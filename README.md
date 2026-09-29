@@ -1,10 +1,30 @@
+<div align="center">
+
+<img src="logo.png" width="160" alt="喵喵抽奖图标">
+
 # 喵喵抽奖
 
-<p align="center"><img src="logo.png" width="120" alt="喵喵抽奖图标"></p>
+**把每一份期待收好，把每一份好运准时送达。**
+
+QQ群聊报名 · 私聊答题与资料 · 多平台多群 · 自动开奖
+
+<p>
+  <a href="https://github.com/WhiteCloudOL"><img alt="作者：清蒸云鸭" src="https://img.shields.io/badge/%E4%BD%9C%E8%80%85-%E6%B8%85%E8%92%B8%E4%BA%91%E9%B8%AD-ffe6f0?style=flat&amp;labelColor=486692"></a>
+  <a href="https://github.com/WhiteCloudOL/astrbot_plugin_catlottery"><img alt="插件：astrbot_plugin_catlottery" src="https://img.shields.io/badge/Plugin-astrbot__plugin__catlottery-e3efff?style=flat&amp;labelColor=486692"></a>
+  <a href="LICENSE"><img alt="许可证：AGPL-3.0" src="https://img.shields.io/badge/License-AGPL--3.0-ffe6f0?style=flat&amp;labelColor=486692"></a>
+</p>
+<p>
+  <img alt="AstrBot 4.27.0 及以上的 4.x 版本" src="https://img.shields.io/badge/AstrBot-%E2%89%A54.27.0-e3efff?style=flat&amp;labelColor=486692">
+  <img alt="支持 NapCat 和 SnowLuma" src="https://img.shields.io/badge/AioCqhttp-NapCat%20%2F%20SnowLuma-ffe6f0?style=flat&amp;labelColor=486692">
+</p>
+
+[快速安装](#安装与打开管理页) · [创建抽奖](#创建第一场抽奖) · [参与流程](#参与者使用流程) · [指令列表](#指令列表) · [工具列表](#llm-工具列表) · [常见问题](#常见问题)
+
+</div>
+
+---
 
 面向 QQ 群的 AstrBot 抽奖插件。每场抽奖独立设置机器人平台、参与群、报名资料、截止时间与开奖时间；从群聊报名，在私聊填写，到时间自动把开奖结果送到对应的群。
-
-作者：**清蒸云鸭** · 插件名：`astrbot_plugin_catlottery` · 许可证：**AGPL-3.0**
 
 ## 功能
 
@@ -18,13 +38,15 @@
 - 支持 QQ 指令与 8 个 LLM 工具。管理员权限、平台范围和真实发送者校验由插件执行。
 - 管理页可查看报名进度、私聊资料、中奖名单及群聊/私聊通知状态，也可重试通知或删除已结束的活动。
 
-![管理工作台](docs/images/webui.png)
+## 页面预览
 
-*页面预览使用示例活动、机器人账号和群号。安装后只会显示你自己的活动和已连接的平台。*
+<p align="center"><a href="docs/images/webui.png"><img src="docs/images/webui.png" width="1080" alt="喵喵抽奖管理工作台"></a></p>
+
+<p align="center"><sub>点击图片查看原图。预览中的活动、机器人账号和群号为示例。</sub></p>
 
 ## 安装与打开管理页
 
-1. 使用 **AstrBot 4.28.1 或更新的 4.x 版本**。本插件使用 AstrBot 内置的插件 Pages 与 Web API。
+1. 使用 **AstrBot 4.27.0 或更新的 4.x 版本**。本插件使用 AstrBot 内置的插件 Pages 与 Web API。
 2. 在 AstrBot 中配置并开启 AioCqhttp 平台，让 NapCat 或 SnowLuma 连接成功，并将机器人加入要举办抽奖的 QQ 群。
 3. 打开 AstrBot WebUI 的插件管理，通过仓库地址安装：
 
