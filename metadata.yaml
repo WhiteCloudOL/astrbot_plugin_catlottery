@@ -6,4 +6,4 @@ author: 清蒸云鸭
 repo: https://github.com/WhiteCloudOL/astrbot_plugin_catlottery
 support_platforms:
   - aiocqhttp
-astrbot_version: '>=4.27.0,<5'
+astrbot_version: '>=4.27.0'

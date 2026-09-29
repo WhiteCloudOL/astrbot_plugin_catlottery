@@ -14,7 +14,7 @@ QQ群聊报名 · 私聊答题与资料 · 多平台多群 · 自动开奖
   <a href="LICENSE"><img alt="许可证：AGPL-3.0" src="https://img.shields.io/badge/License-AGPL--3.0-ffe6f0?style=flat&amp;labelColor=486692"></a>
 </p>
 <p>
-  <img alt="AstrBot 4.27.0 及以上的 4.x 版本" src="https://img.shields.io/badge/AstrBot-%E2%89%A54.27.0-e3efff?style=flat&amp;labelColor=486692">
+  <img alt="AstrBot 4.27.0 及以上版本" src="https://img.shields.io/badge/AstrBot-%E2%89%A54.27.0-e3efff?style=flat&amp;labelColor=486692">
   <img alt="支持 NapCat 和 SnowLuma" src="https://img.shields.io/badge/AioCqhttp-NapCat%20%2F%20SnowLuma-ffe6f0?style=flat&amp;labelColor=486692">
 </p>
 
@@ -46,7 +46,7 @@ QQ群聊报名 · 私聊答题与资料 · 多平台多群 · 自动开奖
 
 ## 安装与打开管理页
 
-1. 使用 **AstrBot 4.27.0 或更新的 4.x 版本**。本插件使用 AstrBot 内置的插件 Pages 与 Web API。
+1. 使用 **AstrBot 4.27.0 及以上版本**。本插件使用 AstrBot 内置的插件 Pages 与 Web API。
 2. 在 AstrBot 中配置并开启 AioCqhttp 平台，让 NapCat 或 SnowLuma 连接成功，并将机器人加入要举办抽奖的 QQ 群。
 3. 打开 AstrBot WebUI 的插件管理，通过仓库地址安装：
 
