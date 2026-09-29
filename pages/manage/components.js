@@ -78,6 +78,28 @@ class Choice extends HTMLElement {
 customElements.define("meow-choice", Choice);
 export const choice = (name, value, items, { placeholder = "请选择", disabled = false, label = "" } = {}) => `<meow-choice name="${name}" value="${escapeHTML(value)}" items='${escapeHTML(JSON.stringify(items))}' placeholder="${escapeHTML(placeholder)}" label="${escapeHTML(label)}" ${disabled ? "disabled" : ""}></meow-choice>`;
 
+class Switch extends HTMLElement {
+  connectedCallback() {
+    if (this._ready) return;
+    this._ready = true;
+    this.value = this.getAttribute("value") === "true";
+    this.render();
+    this.addEventListener("click", event => {
+      if (this.hasAttribute("disabled") || !event.target.closest("button")) return;
+      this.value = !this.value;
+      this.setAttribute("value", String(this.value));
+      this.render();
+      this.querySelector("button").focus();
+      this.dispatchEvent(new Event("change", { bubbles: true }));
+    });
+  }
+  render() {
+    this.innerHTML = `<button type="button" class="switch-control" role="switch" aria-checked="${this.value}" aria-label="${escapeHTML(this.getAttribute("label") || "开关")}" ${this.hasAttribute("disabled") ? "disabled" : ""}><span class="switch-track"><span class="switch-thumb">${icon(this.value ? "check" : "close")}</span></span><span>${this.value ? "已开启" : "已关闭"}</span></button>`;
+  }
+}
+customElements.define("meow-switch", Switch);
+export const toggle = (name, value, label, { disabled = false } = {}) => `<meow-switch name="${escapeHTML(name)}" value="${Boolean(value)}" label="${escapeHTML(label)}" ${disabled ? "disabled" : ""}></meow-switch>`;
+
 class Stepper extends HTMLElement {
   connectedCallback() {
     if (this._ready) return;
@@ -153,12 +175,14 @@ class Calendar extends HTMLElement {
 }
 customElements.define("meow-calendar", Calendar);
 
+let modalSequence = 0;
 export function modal(title, subtitle, body, footer, { wide = false, onClose } = {}) {
   const root = document.getElementById("overlay-root");
   const previous = document.activeElement;
   const holder = document.createElement("div");
+  const titleId = `meow-modal-title-${++modalSequence}`;
   holder.className = "modal-backdrop";
-  holder.innerHTML = `<section class="modal ${wide ? "modal-wide" : ""}" role="dialog" aria-modal="true" aria-labelledby="modal-title"><header class="modal-header"><div><p class="eyebrow">喵喵抽奖 / 管理工作台</p><h2 id="modal-title" class="text-h3 pa-4 pb-0 pl-6">${escapeHTML(title)}</h2><p>${escapeHTML(subtitle)}</p></div><button class="icon-btn modal-close" aria-label="关闭">${icon("close")}</button></header><div class="modal-body">${body}</div>${footer ? `<footer class="modal-footer">${footer}</footer>` : ""}</section>`;
+  holder.innerHTML = `<section class="modal ${wide ? "modal-wide" : ""}" role="dialog" aria-modal="true" aria-labelledby="${titleId}"><header class="modal-header"><div><p class="eyebrow">喵喵抽奖 / 管理工作台</p><h2 id="${titleId}" class="text-h3 pa-4 pb-0 pl-6">${escapeHTML(title)}</h2><p>${escapeHTML(subtitle)}</p></div><button class="icon-btn modal-close" aria-label="关闭">${icon("close")}</button></header><div class="modal-body">${body}</div>${footer ? `<footer class="modal-footer">${footer}</footer>` : ""}</section>`;
   root.append(holder);
   document.body.classList.add("has-modal");
   const close = () => { holder.remove(); if (!root.children.length) document.body.classList.remove("has-modal"); previous?.focus(); onClose?.(); };

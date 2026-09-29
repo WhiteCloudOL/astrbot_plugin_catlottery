@@ -94,6 +94,10 @@ def validate_lottery(payload: dict, *, now: float | None = None) -> dict:
     if isinstance(count, bool) or not isinstance(count, int) or not 1 <= count <= 100:
         raise ValueError("中奖人数必须为 1–100 的整数。")
     result["winner_count"] = count
+    require_correct = payload.get("require_correct", True)
+    if not isinstance(require_correct, bool):
+        raise ValueError("答题模式开关必须为启用或关闭。")
+    result["require_correct"] = require_correct
     result["close_at"] = timestamp(payload.get("close_at"))
     result["draw_at"] = timestamp(payload.get("draw_at"))
     if result["close_at"] <= now:
@@ -138,8 +142,8 @@ def validate_lottery(payload: dict, *, now: float | None = None) -> dict:
             raise ValueError("问题格式无效。")
         kind = question.get("kind")
         prompt = question.get("prompt", "")
-        if not isinstance(kind, str) or kind not in {"quiz", "text", "image"}:
-            raise ValueError("问题类型只支持答题、文本资料、图片资料。")
+        if not isinstance(kind, str) or kind not in {"quiz", "text", "image", "mixed"}:
+            raise ValueError("问题类型只支持答题、文本资料、图片资料、图文资料。")
         if not isinstance(prompt, str) or not 1 <= len(prompt.strip()) <= 300:
             raise ValueError("问题内容必须为 1–300 字。")
         options = question.get("options", [])
@@ -162,8 +166,8 @@ def validate_lottery(payload: dict, *, now: float | None = None) -> dict:
             )
         ):
             raise ValueError("可接受的答案最多 20 个，每项为 1–200 字。")
-        if kind == "quiz" and not answers:
-            raise ValueError("答题问题需要至少一个正确答案。")
+        if kind == "quiz" and require_correct and not answers:
+            raise ValueError("当场答对模式的答题问题需要至少一个正确答案。")
         if options and kind != "quiz":
             raise ValueError("只有答题问题可以设置选项。")
         options = [option.strip() for option in options]
@@ -178,6 +182,26 @@ def validate_lottery(payload: dict, *, now: float | None = None) -> dict:
             }
         )
     return result
+
+
+def review_status(item: dict, entry: dict) -> str:
+    """Derive eligibility from submission completion and the frozen answer mode.
+
+    Args:
+        item: Lottery rules, with legacy activities defaulting to instant checking.
+        entry: A participant's original answers and review marks.
+
+    Returns:
+        incomplete, pending, rejected, or approved.
+    """
+    if entry["status"] != "complete":
+        return "incomplete"
+    if item.get("require_correct", True) or not item["questions"]:
+        return "approved"
+    marks = [answer.get("correct") for answer in entry["answers"]]
+    if any(mark is False for mark in marks):
+        return "rejected"
+    return "approved" if all(mark is True for mark in marks) else "pending"
 
 
 class Store:
@@ -201,7 +225,7 @@ class Store:
             PRAGMA foreign_keys=ON;
             PRAGMA busy_timeout=5000;
             CREATE TABLE IF NOT EXISTS settings (id INTEGER PRIMARY KEY CHECK(id=1), body TEXT NOT NULL);
-            INSERT OR IGNORE INTO settings VALUES (1, '{"manager_ids":[]}');
+            INSERT OR IGNORE INTO settings VALUES (1, '{"manager_ids":[],"llm_tools_enabled":true}');
             CREATE TABLE IF NOT EXISTS lotteries (id TEXT PRIMARY KEY, body TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS entries (
                 lottery_id TEXT NOT NULL REFERENCES lotteries(id) ON DELETE CASCADE,
@@ -239,15 +263,28 @@ class Store:
             async with self.db.execute("SELECT body FROM lotteries") as cursor:
                 items = [json.loads(row[0]) for row in await cursor.fetchall()]
             async with self.db.execute(
-                "SELECT lottery_id, count(*), sum(json_extract(body, '$.status')='complete') FROM entries GROUP BY lottery_id"
+                """SELECT lottery_id, count(*),
+                    sum(json_extract(body, '$.status')='complete' AND
+                        coalesce(json_extract(body, '$.review_status'), 'approved')='approved'),
+                    sum(json_extract(body, '$.status')='complete'),
+                    coalesce(sum(json_extract(body, '$.review_status')='pending'), 0),
+                    coalesce(sum(json_extract(body, '$.review_status')='rejected'), 0)
+                    FROM entries GROUP BY lottery_id"""
             ) as cursor:
-                counts = {row[0]: (row[1], row[2]) for row in await cursor.fetchall()}
+                counts = {row[0]: tuple(row[1:]) for row in await cursor.fetchall()}
             async with self.db.execute(
                 "SELECT lottery_id, count(*) FROM outbox WHERE delivered_at IS NULL GROUP BY lottery_id"
             ) as cursor:
                 pending = dict(await cursor.fetchall())
         for item in items:
-            item["entry_count"], item["complete_count"] = counts.get(item["id"], (0, 0))
+            (
+                item["entry_count"],
+                item["complete_count"],
+                item["submitted_count"],
+                item["review_pending_count"],
+                item["rejected_count"],
+            ) = counts.get(item["id"], (0, 0, 0, 0, 0))
+            item["require_correct"] = item.get("require_correct", True)
             item["pending_deliveries"] = pending.get(item["id"], 0)
             item["phase"] = (
                 "closed"
@@ -284,10 +321,10 @@ class Store:
         return json.loads(row[0])
 
     async def settings(self, payload: dict | None = None) -> dict:
-        """Read or replace the WebUI-managed operator allowlist.
+        """Read or replace the WebUI-managed operators and tool switch.
 
         Args:
-            payload: Optional list of extra operator QQ IDs.
+            payload: Optional settings with operator QQ IDs and a boolean tool switch.
 
         Returns:
             Validated settings.
@@ -296,6 +333,11 @@ class Store:
             ValueError: An operator identifier is invalid.
         """
         async with self.lock:
+            async with self.db.execute(
+                "SELECT body FROM settings WHERE id=1"
+            ) as cursor:
+                settings = json.loads((await cursor.fetchone())[0])
+            settings.setdefault("llm_tools_enabled", True)
             if payload is not None:
                 ids = payload.get("manager_ids") if isinstance(payload, dict) else None
                 if (
@@ -307,15 +349,19 @@ class Store:
                     )
                 ):
                     raise ValueError("管理员 QQ 号需要用列表填写，最多 100 个。")
-                payload = {"manager_ids": list(dict.fromkeys(ids))}
-                await self.db.execute(
-                    "UPDATE settings SET body=? WHERE id=1", (json.dumps(payload),)
+                enabled = payload.get(
+                    "llm_tools_enabled", settings["llm_tools_enabled"]
                 )
-            async with self.db.execute(
-                "SELECT body FROM settings WHERE id=1"
-            ) as cursor:
-                row = await cursor.fetchone()
-        return json.loads(row[0])
+                if not isinstance(enabled, bool):
+                    raise ValueError("LLM 工具开关必须为启用或关闭。")
+                settings = {
+                    "manager_ids": list(dict.fromkeys(ids)),
+                    "llm_tools_enabled": enabled,
+                }
+                await self.db.execute(
+                    "UPDATE settings SET body=? WHERE id=1", (json.dumps(settings),)
+                )
+        return settings
 
     async def save(self, payload: dict, creator_id: str, lottery_id: str = "") -> dict:
         """Create rules or edit an activity without changing an enrolled user's contract.
@@ -349,11 +395,17 @@ class Store:
                 ) as cursor:
                     count = (await cursor.fetchone())[0]
                 if count and any(
-                    rules[k] != item[k]
-                    for k in ("targets", "questions", "prize", "winner_count")
+                    rules[k] != item.get(k, True)
+                    for k in (
+                        "targets",
+                        "questions",
+                        "prize",
+                        "winner_count",
+                        "require_correct",
+                    )
                 ):
                     raise ValueError(
-                        "已有报名后，平台、群、问题、奖品和中奖人数不能修改。可修改说明和未来时间。"
+                        "已有报名后，平台、群、问题、答题模式、奖品和中奖人数不能修改。可修改说明和未来时间。"
                     )
                 item.update(rules)
             else:
@@ -459,6 +511,7 @@ class Store:
                     "joined_at": time.time(),
                     "completed_at": None if item["questions"] else time.time(),
                 }
+                entry["review_status"] = review_status(item, entry)
                 await self.db.execute(
                     "INSERT INTO entries VALUES (?, ?, ?)",
                     (
@@ -538,7 +591,7 @@ class Store:
         Args:
             lottery_id: Previously selected activity identifier.
             identity: Actual sender, bot, and platform; group_id must be empty.
-            answer: Validated text or an internal image filename.
+            answer: Original text and an optional internal image filename.
             index: Expected question index to reject simultaneous stale submissions.
 
         Returns:
@@ -577,48 +630,81 @@ class Store:
                 if entry["status"] != "pending" or index != len(entry["answers"]):
                     raise ValueError("这题已处理，请按最新的问题卡片作答。")
                 question = item["questions"][index]
-                if answer.get("kind") != (
-                    "image" if question["kind"] == "image" else "text"
+                expected_kind = (
+                    question["kind"]
+                    if question["kind"] in {"image", "mixed"}
+                    else "text"
+                )
+                if not isinstance(answer, dict) or answer.get("kind") != expected_kind:
+                    raise ValueError("请按当前题目要求发送文本、图片或图文消息。")
+                original_text = (
+                    answer.get("text", "")
+                    if expected_kind == "image"
+                    else answer.get("value", "")
+                )
+                filename = (
+                    answer.get("value", "")
+                    if expected_kind == "image"
+                    else answer.get("image", "")
+                )
+                if not isinstance(original_text, str) or len(original_text) > 1000:
+                    raise ValueError("文本请控制在 1000 字以内，空格和换行也计入长度。")
+                if expected_kind != "image" and not original_text.strip():
+                    raise ValueError(
+                        "本题需要非空文本，图片可以与文本在同一条消息中发送。"
+                    )
+                if not isinstance(filename, str) or (
+                    filename and not re.fullmatch(r"[a-f0-9]{32}\.jpg", filename)
                 ):
-                    raise ValueError("请按当前题目要求发送文本或一张图片。")
-                if question["kind"] == "image":
-                    if not re.fullmatch(r"[a-f0-9]{32}\.jpg", answer.get("value", "")):
-                        raise ValueError("图片记录无效。")
-                else:
-                    text = answer.get("value", "")
-                    if not isinstance(text, str) or not 1 <= len(text.strip()) <= 1000:
-                        raise ValueError("文本请控制在 1–1000 字。")
-                    text = text.strip()
+                    raise ValueError("图片记录无效。")
+                if expected_kind in {"image", "mixed"} and not filename:
+                    raise ValueError("本题需要一张图片，请按题目要求重新发送。")
+                answer = {
+                    "kind": expected_kind,
+                    "value": filename if expected_kind == "image" else original_text,
+                }
+                if expected_kind == "image" and original_text:
+                    answer["text"] = original_text
+                elif expected_kind != "image" and filename:
+                    answer["image"] = filename
+                if question["kind"] == "quiz" and item.get("require_correct", True):
+                    text = original_text.strip()
                     options = question["options"]
                     if options:
-                        choice = text.upper()
+                        choice = unicodedata.normalize("NFKC", text).upper()
                         if choice in [chr(65 + n) for n in range(len(options))]:
                             text = options[ord(choice) - 65]
                         elif choice.isdigit() and 1 <= int(choice) <= len(options):
                             text = options[int(choice) - 1]
-                        elif text not in options:
-                            raise ValueError("请发送选项字母、数字序号或完整选项文本。")
-                    if question["kind"] == "quiz":
-                        normalized = (
-                            unicodedata.normalize("NFKC", text).strip().casefold()
-                        )
-                        if normalized not in {
-                            unicodedata.normalize("NFKC", x).strip().casefold()
-                            for x in question["answers"]
+                        elif unicodedata.normalize("NFKC", text).casefold() not in {
+                            unicodedata.normalize("NFKC", option).casefold()
+                            for option in options
                         }:
-                            raise ValueError(
-                                "答案还不正确，再想一想喵！请重新回答当前题。"
-                            )
-                    answer = {"kind": "text", "value": text}
+                            raise ValueError("请发送选项字母、数字序号或完整选项文本。")
+                    normalized = unicodedata.normalize("NFKC", text).strip().casefold()
+                    if normalized not in {
+                        unicodedata.normalize("NFKC", x).strip().casefold()
+                        for x in question["answers"]
+                    }:
+                        raise ValueError("答案还不正确，再想一想喵！请重新回答当前题。")
+                if not item.get("require_correct", True):
+                    answer["correct"] = None
                 entry["answers"].append(answer)
                 if len(entry["answers"]) == len(item["questions"]):
                     entry["status"] = "complete"
                     entry["completed_at"] = time.time()
+                    entry["review_status"] = review_status(item, entry)
                     await self.db.execute(
                         "DELETE FROM sessions WHERE bot_id=? AND user_id=?",
                         (identity["bot_id"], identity["user_id"]),
                     )
-                    await self.queue(item, "success", entry=entry)
+                    await self.queue(
+                        item,
+                        "success"
+                        if entry["review_status"] == "approved"
+                        else "submitted",
+                        entry=entry,
+                    )
                 await self.db.execute(
                     "UPDATE entries SET body=? WHERE lottery_id=? AND user_id=?",
                     (
@@ -629,6 +715,138 @@ class Store:
                 )
                 await self.db.commit()
                 return item, entry
+            except BaseException:
+                await self.db.rollback()
+                raise
+
+    async def review(self, lottery_id: str, payload: dict, reviewer_id: str) -> dict:
+        """Mark submitted answers or match text references before the draw freezes eligibility.
+
+        Args:
+            lottery_id: Activity identifier.
+            payload: mark with user_id, question_index, and correct; or match.
+            reviewer_id: Authenticated Dashboard operator for the private audit trail.
+
+        Returns:
+            Counts of marked answers, changed participants, and approved participants.
+
+        Raises:
+            ValueError: The activity, review mode, participant, or mark is invalid.
+        """
+        if not isinstance(payload, dict) or payload.get("action") not in (
+            "mark",
+            "match",
+        ):
+            raise ValueError("请选择逐题标记或文字答案匹配。")
+        action = payload["action"]
+        if action == "mark":
+            user_id = payload.get("user_id")
+            index = payload.get("question_index")
+            correct = payload.get("correct")
+            if (
+                not isinstance(user_id, str)
+                or not re.fullmatch(r"[1-9]\d{4,19}", user_id)
+                or not isinstance(index, int)
+                or isinstance(index, bool)
+                or "correct" not in payload
+                or (correct is not None and not isinstance(correct, bool))
+            ):
+                raise ValueError("请指定报名 QQ、题目序号及待审核／正确／错误标记。")
+        async with self.lock:
+            await self.db.execute("BEGIN IMMEDIATE")
+            try:
+                async with self.db.execute(
+                    "SELECT body FROM lotteries WHERE id=?", (lottery_id,)
+                ) as cursor:
+                    row = await cursor.fetchone()
+                if not row:
+                    raise ValueError("抽奖不存在。")
+                item = json.loads(row[0])
+                if item["status"] != "open" or time.time() >= item["draw_at"]:
+                    raise ValueError("开奖时间已到或活动已结束，审核资格已锁定。")
+                if item.get("require_correct", True):
+                    raise ValueError("本场采用当场答对模式，无需后续审核。")
+                async with self.db.execute(
+                    "SELECT body FROM entries WHERE lottery_id=?", (lottery_id,)
+                ) as cursor:
+                    entries = [json.loads(row[0]) for row in await cursor.fetchall()]
+                if action == "mark":
+                    entries = [
+                        entry for entry in entries if entry["user_id"] == user_id
+                    ]
+                    if not entries or entries[0]["status"] != "complete":
+                        raise ValueError("只能审核已经提交全部资料的报名。")
+                    if not 0 <= index < len(item["questions"]):
+                        raise ValueError("题目序号无效。")
+                changed = marked = approved = 0
+                for entry in entries:
+                    if entry["status"] != "complete":
+                        continue
+                    previous = entry.get("review_status", "approved")
+                    for question_index, answer in enumerate(entry["answers"]):
+                        if action == "mark":
+                            if question_index != index:
+                                continue
+                            result = correct
+                        else:
+                            question = item["questions"][question_index]
+                            if (
+                                question["kind"] != "quiz"
+                                or not question["answers"]
+                                or answer.get("correct") is not None
+                                or answer.get("image")
+                            ):
+                                continue
+                            text = answer["value"].strip()
+                            options = question["options"]
+                            choice = unicodedata.normalize("NFKC", text).upper()
+                            if options and choice in [
+                                chr(65 + n) for n in range(len(options))
+                            ]:
+                                text = options[ord(choice) - 65]
+                            elif (
+                                options
+                                and choice.isdigit()
+                                and 1 <= int(choice) <= len(options)
+                            ):
+                                text = options[int(choice) - 1]
+                            result = unicodedata.normalize(
+                                "NFKC", text
+                            ).strip().casefold() in {
+                                unicodedata.normalize("NFKC", value).strip().casefold()
+                                for value in question["answers"]
+                            }
+                        answer.update(
+                            correct=result,
+                            review_method=action,
+                            reviewed_by=reviewer_id,
+                            reviewed_at=time.time(),
+                        )
+                        marked += 1
+                    entry["review_status"] = review_status(item, entry)
+                    approved += entry["review_status"] == "approved"
+                    if previous != entry["review_status"]:
+                        changed += 1
+                        # Supersede undelivered submission/review cards with the current eligibility.
+                        await self.db.execute(
+                            "DELETE FROM outbox WHERE lottery_id=? AND delivered_at IS NULL AND json_extract(body, '$.entry.user_id')=?",
+                            (lottery_id, entry["user_id"]),
+                        )
+                        await self.queue(item, "review", entry=entry)
+                    await self.db.execute(
+                        "UPDATE entries SET body=? WHERE lottery_id=? AND user_id=?",
+                        (
+                            json.dumps(entry, ensure_ascii=False),
+                            lottery_id,
+                            entry["user_id"],
+                        ),
+                    )
+                await self.db.commit()
+                return {
+                    "marked_answers": marked,
+                    "changed_entries": changed,
+                    "approved_entries": approved,
+                }
             except BaseException:
                 await self.db.rollback()
                 raise
@@ -685,8 +903,11 @@ class Store:
                 await self.db.rollback()
                 raise
         for answer in entry["answers"]:
-            if answer["kind"] == "image":
-                (self.directory / "uploads" / Path(answer["value"]).name).unlink(
+            filename = (
+                answer["value"] if answer["kind"] == "image" else answer.get("image")
+            )
+            if filename:
+                (self.directory / "uploads" / Path(filename).name).unlink(
                     missing_ok=True
                 )
 
@@ -764,7 +985,12 @@ class Store:
                         (lottery_id,),
                     ) as cursor:
                         pool = [json.loads(row[0]) for row in await cursor.fetchall()]
-                    pool = [e for e in pool if e["status"] == "complete"]
+                    pool = [
+                        e
+                        for e in pool
+                        if e["status"] == "complete"
+                        and e.get("review_status", "approved") == "approved"
+                    ]
                     item["pool_hash"] = hashlib.sha256(
                         "\n".join(e["user_id"] for e in pool).encode()
                     ).hexdigest()
@@ -910,7 +1136,12 @@ class Store:
             await self.db.execute("DELETE FROM lotteries WHERE id=?", (lottery_id,))
         for entry in entries:
             for answer in entry["answers"]:
-                if answer["kind"] == "image":
-                    (self.directory / "uploads" / Path(answer["value"]).name).unlink(
+                filename = (
+                    answer["value"]
+                    if answer["kind"] == "image"
+                    else answer.get("image")
+                )
+                if filename:
+                    (self.directory / "uploads" / Path(filename).name).unlink(
                         missing_ok=True
                     )

@@ -9,6 +9,59 @@ import pytest
 from astrbot_plugin_catlottery.storage import Store, timestamp, validate_lottery
 
 
+async def test_settings_switch_preserves_legacy_settings_and_survives_restart(store):
+    await store.db.execute(
+        "UPDATE settings SET body=? WHERE id=1", ('{"manager_ids":[]}',)
+    )
+    assert (await store.settings())["llm_tools_enabled"] is True
+    await store.settings({"manager_ids": ["9999999"], "llm_tools_enabled": False})
+    await store.settings({"manager_ids": ["9999999", "9999999"]})
+    await store.close()
+    await store.open()
+    assert await store.settings() == {
+        "manager_ids": ["9999999"],
+        "llm_tools_enabled": False,
+    }
+
+
+@pytest.mark.parametrize("enabled", [0, 1, "false", "true", None, [], {}])
+async def test_settings_reject_non_boolean_tool_switch(store, enabled):
+    with pytest.raises(ValueError, match="LLM"):
+        await store.settings({"manager_ids": [], "llm_tools_enabled": enabled})
+    assert (await store.settings())["llm_tools_enabled"] is True
+
+
+@pytest.mark.parametrize("kind", ["quiz", "text", "image", "mixed"])
+@pytest.mark.parametrize("action", ["withdraw", "delete"])
+async def test_original_text_and_attachments_survive_and_are_removed_together(
+    store, rules, sender, kind, action
+):
+    question = {"kind": kind, "prompt": "提交资料"}
+    if kind == "quiz":
+        question["answers"] = ["a  b"]
+    rules["questions"] = [question]
+    item = await store.save(rules, "admin")
+    await store.enroll(item["id"], sender)
+    text = "  a  b\n "
+    filename = "a" * 32 + ".jpg"
+    path = store.directory / "uploads" / filename
+    path.write_bytes(b"attachment")
+    answer = {"kind": kind if kind in {"image", "mixed"} else "text"}
+    if kind == "image":
+        answer.update(value=filename, text=text)
+    else:
+        answer.update(value=text, image=filename)
+    _, entry = await store.answer(item["id"], {**sender, "group_id": ""}, answer, 0)
+    assert entry["status"] == "complete"
+    assert entry["answers"] == [answer]
+    if action == "withdraw":
+        await store.withdraw(item["id"], sender)
+    else:
+        await store.action(item["id"], "cancel")
+        await store.delete(item["id"])
+    assert not path.exists()
+
+
 @pytest.mark.parametrize("kind", [None, [], {}, True])
 def test_question_kind_wrong_json_types_are_validation_errors(rules, kind):
     rules["questions"] = [{"kind": kind, "prompt": "题目"}]
@@ -254,6 +307,328 @@ async def test_empty_pool_draw_is_final_and_scheduled_draw_not_early(store, rule
     assert drawn["winners"] == []
     assert drawn["eligible_count"] == 0
     assert drawn["status"] == "drawn"
+    assert len(await store.deliveries()) == len(rules["targets"])
+    with pytest.raises(ValueError, match="结束"):
+        await store.action(item["id"], "draw")
+
+
+async def test_review_mode_advances_wrong_answers_and_requires_every_mark(
+    store, rules, sender
+):
+    rules.update(
+        require_correct=False,
+        questions=[
+            {
+                "kind": "quiz",
+                "prompt": "选猫",
+                "options": ["猫", "狗"],
+                "answers": ["猫"],
+            },
+            {"kind": "mixed", "prompt": "PRIVATE-PROMPT"},
+        ],
+    )
+    item = await store.save(rules, "admin")
+    await store.enroll(item["id"], sender)
+    private = {**sender, "group_id": ""}
+    await store.private_session(sender["bot_id"], sender["user_id"], item["id"])
+    _, entry = await store.answer(
+        item["id"], private, {"kind": "text", "value": "B"}, 0
+    )
+    assert len(entry["answers"]) == 1
+    assert entry["answers"][0]["correct"] is None
+    _, entry = await store.answer(
+        item["id"],
+        private,
+        {"kind": "mixed", "value": "  PRIVATE-CONTACT\n", "image": "a" * 32 + ".jpg"},
+        1,
+    )
+    assert entry["status"] == "complete" and entry["review_status"] == "pending"
+    assert await store.private_session(sender["bot_id"], sender["user_id"]) is None
+    summary = (await store.snapshot())[0]
+    assert (
+        summary["complete_count"],
+        summary["submitted_count"],
+        summary["review_pending_count"],
+    ) == (0, 1, 1)
+    result = await store.review(item["id"], {"action": "match"}, "web:admin")
+    assert result["marked_answers"] == 1
+    assert (await store.entry(item["id"], sender["user_id"]))[
+        "review_status"
+    ] == "rejected"
+    for index in (0, 1):
+        await store.review(
+            item["id"],
+            {
+                "action": "mark",
+                "user_id": sender["user_id"],
+                "question_index": index,
+                "correct": True,
+            },
+            "web:admin",
+        )
+    entry = await store.entry(item["id"], sender["user_id"])
+    assert entry["review_status"] == "approved"
+    assert entry["answers"][1]["value"] == "  PRIVATE-CONTACT\n"
+    assert all(answer["reviewed_by"] == "web:admin" for answer in entry["answers"])
+    deliveries = await store.deliveries()
+    assert len(deliveries) == 2
+    assert all("PRIVATE-CONTACT" not in row["body"] for row in deliveries)
+    assert {json.loads(row["body"])["target"]["channel"] for row in deliveries} == {
+        "group",
+        "private",
+    }
+    await store.review(
+        item["id"],
+        {
+            "action": "mark",
+            "user_id": sender["user_id"],
+            "question_index": 0,
+            "correct": None,
+        },
+        "web:admin",
+    )
+    assert (await store.entry(item["id"], sender["user_id"]))[
+        "review_status"
+    ] == "pending"
+
+
+async def test_later_matching_preserves_manual_marks_spaces_and_images(
+    store, rules, sender
+):
+    rules.update(
+        require_correct=False,
+        questions=[
+            {
+                "kind": "quiz",
+                "prompt": "选择",
+                "options": ["猫", "狗"],
+                "answers": ["猫"],
+            },
+            {"kind": "quiz", "prompt": "两个空格", "answers": ["a  b"]},
+            {"kind": "quiz", "prompt": "需要人工核对图文", "answers": ["yes"]},
+            {"kind": "quiz", "prompt": "没有文字参考答案"},
+        ],
+    )
+    item = await store.save(rules, "admin")
+    await store.enroll(item["id"], sender)
+    private = {**sender, "group_id": ""}
+    for index, answer in enumerate(
+        [
+            {"kind": "text", "value": "  １\n"},
+            {"kind": "text", "value": "  Ａ  Ｂ\n"},
+            {"kind": "text", "value": "yes", "image": "b" * 32 + ".jpg"},
+            {"kind": "text", "value": "自定义文字"},
+        ]
+    ):
+        await store.answer(item["id"], private, answer, index)
+    await store.review(
+        item["id"],
+        {
+            "action": "mark",
+            "user_id": sender["user_id"],
+            "question_index": 0,
+            "correct": False,
+        },
+        "web:human",
+    )
+    result = await store.review(item["id"], {"action": "match"}, "web:matcher")
+    assert result["marked_answers"] == 1
+    entry = await store.entry(item["id"], sender["user_id"])
+    assert [answer["correct"] for answer in entry["answers"]] == [
+        False,
+        True,
+        None,
+        None,
+    ]
+    assert entry["answers"][0]["reviewed_by"] == "web:human"
+    assert (await store.review(item["id"], {"action": "match"}, "web:matcher"))[
+        "marked_answers"
+    ] == 0
+
+
+async def test_draw_uses_only_approved_entries_and_freezes_review(store, rules, sender):
+    rules.update(require_correct=False, questions=[{"kind": "text", "prompt": "资料"}])
+    item = await store.save(rules, "admin")
+    for user_id in ("4444444", "5555555", "6666666", "7777777"):
+        identity = {**sender, "user_id": user_id}
+        await store.enroll(item["id"], identity)
+        if user_id != "7777777":
+            await store.answer(
+                item["id"],
+                {**identity, "group_id": ""},
+                {"kind": "text", "value": "answer"},
+                0,
+            )
+    await store.action(item["id"], "close")
+    for user_id, correct in (("4444444", True), ("5555555", False)):
+        await store.review(
+            item["id"],
+            {
+                "action": "mark",
+                "user_id": user_id,
+                "question_index": 0,
+                "correct": correct,
+            },
+            "web:admin",
+        )
+    summary = (await store.snapshot())[0]
+    assert (
+        summary["complete_count"],
+        summary["submitted_count"],
+        summary["rejected_count"],
+        summary["review_pending_count"],
+    ) == (1, 3, 1, 1)
+    drawn = await store.action(item["id"], "draw")
+    assert drawn["eligible_count"] == 1
+    assert [winner["user_id"] for winner in drawn["winners"]] == ["4444444"]
+    with pytest.raises(ValueError, match="锁定"):
+        await store.review(item["id"], {"action": "match"}, "web:admin")
+
+
+async def test_unapproved_pool_produces_final_empty_result_and_group_notices(
+    store, rules, sender
+):
+    rules.update(require_correct=False, questions=[{"kind": "text", "prompt": "资料"}])
+    item = await store.save(rules, "admin")
+    await store.enroll(item["id"], sender)
+    await store.answer(
+        item["id"], {**sender, "group_id": ""}, {"kind": "text", "value": "waiting"}, 0
+    )
+    drawn = await store.action(item["id"], "draw")
+    assert (
+        drawn["status"] == "drawn"
+        and drawn["eligible_count"] == 0
+        and drawn["winners"] == []
+    )
+    notices = [
+        json.loads(row["body"])
+        for row in await store.deliveries()
+        if json.loads(row["body"])["kind"] == "result"
+    ]
+    assert {notice["target"]["recipient"] for notice in notices} == {
+        "2222222",
+        "3333333",
+    }
+    await store.close()
+    await store.open()
+    assert (await store.get(item["id"]))["winners"] == []
+    with pytest.raises(ValueError):
+        await store.action(item["id"], "draw")
+
+
+async def test_review_rejects_exact_draw_deadline_and_mode_changes(
+    store, rules, sender, monkeypatch
+):
+    rules.update(
+        require_correct=False, questions=[{"kind": "quiz", "prompt": "人工题"}]
+    )
+    item = await store.save(rules, "admin")
+    await store.enroll(item["id"], sender)
+    await store.answer(
+        item["id"], {**sender, "group_id": ""}, {"kind": "text", "value": "original"}, 0
+    )
+    with pytest.raises(ValueError, match="已有报名"):
+        await store.save(
+            {
+                **rules,
+                "require_correct": True,
+                "questions": [
+                    {"kind": "quiz", "prompt": "人工题", "answers": ["original"]}
+                ],
+            },
+            "admin",
+            item["id"],
+        )
+    monkeypatch.setattr(
+        "astrbot_plugin_catlottery.storage.time.time", lambda: item["draw_at"]
+    )
+    with pytest.raises(ValueError, match="锁定"):
+        await store.review(
+            item["id"],
+            {
+                "action": "mark",
+                "user_id": sender["user_id"],
+                "question_index": 0,
+                "correct": True,
+            },
+            "web:admin",
+        )
+    assert (await store.entry(item["id"], sender["user_id"]))[
+        "review_status"
+    ] == "pending"
+
+
+async def test_review_and_draw_are_serialized(store, rules, sender):
+    rules.update(
+        require_correct=False, questions=[{"kind": "quiz", "prompt": "人工题"}]
+    )
+    item = await store.save(rules, "admin")
+    await store.enroll(item["id"], sender)
+    await store.answer(
+        item["id"], {**sender, "group_id": ""}, {"kind": "text", "value": "answer"}, 0
+    )
+    results = await asyncio.gather(
+        store.action(item["id"], "draw"),
+        store.review(
+            item["id"],
+            {
+                "action": "mark",
+                "user_id": sender["user_id"],
+                "question_index": 0,
+                "correct": True,
+            },
+            "web:admin",
+        ),
+        return_exceptions=True,
+    )
+    saved = await store.get(item["id"])
+    assert saved["eligible_count"] in (0, 1)
+    if isinstance(results[1], ValueError):
+        assert saved["eligible_count"] == 0
+        assert (await store.entry(item["id"], sender["user_id"]))[
+            "review_status"
+        ] == "pending"
+    else:
+        assert saved["eligible_count"] == 1
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        None,
+        [],
+        {},
+        {"action": []},
+        {
+            "action": "mark",
+            "user_id": "4444444",
+            "question_index": True,
+            "correct": True,
+        },
+        {
+            "action": "mark",
+            "user_id": "4444444",
+            "question_index": 0,
+            "correct": "true",
+        },
+        {"action": "mark", "user_id": "4444444", "question_index": 0},
+        {"action": "mark", "user_id": "4444444", "question_index": 99, "correct": True},
+    ],
+)
+async def test_review_rejects_malformed_marks_without_changing_entries(
+    store, rules, sender, payload
+):
+    rules.update(require_correct=False, questions=[{"kind": "text", "prompt": "题目"}])
+    item = await store.save(rules, "admin")
+    await store.enroll(item["id"], sender)
+    await store.answer(
+        item["id"], {**sender, "group_id": ""}, {"kind": "text", "value": "answer"}, 0
+    )
+    with pytest.raises(ValueError):
+        await store.review(item["id"], payload, "web:admin")
+    assert (await store.entry(item["id"], sender["user_id"]))[
+        "review_status"
+    ] == "pending"
 
 
 async def test_withdraw_and_delete_remove_private_files(store, rules, sender):
@@ -305,3 +680,35 @@ def test_invalid_rule_boundaries_rejected(rules, change):
 def test_naive_and_explicit_dates_share_utc8():
     assert timestamp("2026-10-01 20:00") == timestamp("2026-10-01T20:00:00+08:00")
     assert timestamp("2026-10-01T12:00:00Z") == timestamp("2026-10-01 20:00")
+
+
+@pytest.mark.parametrize("require_correct", [None, "false", 0, 1, [], {}])
+def test_answer_mode_requires_boolean(rules, require_correct):
+    with pytest.raises(ValueError, match="答题模式"):
+        validate_lottery({**rules, "require_correct": require_correct})
+
+
+async def test_legacy_completed_entries_keep_eligibility_and_instant_rules(
+    store, rules, sender
+):
+    item = await store.save(rules, "admin")
+    entry, _ = await store.enroll(item["id"], sender)
+    item.pop("require_correct")
+    entry.pop("review_status")
+    await store.db.execute(
+        "UPDATE lotteries SET body=? WHERE id=?", (json.dumps(item), item["id"])
+    )
+    await store.db.execute(
+        "UPDATE entries SET body=? WHERE lottery_id=?", (json.dumps(entry), item["id"])
+    )
+    summary = (await store.snapshot())[0]
+    assert summary["require_correct"] is True
+    assert (
+        summary["complete_count"] == 1
+        and summary["review_pending_count"] == 0
+        and summary["rejected_count"] == 0
+    )
+    with pytest.raises(ValueError, match="当场答对"):
+        await store.review(item["id"], {"action": "match"}, "web:admin")
+    drawn = await store.action(item["id"], "draw")
+    assert drawn["eligible_count"] == 1

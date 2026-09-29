@@ -27,6 +27,16 @@ from .cards import FONT_PATH, LOGO_PATH, render_pages
 from .storage import Store, date_text, validate_lottery
 
 PLUGIN_NAME = "astrbot_plugin_catlottery"
+TOOL_NAMES = (
+    "catlottery_list",
+    "catlottery_info",
+    "catlottery_join",
+    "catlottery_status",
+    "catlottery_withdraw",
+    "catlottery_fill",
+    "catlottery_create",
+    "catlottery_manage",
+)
 HELP = [
     (
         "群聊 · 参加与查看",
@@ -34,7 +44,7 @@ HELP = [
     ),
     (
         "私聊 · 补充报名资料",
-        "/抽奖 填写 编号\n按问题卡片逐条发送答案、文本或一张图片。\n/抽奖 待办 · 查看待填写记录\n/抽奖 取消填写 · 暂停当前表单\n/抽奖 回答 内容 · 提交以斜杠开头的文本",
+        "/抽奖 填写 编号\n最多 20 项问题，按卡片逐题发送文本、图片或图文消息。\n/抽奖 待办 · 查看待填写记录\n/抽奖 取消填写 · 暂停当前表单\n/抽奖 回答 内容 · 提交当前题，可带图片，保留空格与换行",
     ),
     (
         "管理员 · 管理抽奖",
@@ -42,7 +52,7 @@ HELP = [
     ),
     (
         "时间与管理页面",
-        "时间示例：2026-10-01 20:00，默认北京时间。\n在 AstrBot 插件详情打开「喵喵抽奖 · 管理工作台」，设置每个抽奖允许的平台、群和私聊问题。\n仅群聊可发起报名，私聊仅补充已有报名资料。",
+        "时间示例：2026-10-01 20:00，默认北京时间。\n在 AstrBot 插件详情打开「喵喵抽奖 · 管理工作台」，设置每场的平台、群、问题与答题模式。\n支持当场答对或提交后审核；只有成功参与者进入开奖名单。\n仅群聊可发起报名，私聊仅补充已有报名资料。",
     ),
 ]
 NETWORK_ERRORS = (
@@ -52,6 +62,27 @@ NETWORK_ERRORS = (
     ConnectionError,
     OSError,
 )
+
+
+def entry_text(entry: dict | None, question_count: int) -> str:
+    """Describe form completion separately from approved lottery eligibility.
+
+    Args:
+        entry: The actual sender's enrollment, or None.
+        question_count: Total questions in the activity.
+
+    Returns:
+        A public status without private answers.
+    """
+    if entry is None:
+        return "尚未参与"
+    if entry["status"] != "complete":
+        return f"待填写 · 已完成 {len(entry['answers'])}/{question_count} 项"
+    return {
+        "approved": "参与成功",
+        "pending": "资料已提交 · 等待审核",
+        "rejected": "审核未通过 · 暂无开奖资格",
+    }[entry.get("review_status", "approved")]
 
 
 def web_boundary(handler):
@@ -98,6 +129,21 @@ def tool_boundary(handler):
     @wraps(handler)
     async def wrapped(self, event, *args, **kwargs):
         try:
+            if not (await self.store.settings())["llm_tools_enabled"]:
+                self.logger.debug(
+                    "Disabled lottery tool %s rejected.", handler.__name__
+                )
+                await self.card(
+                    event,
+                    "LLM 工具已关闭",
+                    [
+                        (
+                            "使用提示",
+                            "管理员已关闭抽奖工具调用。可以使用 /抽奖 指令操作。",
+                        )
+                    ],
+                )
+                return "本插件的 LLM 工具已关闭，本次没有执行任何查询或操作。请使用 /抽奖 指令。"
             return await handler(self, event, *args, **kwargs)
         except NETWORK_ERRORS:
             self.logger.warning("Lottery tool %s could not reach QQ.", handler.__name__)
@@ -124,6 +170,7 @@ class CatLottery(Star):
         self.sender: asyncio.Task | None = None
         self.wake = asyncio.Event()
         self.delivery_lock = asyncio.Lock()
+        self.tool_switch_lock = asyncio.Lock()
 
     async def initialize(self) -> None:
         """Open storage, register plugin-only APIs, and recover pending scheduled work."""
@@ -132,6 +179,7 @@ class CatLottery(Star):
                 "A bundled font or logo is missing; reinstall the plugin."
             )
         await self.store.open()
+        await self.apply_tool_switch()
         for route, handler, methods, description in (
             ("state", self.web_state, ["GET"], "Lottery management state"),
             (
@@ -144,7 +192,7 @@ class CatLottery(Star):
                 "settings",
                 self.web_settings,
                 ["POST"],
-                "Save lottery operator allowlist",
+                "Save lottery operators and LLM tool switch",
             ),
             ("lotteries", self.web_save, ["POST"], "Create or edit lottery rules"),
             (
@@ -158,6 +206,12 @@ class CatLottery(Star):
                 self.web_action,
                 ["POST"],
                 "Operate a lottery",
+            ),
+            (
+                "lotteries/<lottery_id>/review",
+                self.web_review,
+                ["POST"],
+                "Review submitted answers and lottery eligibility",
             ),
             (
                 "images/<filename>",
@@ -174,6 +228,34 @@ class CatLottery(Star):
             self.delivery_loop(), name="catlottery-delivery"
         )
         self.logger.info("CatLottery initialized; persisted schedules are active.")
+
+    async def apply_tool_switch(self) -> None:
+        """Synchronize the persistent switch with this plugin's eight registered tools.
+
+        Raises:
+            RuntimeError: A registered lottery tool could not be found.
+        """
+        async with self.tool_switch_lock:
+            enabled = (await self.store.settings())["llm_tools_enabled"]
+            method = "activate_llm_tool" if enabled else "deactivate_llm_tool"
+            asynchronous = getattr(self.context, f"{method}_async", None)
+            for name in TOOL_NAMES:
+                # AstrBot 4.27 exposes synchronous tool control; newer releases add async APIs.
+                updated = (
+                    await asynchronous(name)
+                    if asynchronous is not None
+                    else await asyncio.to_thread(getattr(self.context, method), name)
+                )
+                if not updated:
+                    raise RuntimeError(f"Registered lottery tool {name} was not found.")
+            self.logger.info(
+                "Lottery LLM tools %s.", "enabled" if enabled else "disabled"
+            )
+
+    @filter.on_astrbot_loaded()
+    async def restore_tool_switch(self) -> None:
+        """Reapply tool settings after AstrBot finishes restoring global tool state."""
+        await self.apply_tool_switch()
 
     async def terminate(self) -> None:
         """Stop owned tasks and close SQLite before plugin reload."""
@@ -419,7 +501,12 @@ class CatLottery(Star):
                 "参与方式",
                 f"群聊发送 /抽奖 参与 {item['id']}\n"
                 + (
-                    f"报名后需私聊完成 {len(item['questions'])} 项答题或资料，全部完成才算报名成功。"
+                    f"报名后需私聊完成 {len(item['questions'])} 项答题或资料。"
+                    + (
+                        "答题必须当场答对，全部填写完成即报名成功。"
+                        if item.get("require_correct", True)
+                        else "提交后由管理员审核，全部通过才算成功参与。"
+                    )
                     if item["questions"]
                     else "本次无需填写资料，群聊报名即可成功。"
                 ),
@@ -434,7 +521,7 @@ class CatLottery(Star):
                     "\n".join(
                         f"{w['nickname']} · QQ {w['user_id']}" for w in item["winners"]
                     )
-                    or "没有完成报名的参与者，本次无人中奖。",
+                    or "无人符合开奖资格，本次无人中奖。",
                 )
             )
         await self.card(
@@ -459,13 +546,21 @@ class CatLottery(Star):
                 f"{chr(65 + n)}. {option}"
                 for n, option in enumerate(question["options"])
             )
-        instruction = (
-            "直接发送一张图片（不超过 8 MB）。"
-            if question["kind"] == "image"
-            else "直接发送文本答案（1–1000 字）。"
-        )
+        instruction = {
+            "image": "发送一张图片（不超过 8 MB），可在同一条消息中附带文字。",
+            "mixed": "在同一条消息中发送 1–1000 字文字和一张图片（不超过 8 MB），两者都必填。",
+            "text": "发送 1–1000 字文本，可在同一条消息中附带一张图片。",
+            "quiz": "发送文本答案（1–1000 字），可附带一张图片。",
+        }[question["kind"]]
         if question["options"]:
             instruction = "发送选项字母、数字序号或完整选项文本。"
+        instruction += (
+            "\n答题当场核对，答错需重答当前题。"
+            if item.get("require_correct", True) and question["kind"] == "quiz"
+            else "\n提交后直接进入下一题，全部资料由管理员后续审核。"
+            if not item.get("require_correct", True)
+            else ""
+        )
         await self.card(
             event,
             f"第 {index + 1} / {len(item['questions'])} 题",
@@ -474,11 +569,11 @@ class CatLottery(Star):
                 (
                     "怎么填写",
                     instruction
-                    + "\n/抽奖 取消填写 可以暂停；/抽奖 填写 编号 可以继续。",
+                    + "\n文字保留空格和换行。以斜杠开头时使用 /抽奖 回答 内容，可带图片。\n/抽奖 取消填写 可以暂停；/抽奖 填写 编号 可以继续。",
                 ),
                 (
                     "请在截止前完成全部题目",
-                    f"{date_text(item['close_at'])}（北京时间）\n未完成资料的报名不会参与开奖。",
+                    f"{date_text(item['close_at'])}（北京时间）\n未完成或审核未通过的报名不会参与开奖。",
                 ),
             ],
             f"{item['title']}  ·  {item['id']}  ·  QQ {entry['user_id']}",
@@ -519,11 +614,11 @@ class CatLottery(Star):
             if not created:
                 await self.card(
                     event,
-                    "你已参与成功",
+                    entry_text(entry, len(item["questions"])),
                     [
                         (
                             "报名记录",
-                            f"QQ {identity['user_id']} 已在本次抽奖中报名，无需重复参加。",
+                            f"QQ {identity['user_id']} 已提交本次资料。{entry_text(entry, len(item['questions']))}，无需重复报名。",
                         ),
                         ("自动开奖", date_text(item["draw_at"]) + "（北京时间）"),
                     ],
@@ -532,7 +627,7 @@ class CatLottery(Star):
             return (
                 "报名成功；群聊与私聊图片通知已加入发送队列。"
                 if created
-                else "该 QQ 已完成报名，未重复计数。"
+                else f"{entry_text(entry, len(item['questions']))}，未重复计数；只有参与成功者进入开奖名单。"
             )
         try:
             original_platform = self.context.get_platform_inst(entry["platform_id"])
@@ -560,7 +655,12 @@ class CatLottery(Star):
                 ("下一步", guidance),
                 (
                     "你的报名",
-                    f"QQ {identity['user_id']}\n需要完成 {len(item['questions'])} 个问题，截止前全部完成才会进入开奖名单。",
+                    f"QQ {identity['user_id']}\n截止前完成 {len(item['questions'])} 个问题。"
+                    + (
+                        "答题当场核对。"
+                        if item.get("require_correct", True)
+                        else "提交后等待管理员审核资格。"
+                    ),
                 ),
                 ("资料截止", date_text(item["close_at"]) + "（北京时间）"),
             ],
@@ -581,10 +681,15 @@ class CatLottery(Star):
             identity = self.identity(event)
             # A single root handler avoids framework-generated text errors for
             # missing arguments and unknown command-group subcommands.
-            text = event.message_str.strip().lstrip("/／").removeprefix("抽奖").strip()
-            parts = text.split(maxsplit=1)
-            command = parts[0] if parts else "帮助"
-            argument = parts[1].strip() if len(parts) > 1 else ""
+            text = "".join(
+                part.text for part in event.get_messages() if isinstance(part, Plain)
+            )
+            text = text.lstrip().lstrip("/／").removeprefix("抽奖").lstrip()
+            parts = re.match(r"(\S+)(?:\s([\s\S]*))?", text)
+            command = parts.group(1) if parts else "帮助"
+            argument = (parts.group(2) or "") if parts else ""
+            if command != "回答":
+                argument = argument.strip()
             if command in {"帮助", "help"}:
                 await self.card(
                     event,
@@ -764,13 +869,7 @@ class CatLottery(Star):
                     await self.join(event, lottery_id)
                 elif command == "状态":
                     entry = await self.store.entry(lottery_id, identity["user_id"])
-                    status = (
-                        "尚未参与"
-                        if entry is None
-                        else "参与成功"
-                        if entry["status"] == "complete"
-                        else f"待填写 · 已完成 {len(entry['answers'])}/{len(item['questions'])} 项"
-                    )
+                    status = entry_text(entry, len(item["questions"]))
                     await self.card(
                         event,
                         status,
@@ -840,7 +939,9 @@ class CatLottery(Star):
             else:
                 raise ValueError("未知子命令。发送 /抽奖 查看图片帮助。")
         except ValueError as exc:
-            self.logger.debug("Lottery command validation rejected: %s", exc)
+            self.logger.debug(
+                "Lottery command validation rejected (%s).", type(exc).__name__
+            )
             await self.card(
                 event, "再检查一下，喵", [("操作提示", str(exc))], badge="抽奖提示"
             )
@@ -882,10 +983,11 @@ class CatLottery(Star):
             if content is not None
             else "".join(
                 part.text for part in event.get_messages() if isinstance(part, Plain)
-            ).strip()
+            )
         )
         if content is None and (
-            text.startswith(("/", "／")) or re.match(r"^抽奖(?:\s|$)", text)
+            text.lstrip().startswith(("/", "／"))
+            or re.match(r"^抽奖(?:\s|$)", text.lstrip())
         ):
             return
         raw = event.message_obj.raw_message
@@ -916,9 +1018,15 @@ class CatLottery(Star):
                 raise ValueError("报名已截止，未完成的资料不会进入开奖名单。")
             question = item["questions"][index]
             images = [part for part in event.get_messages() if isinstance(part, Image)]
-            if question["kind"] == "image":
-                if len(images) != 1 or text:
-                    raise ValueError("本题请单独发送一张图片，不要附带文本。")
+            if len(images) > 1:
+                raise ValueError("每题最多发送一张图片，可与文字在同一条消息中提交。")
+            if question["kind"] in {"image", "mixed"} and not images:
+                raise ValueError("本题需要一张图片，请按题目要求重新发送。")
+            if len(text) > 1000 or (question["kind"] != "image" and not text.strip()):
+                raise ValueError(
+                    "本题需要 1–1000 字非空文本，可附带一张图片；空格与换行也计入长度。"
+                )
+            if images:
                 local_path = Path(
                     await asyncio.wait_for(images[0].convert_to_file_path(), timeout=25)
                 )
@@ -938,17 +1046,22 @@ class CatLottery(Star):
                         await asyncio.to_thread(
                             picture.save, stored_image, "JPEG", quality=88
                         )
-                answer = {"kind": "image", "value": stored_image.name}
+            if question["kind"] == "image":
+                answer = {"kind": "image", "value": stored_image.name, "text": text}
             else:
-                if images:
-                    raise ValueError("本题需要文本，请直接发送答案或资料，不要发图片。")
-                answer = {"kind": "text", "value": text}
+                answer = {
+                    "kind": "mixed" if question["kind"] == "mixed" else "text",
+                    "value": text,
+                }
+                if stored_image is not None:
+                    answer["image"] = stored_image.name
             item, entry = await self.store.answer(lottery_id, identity, answer, index)
             stored_image = None
             if entry["status"] == "complete":
                 self.logger.info(
-                    "Lottery %s private form completed; success notices queued.",
+                    "Lottery %s private form completed; eligibility=%s; notices queued.",
                     lottery_id,
+                    entry.get("review_status", "approved"),
                 )
                 self.wake.set()
             else:
@@ -1053,13 +1166,19 @@ class CatLottery(Star):
                         raise ConnectionError("Bot offline")
                     subtitle = f"{item['title']} · {item['id']}"
                     kind = message["kind"]
-                    if kind == "success":
+                    if kind in {"success", "submitted", "review"}:
                         entry = message["entry"]
-                        title = "参与成功 · 好运已收好"
+                        status = entry.get("review_status", "approved")
+                        title = entry_text(entry, len(item["questions"]))
+                        explanation = {
+                            "approved": "已成功参与，每个 QQ 号仅计一次，已获得开奖资格。",
+                            "pending": "资料已提交，请等待管理员审核。审核全部通过后才有开奖资格。",
+                            "rejected": "审核未通过，暂不进入开奖名单。请联系活动管理员核对。",
+                        }[status]
                         sections = [
                             (
                                 "报名确认",
-                                f"{entry['nickname']} · QQ {entry['user_id']}\n已完成报名，每个 QQ 号仅计一次。",
+                                f"{entry['nickname']} · QQ {entry['user_id']}\n{explanation}",
                             ),
                             (
                                 "奖品与开奖",
@@ -1076,7 +1195,7 @@ class CatLottery(Star):
                                     f"{n + 1}. {w['nickname']} · QQ {w['user_id']}"
                                     for n, w in enumerate(winners)
                                 )
-                                or "本次没有完成报名的参与者，无人中奖。",
+                                or "无人符合开奖资格，本次无人中奖。",
                             ),
                             (
                                 "本次奖品",
@@ -1098,7 +1217,7 @@ class CatLottery(Star):
                                 "活动状态",
                                 "本次活动已取消，不再接受报名或开奖。"
                                 if kind == "cancelled"
-                                else f"停止报名与资料填写，已完成报名仍有效。\n自动开奖：{date_text(item['draw_at'])}（北京时间）",
+                                else f"停止报名与资料填写，已成功参与的报名仍有效。后审活动请在开奖前完成资格审核。\n自动开奖：{date_text(item['draw_at'])}（北京时间）",
                             )
                         ]
                     else:
@@ -1113,6 +1232,11 @@ class CatLottery(Star):
                                 f"在本群发送 /抽奖 参与 {item['id']}\n"
                                 + (
                                     f"群聊报名后，需私聊完成 {len(item['questions'])} 项问题或资料。"
+                                    + (
+                                        "答题当场核对。"
+                                        if item.get("require_correct", True)
+                                        else "提交后由管理员审核，全部通过才算成功参与。"
+                                    )
                                     if item["questions"]
                                     else "无需填写资料，群聊报名即可成功。"
                                 ),
@@ -1130,7 +1254,7 @@ class CatLottery(Star):
                         subtitle,
                         sections,
                         "报名确认"
-                        if kind == "success"
+                        if kind in {"success", "submitted", "review"}
                         else "开奖通知"
                         if kind == "result"
                         else "抽奖公告",
@@ -1195,13 +1319,14 @@ class CatLottery(Star):
 
     @web_boundary
     async def web_settings(self):
-        """Save validated operator IDs from the dedicated management Page."""
+        """Save operators and apply the persistent LLM switch from the management Page."""
         try:
             payload = await request.json()
             if not isinstance(payload, dict):
                 raise ValueError("管理员设置必须为对象。")
             settings = await self.store.settings(payload)
-            self.logger.info("Lottery operator settings updated via WebUI.")
+            await self.apply_tool_switch()
+            self.logger.info("Lottery operator and tool settings updated via WebUI.")
             return json_response(settings)
         except ValueError as exc:
             return error_response(str(exc))
@@ -1288,6 +1413,33 @@ class CatLottery(Star):
             self.logger.info("Lottery %s action=%s via WebUI.", lottery_id, action)
             self.wake.set()
             return json_response(item)
+        except ValueError as exc:
+            return error_response(str(exc))
+
+    @web_boundary
+    async def web_review(self, lottery_id: str):
+        """Review private submissions using the authenticated management identity.
+
+        Args:
+            lottery_id: Exact activity identifier from the route.
+
+        Returns:
+            Review counts or a safe validation error.
+        """
+        try:
+            payload = await request.json()
+            result = await self.store.review(
+                lottery_id, payload, f"web:{request.username}"
+            )
+            self.logger.info(
+                "Lottery %s review action=%s; marked=%d; changed=%d.",
+                lottery_id,
+                payload["action"],
+                result["marked_answers"],
+                result["changed_entries"],
+            )
+            self.wake.set()
+            return json_response(result)
         except ValueError as exc:
             return error_response(str(exc))
 
@@ -1400,8 +1552,10 @@ class CatLottery(Star):
         message, never enroll a mentioned/quoted user, and never accept a user_id
         or session ID from the model. If multiple lotteries are possible, ask
         which one first. With questions this only reserves a slot and sends
-        private-form instructions; do not claim success until all questions are
-        complete. With no questions success images are queued for group AND DM.
+        private-form instructions. In instant-check mode, all questions must be
+        completed; in review mode, completed submissions must also be approved.
+        Never claim eligibility while review is pending or rejected. With no
+        questions success images are queued for group AND DM.
 
         Args:
             lottery_id (string): Exact ID selected by the sender, from catlottery_list or a real announcement.
@@ -1422,8 +1576,9 @@ class CatLottery(Star):
 
         Use for a sender asking whether their own enrollment succeeded. Works
         in allowed groups or the associated robot's DM, never creates a slot,
-        never reads another person's answers, and never treats pending as
-        complete. No user, nickname, or conversation ID parameter is accepted.
+        never reads another person's answers. Submission completion is separate
+        from eligibility: pending or rejected review is NOT successful participation.
+        No user, nickname, or conversation ID parameter is accepted.
 
         Args:
             lottery_id (string): Exact activity ID selected by the actual sender.
@@ -1438,6 +1593,17 @@ class CatLottery(Star):
             entry = await self.store.entry(lottery_id, identity["user_id"])
             status = {
                 "status": entry["status"] if entry else "not_joined",
+                "review_status": entry.get(
+                    "review_status",
+                    "approved" if entry["status"] == "complete" else "incomplete",
+                )
+                if entry
+                else None,
+                "eligible": bool(
+                    entry
+                    and entry["status"] == "complete"
+                    and entry.get("review_status", "approved") == "approved"
+                ),
                 "answered": len(entry["answers"]) if entry else 0,
                 "questions": len(item["questions"]),
                 "user_id": identity["user_id"],
@@ -1448,11 +1614,7 @@ class CatLottery(Star):
                 [
                     (
                         "报名状态",
-                        "参与成功"
-                        if status["status"] == "complete"
-                        else "尚未参与"
-                        if not entry
-                        else f"待私聊填写，已完成 {status['answered']}/{status['questions']} 项",
+                        entry_text(entry, len(item["questions"])),
                     ),
                     ("身份", f"QQ {identity['user_id']}"),
                 ],
@@ -1626,6 +1788,9 @@ class CatLottery(Star):
         Requires actual QQ administrator identity and this lottery's allowed
         platform/group. Results are sent to EVERY configured group. Drawing an
         already finalized lottery is rejected; delivery retry never rerolls.
+        Only successfully enrolled and approved users enter the draw; unfinished,
+        pending-review, and rejected entries are excluded. An empty eligible pool
+        produces a final empty result and group notifications, never an error.
 
         Args:
             lottery_id (string): Exact existing lottery ID selected by the operator.

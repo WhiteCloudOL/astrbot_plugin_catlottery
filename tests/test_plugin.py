@@ -5,6 +5,7 @@ import json
 import sqlite3
 import time
 from types import SimpleNamespace
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 from astrbot.api.message_components import Image, Plain
@@ -16,7 +17,7 @@ from astrbot.core.platform.sources.aiocqhttp.aiocqhttp_message_event import (
     AiocqhttpMessageEvent,
 )
 from astrbot.dashboard.services.plugin_page_service import PluginPageService
-from astrbot_plugin_catlottery.main import CatLottery
+from astrbot_plugin_catlottery.main import TOOL_NAMES, CatLottery
 from astrbot_plugin_catlottery.storage import Store
 from PIL import Image as PillowImage
 from starlette.requests import Request
@@ -86,12 +87,243 @@ async def plugin(tmp_path):
         get_config=lambda: {"admins_id": ["9999999"]},
         registered_web_apis=[],
         register_web_api=lambda *args: None,
+        activate_llm_tool_async=AsyncMock(return_value=True),
+        deactivate_llm_tool_async=AsyncMock(return_value=True),
     )
     instance = CatLottery(context)
     instance.store = Store(tmp_path)
     await instance.store.open()
     yield instance
     await instance.terminate()
+
+
+async def test_tool_switch_blocks_all_tools_and_leaves_qq_commands_available(
+    plugin, rules
+):
+    item = await plugin.store.save(rules, "admin")
+    with web_request({"manager_ids": [], "llm_tools_enabled": False}):
+        assert (await plugin.web_settings()).status_code == 200
+    assert [
+        call.args[0]
+        for call in plugin.context.deactivate_llm_tool_async.await_args_list
+    ] == list(TOOL_NAMES)
+    for handler, args in (
+        (plugin.tool_list, ()),
+        (plugin.tool_info, (item["id"],)),
+        (plugin.tool_join, (item["id"],)),
+        (plugin.tool_status, (item["id"],)),
+        (plugin.tool_withdraw, (item["id"],)),
+        (plugin.tool_fill, (item["id"],)),
+        (plugin.tool_create, ("标题", "奖品", 1, "2030-01-01", "2030-01-02")),
+        (plugin.tool_manage, (item["id"], "draw", True)),
+    ):
+        assert "已关闭" in await handler(event(plugin), *args)
+    assert (await plugin.store.get(item["id"]))["status"] == "open"
+    assert len(await plugin.store.snapshot()) == 1
+    assert (await plugin.store.snapshot())[0]["entry_count"] == 0
+    await plugin.lottery_command(event(plugin, text=f"抽奖 参与 {item['id']}"))
+    assert (await plugin.store.entry(item["id"], "4444444"))["status"] == "complete"
+    with web_request({"manager_ids": [], "llm_tools_enabled": True}):
+        assert (await plugin.web_settings()).status_code == 200
+    assert [
+        call.args[0] for call in plugin.context.activate_llm_tool_async.await_args_list
+    ] == list(TOOL_NAMES)
+    assert "已关闭" not in await plugin.tool_list(event(plugin))
+
+
+async def test_tool_switch_supports_astrbot_427_api_and_startup_restore(plugin):
+    del plugin.context.activate_llm_tool_async
+    del plugin.context.deactivate_llm_tool_async
+    plugin.context.activate_llm_tool = Mock(return_value=True)
+    plugin.context.deactivate_llm_tool = Mock(return_value=True)
+    await plugin.store.settings({"manager_ids": [], "llm_tools_enabled": False})
+    await plugin.store.close()
+    await plugin.initialize()
+    await plugin.restore_tool_switch()
+    assert plugin.context.deactivate_llm_tool.call_count == len(TOOL_NAMES) * 2
+    await plugin.store.settings({"manager_ids": [], "llm_tools_enabled": True})
+    await plugin.apply_tool_switch()
+    assert [
+        call.args[0] for call in plugin.context.activate_llm_tool.call_args_list
+    ] == list(TOOL_NAMES)
+
+
+async def test_multiple_questions_accept_mixed_messages_and_preserve_spaces(
+    plugin, rules, tmp_path
+):
+    rules["require_correct"] = False
+    rules["questions"] = [
+        {"kind": "quiz", "prompt": "两词之间两个空格", "answers": ["first  second"]},
+        {"kind": "mixed", "prompt": "文字和图片都必填"},
+        {"kind": "image", "prompt": "图片可附说明"},
+    ]
+    item = await plugin.store.save(rules, "admin")
+    await plugin.join(event(plugin), item["id"])
+    await plugin.lottery_command(
+        event(plugin, group="", text=f"抽奖 填写 {item['id']}")
+    )
+    first = "  FIRST  SECOND\n "
+    await plugin.collect_private(event(plugin, group="", text=first))
+    entry = await plugin.store.entry(item["id"], "4444444")
+    assert entry["answers"][0]["value"] == first
+    source = tmp_path / "mixed.png"
+    PillowImage.new("RGB", (64, 64), "pink").save(source)
+    await plugin.collect_private(event(plugin, group="", text="missing image"))
+    await plugin.collect_private(
+        event(plugin, group="", components=[Image.fromFileSystem(source)])
+    )
+    assert len((await plugin.store.entry(item["id"], "4444444"))["answers"]) == 1
+    text = "  /docs/a b\n  line  two  "
+    await plugin.lottery_command(
+        event(
+            plugin,
+            group="",
+            components=[Plain(f"/抽奖 回答 {text}"), Image.fromFileSystem(source)],
+        )
+    )
+    await plugin.collect_private(
+        event(
+            plugin,
+            group="",
+            components=[Plain("  photo  caption\n"), Image.fromFileSystem(source)],
+        )
+    )
+    entry = await plugin.store.entry(item["id"], "4444444")
+    assert entry["status"] == "complete"
+    assert entry["review_status"] == "pending"
+    assert entry["answers"][1]["kind"] == "mixed"
+    assert entry["answers"][1]["value"] == text
+    assert entry["answers"][2]["text"] == "  photo  caption\n"
+    for answer in entry["answers"][1:]:
+        filename = answer["value"] if answer["kind"] == "image" else answer["image"]
+        assert (plugin.store.directory / "uploads" / filename).is_file()
+    assert len(await plugin.store.deliveries()) == 2
+
+
+async def test_wrong_quiz_with_image_discards_file_but_correct_text_keeps_both(
+    plugin, rules, tmp_path
+):
+    rules["questions"] = [
+        {"kind": "quiz", "prompt": "包含空格的答案", "answers": ["a  b"]}
+    ]
+    item = await plugin.store.save(rules, "admin")
+    await plugin.join(event(plugin), item["id"])
+    await plugin.store.private_session("1234567", "4444444", item["id"])
+    source = tmp_path / "answer.png"
+    PillowImage.new("RGB", (64, 64), "blue").save(source)
+    for text, accepted in (("a b", False), ("  A  B\n", True)):
+        await plugin.collect_private(
+            event(
+                plugin, group="", components=[Plain(text), Image.fromFileSystem(source)]
+            )
+        )
+        entry = await plugin.store.entry(item["id"], "4444444")
+        assert bool(entry["answers"]) is accepted
+        assert len(list((plugin.store.directory / "uploads").glob("*.jpg"))) == int(
+            accepted
+        )
+    assert entry["answers"][0]["value"] == "  A  B\n"
+    assert entry["answers"][0]["image"]
+
+
+async def test_deferred_review_keeps_wrong_mixed_answer_and_truthful_status(
+    plugin, rules, tmp_path, monkeypatch
+):
+    rules.update(
+        require_correct=False,
+        questions=[
+            {"kind": "quiz", "prompt": "正确答案有两个空格", "answers": ["a  b"]},
+            {"kind": "text", "prompt": "第二题"},
+        ],
+    )
+    item = await plugin.store.save(rules, "admin")
+    await plugin.join(event(plugin), item["id"])
+    await plugin.store.private_session("1234567", "4444444", item["id"])
+    source = tmp_path / "deferred.png"
+    PillowImage.new("RGB", (80, 80), "pink").save(source)
+    await plugin.collect_private(
+        event(
+            plugin,
+            group="",
+            components=[Plain("  wrong  answer\n"), Image.fromFileSystem(source)],
+        )
+    )
+    entry = await plugin.store.entry(item["id"], "4444444")
+    assert entry["answers"][0]["value"] == "  wrong  answer\n"
+    assert entry["answers"][0]["correct"] is None
+    assert len(list((plugin.store.directory / "uploads").glob("*.jpg"))) == 1
+    await plugin.collect_private(event(plugin, group="", text="second answer"))
+    status = json.loads(await plugin.tool_status(event(plugin), item["id"]))
+    assert (
+        status["status"] == "complete"
+        and status["review_status"] == "pending"
+        and status["eligible"] is False
+    )
+    assert "等待审核" in await plugin.join(event(plugin), item["id"])
+    with web_request({"action": "match"}):
+        response = await plugin.web_review(item["id"])
+    assert response.status_code == 200
+    assert json.loads(response.body)["marked_answers"] == 0
+    for index in (0, 1):
+        with web_request(
+            {
+                "action": "mark",
+                "user_id": "4444444",
+                "question_index": index,
+                "correct": True,
+            },
+            username="reviewer",
+        ):
+            assert (await plugin.web_review(item["id"])).status_code == 200
+    status = json.loads(await plugin.tool_status(event(plugin, group=""), item["id"]))
+    assert status["eligible"] is True and status["review_status"] == "approved"
+    captured = []
+
+    def capture(title, subtitle, sections, badge):
+        captured.append((title, sections))
+        return [b"image"]
+
+    monkeypatch.setattr("astrbot_plugin_catlottery.main.render_pages", capture)
+    await plugin.send_deliveries()
+    assert len(captured) == 2
+    assert all(title == "参与成功" for title, _ in captured)
+    assert "wrong  answer" not in str(captured)
+    client = plugin.context.get_platform_inst("napcat").client
+    assert {name for name, kwargs in client.calls[-2:]} == {
+        "send_group_msg",
+        "send_private_msg",
+    }
+
+
+async def test_empty_eligible_pool_announces_saved_result_to_each_group(
+    plugin, rules, monkeypatch
+):
+    rules.update(
+        require_correct=False, questions=[{"kind": "text", "prompt": "需要审核的资料"}]
+    )
+    item = await plugin.store.save(rules, "admin")
+    await plugin.join(event(plugin), item["id"])
+    await plugin.store.private_session("1234567", "4444444", item["id"])
+    await plugin.collect_private(event(plugin, group="", text="not reviewed"))
+    drawn = await plugin.store.action(item["id"], "draw")
+    assert drawn["eligible_count"] == 0 and drawn["winners"] == []
+    captured = []
+
+    def capture(title, subtitle, sections, badge):
+        if badge == "开奖通知":
+            captured.append(sections)
+        return [b"image"]
+
+    monkeypatch.setattr("astrbot_plugin_catlottery.main.render_pages", capture)
+    await plugin.send_deliveries()
+    assert len(captured) == 2
+    assert all("无人符合开奖资格" in str(sections) for sections in captured)
+    for platform_id, group_id in (("napcat", 2222222), ("snowluma", 3333333)):
+        client = plugin.context.get_platform_inst(platform_id).client
+        assert any(
+            action == "send_group_msg" and params["group_id"] == group_id
+            for action, params in client.calls
+        )
 
 
 @pytest.fixture
@@ -355,6 +587,7 @@ async def test_all_management_endpoints_deny_unauthenticated_access(plugin):
         (plugin.web_save, ()),
         (plugin.web_detail, ("12345678",)),
         (plugin.web_action, ("12345678",)),
+        (plugin.web_review, ("12345678",)),
         (plugin.web_image, ("a" * 32 + ".jpg",)),
     ):
         with web_request(username=None):
@@ -449,7 +682,7 @@ async def test_lifecycle_registers_only_owned_routes_and_stops_tasks(plugin, tmp
     instance = CatLottery(context)
     instance.store = Store(tmp_path / "lifecycle")
     await instance.initialize()
-    assert len(context.registered_web_apis) == 8
+    assert len(context.registered_web_apis) == 9
     tasks = (instance.worker, instance.sender)
     await instance.terminate()
     assert all(task.done() for task in tasks)
