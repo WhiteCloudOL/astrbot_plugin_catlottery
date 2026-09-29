@@ -884,7 +884,9 @@ class CatLottery(Star):
                 part.text for part in event.get_messages() if isinstance(part, Plain)
             ).strip()
         )
-        if content is None and text.startswith(("/", "／", "抽奖")):
+        if content is None and (
+            text.startswith(("/", "／")) or re.match(r"^抽奖(?:\s|$)", text)
+        ):
             return
         raw = event.message_obj.raw_message
         if not isinstance(raw, dict) or raw.get("post_type") != "message":

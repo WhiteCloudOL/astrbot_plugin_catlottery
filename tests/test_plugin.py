@@ -433,6 +433,15 @@ async def test_explicit_private_answer_preserves_slash_content(plugin, rules):
     ] == "/docs/guide"
 
 
+async def test_private_text_can_begin_with_lottery_word(plugin, rules):
+    rules["questions"] = [{"kind": "text", "prompt": "参与理由"}]
+    item = await plugin.store.save(rules, "admin")
+    await plugin.join(event(plugin), item["id"])
+    await plugin.store.private_session("1234567", "4444444", item["id"])
+    await plugin.collect_private(event(plugin, group="", text="抽奖让我很期待"))
+    assert (await plugin.store.entry(item["id"], "4444444"))["status"] == "complete"
+
+
 async def test_lifecycle_registers_only_owned_routes_and_stops_tasks(plugin, tmp_path):
     context = plugin.context
     context.registered_web_apis = [("/another_plugin/state", None, ["GET"], "External")]
