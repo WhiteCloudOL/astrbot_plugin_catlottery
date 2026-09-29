@@ -860,16 +860,18 @@ class Store:
                     (bot_id, user_id, lottery_id, len(entry["answers"])),
                 )
             async with self.db.execute(
-                "SELECT s.lottery_id FROM sessions s "
+                "SELECT s.lottery_id, l.body FROM sessions s "
                 "JOIN entries e ON e.lottery_id=s.lottery_id AND e.user_id=s.user_id "
                 "JOIN lotteries l ON l.id=s.lottery_id "
                 "WHERE s.bot_id=? AND s.user_id=? "
                 "AND json_extract(e.body,'$.status')='pending' "
-                "AND json_extract(l.body,'$.status')='open' "
-                "AND json_extract(l.body,'$.close_at')>?",
-                (bot_id, user_id, time.time()),
+                "AND json_extract(l.body,'$.status')='open'",
+                (bot_id, user_id),
             ) as cursor:
                 row = await cursor.fetchone()
+            # Older SQLite JSON parsers can round fractional timestamps differently.
+            if row is not None and time.time() >= json.loads(row[1])["close_at"]:
+                row = None
             if row is None:
                 await self.db.execute(
                     "DELETE FROM sessions WHERE bot_id=? AND user_id=?",
@@ -1467,11 +1469,13 @@ class Store:
             try:
                 async with self.db.execute(
                     "SELECT body FROM lotteries WHERE json_extract(body,'$.status')='open' "
-                    "AND json_extract(body,'$.announcement_next_at')<=?",
-                    (now,),
+                    "AND json_extract(body,'$.announcement_next_at') IS NOT NULL"
                 ) as cursor:
                     items = [json.loads(row[0]) for row in await cursor.fetchall()]
                 for item in items:
+                    # Compare Python-decoded values to preserve the exact deadline on all OSes.
+                    if item["announcement_next_at"] > now:
+                        continue
                     schedule = item["announcement_schedule"]
                     next_at = None
                     if now < item["close_at"] and schedule["mode"] != "off":

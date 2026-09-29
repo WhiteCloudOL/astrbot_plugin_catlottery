@@ -2,12 +2,62 @@
 
 import asyncio
 import json
+import math
 import os
 import time
 from copy import deepcopy
 
 import pytest
 from astrbot_plugin_catlottery.storage import Store, timestamp, validate_lottery
+
+
+@pytest.mark.parametrize("mode", ["once", "repeat"])
+async def test_fractional_announcement_deadline_uses_exact_saved_time(
+    store, rules, monkeypatch, mode
+):
+    # SQLite 3.40 on Windows rounds this JSON number upward by one float step.
+    start = 1790699748.8209887
+    monkeypatch.setattr(time, "time", lambda: start - 60)
+    rules.update(close_at=start + 3600, draw_at=start + 7200)
+    item = await store.save(
+        {
+            **rules,
+            "announcement_schedule": {
+                "mode": mode,
+                "start_at": start,
+                "interval_minutes": 1,
+            },
+        },
+        "admin",
+    )
+    assert (
+        await store.schedule_announcements(now=math.nextafter(start, -math.inf)) == []
+    )
+    assert await store.schedule_announcements(now=start) == [item["id"]]
+    saved = await store.get(item["id"])
+    assert saved["announcement_last_at"] == start
+    assert saved["announcement_next_at"] == (start + 60 if mode == "repeat" else None)
+    assert await store.schedule_announcements(now=start) == []
+
+
+async def test_fractional_private_session_cutoff_is_exact(
+    store, rules, sender, monkeypatch
+):
+    cutoff = 1790699748.8209887
+    monkeypatch.setattr(time, "time", lambda: cutoff - 60)
+    rules.update(
+        close_at=cutoff,
+        draw_at=cutoff + 3600,
+        questions=[{"kind": "text", "prompt": "资料"}],
+    )
+    item = await store.save(rules, "admin")
+    await store.enroll(item["id"], sender)
+    monkeypatch.setattr(time, "time", lambda: math.nextafter(cutoff, -math.inf))
+    assert (
+        await store.private_session(sender["bot_id"], sender["user_id"]) == item["id"]
+    )
+    monkeypatch.setattr(time, "time", lambda: cutoff)
+    assert await store.private_session(sender["bot_id"], sender["user_id"]) is None
 
 
 async def test_expired_session_releases_sender_for_another_lottery(
