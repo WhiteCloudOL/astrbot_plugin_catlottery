@@ -139,3 +139,17 @@ def test_missing_artwork_keeps_public_text_and_valid_card(tmp_path):
     assert len(pages) == 1
     with Image.open(BytesIO(pages[0])) as picture:
         assert picture.format == "PNG"
+
+
+def test_corrupt_optional_artwork_and_avatar_do_not_block_result_cards(tmp_path):
+    broken = tmp_path / "broken.jpg"
+    broken.write_bytes(b"incomplete image")
+    pages = render_pages(
+        "开奖结果",
+        "活动 a1234567",
+        [("一等奖", "小云朵 · QQ 4444444", broken)],
+        avatar_path=broken,
+    )
+    with Image.open(BytesIO(pages[0])) as picture:
+        assert picture.format == "PNG"
+        assert picture.height <= 2300

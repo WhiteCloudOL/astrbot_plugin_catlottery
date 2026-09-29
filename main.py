@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import binascii
 import contextlib
 import json
 import re
@@ -13,14 +14,19 @@ import time
 from functools import wraps
 from io import BytesIO
 from pathlib import Path
+from urllib.parse import unquote, urlsplit
 
+import aiohttp
 from aiocqhttp.exceptions import Error as OneBotError
 from astrbot.api.event import AstrMessageEvent, MessageChain, filter
 from astrbot.api.message_components import Image, Plain
 from astrbot.api.star import Context, Star
 from astrbot.api.web import error_response, file_response, json_response, request
 from astrbot.core.platform.message_type import MessageType
-from astrbot.core.utils.astrbot_path import get_astrbot_plugin_data_path
+from astrbot.core.utils.astrbot_path import (
+    get_astrbot_plugin_data_path,
+    get_astrbot_temp_path,
+)
 from PIL import Image as PillowImage
 from PIL import ImageOps, UnidentifiedImageError
 
@@ -238,7 +244,7 @@ def tool_boundary(handler):
             return "QQ 连接暂时失败。请查询实际状态后再操作，不要推断操作成功，也不要自动重复创建或开奖。"
         except (sqlite3.Error, RuntimeError, json.JSONDecodeError):
             self.logger.exception("Lottery tool %s storage failure.", handler.__name__)
-            await self.card(
+            await self.error_card(
                 event,
                 "服务暂时不可用",
                 [("操作提示", "请检查 AstrBot 日志并稍后查询报名或抽奖状态。")],
@@ -260,6 +266,8 @@ class CatLottery(Star):
         self.delivery_lock = asyncio.Lock()
         self.tool_switch_lock = asyncio.Lock()
         self.avatars = AvatarCache(self.store.directory / "avatars", self.logger)
+        self.image_session: aiohttp.ClientSession | None = None
+        self.image_slots = asyncio.Semaphore(4)
 
     async def initialize(self) -> None:
         """Open storage, register plugin-only APIs, and recover pending scheduled work."""
@@ -268,7 +276,11 @@ class CatLottery(Star):
                 "A bundled font or logo is missing; reinstall the plugin."
             )
         await self.store.open()
-        await self.apply_tool_switch()
+        try:
+            await self.apply_tool_switch()
+        except BaseException:
+            await self.store.close()
+            raise
         for route, handler, methods, description in (
             ("state", self.web_state, ["GET"], "Lottery management state"),
             (
@@ -350,7 +362,7 @@ class CatLottery(Star):
         self.logger.info("CatLottery initialized; persisted schedules are active.")
 
     async def apply_tool_switch(self) -> None:
-        """Synchronize the persistent switch with this plugin's eight registered tools.
+        """Synchronize the persistent switch with this plugin's registered tools.
 
         Raises:
             RuntimeError: A registered lottery tool could not be found.
@@ -388,6 +400,9 @@ class CatLottery(Star):
                     await task
         self.worker = self.sender = None
         await self.avatars.close()
+        if self.image_session is not None:
+            await self.image_session.close()
+            self.image_session = None
         await self.store.close()
         self.context.registered_web_apis[:] = [
             api
@@ -418,7 +433,7 @@ class CatLottery(Star):
         user_id = str(event.get_sender_id())
         bot_id = str(event.get_self_id())
         group_id = str(event.get_group_id() or "")
-        if any(not re.fullmatch(r"[1-9]\d{4,19}", x) for x in (user_id, bot_id)):
+        if any(not re.fullmatch(r"[1-9][0-9]{4,19}", x) for x in (user_id, bot_id)):
             raise ValueError("无法确认你的 QQ 身份或我的 QQ 账号。")
         if str(raw.get("user_id")) != user_id or str(raw.get("self_id")) != bot_id:
             raise ValueError("QQ 消息身份不一致，已拒绝操作。")
@@ -520,6 +535,30 @@ class CatLottery(Star):
         )
         await event.send(MessageChain([Image.fromBytes(png) for png in pngs]))
 
+    async def error_card(
+        self,
+        event: AstrMessageEvent,
+        title: str,
+        sections: list[CardSection],
+        subtitle: str = "",
+        badge: str = "抽奖提示",
+    ) -> None:
+        """Attempt one error reply without allowing a transport failure to escape.
+
+        Args:
+            event: Destination event.
+            title: User-facing error title.
+            sections: Safe error context and next steps.
+            subtitle: Optional activity context.
+            badge: Card category.
+        """
+        try:
+            await self.card(event, title, sections, subtitle, badge)
+        except NETWORK_ERRORS as exc:
+            self.logger.warning(
+                "Lottery error reply could not be delivered (%s).", type(exc).__name__
+            )
+
     async def platform_inventory(self) -> list[dict]:
         """Discover running adapters and live account/group metadata with bounded waits.
 
@@ -612,6 +651,17 @@ class CatLottery(Star):
                 raise ValueError(
                     "所选 QQ 账号离线，无法验证目标群，请连接协议端后重试。"
                 ) from exc
+            if (
+                not isinstance(login, dict)
+                or not isinstance(groups, list)
+                or any(not isinstance(group, dict) for group in groups)
+            ):
+                self.logger.warning(
+                    "OneBot returned invalid account or group metadata."
+                )
+                raise ValueError(
+                    "QQ 协议端返回的账号或群信息无效，请刷新平台列表后重试。"
+                )
             if str(login.get("user_id")) != target["bot_id"] or target[
                 "group_id"
             ] not in {str(g.get("group_id")) for g in groups}:
@@ -929,7 +979,26 @@ class CatLottery(Star):
             text = "".join(
                 part.text for part in event.get_messages() if isinstance(part, Plain)
             )
-            text = text.lstrip().lstrip("/／").removeprefix("抽奖").lstrip()
+            raw_segments = event.message_obj.raw_message.get("message")
+            if isinstance(raw_segments, list):
+                # The adapter trims Plain components; raw segments preserve submitted whitespace.
+                text = "".join(
+                    segment["data"]["text"]
+                    for segment in raw_segments
+                    if isinstance(segment, dict)
+                    and segment.get("type") == "text"
+                    and isinstance(segment.get("data"), dict)
+                    and isinstance(segment["data"].get("text"), str)
+                )
+            text = text.lstrip()
+            for prefix in self.context.get_config(event.unified_msg_origin).get(
+                "wake_prefix", ["/", "／"]
+            ):
+                if prefix and text.startswith(prefix):
+                    text = text[len(prefix) :].lstrip()
+                    break
+            # The framework already matched the root command, including configured renames.
+            text = re.sub(r"^\S+\s*", "", text, count=1)
             parts = re.match(r"(\S+)(?:\s([\s\S]*))?", text)
             command = parts.group(1) if parts else "帮助"
             argument = (parts.group(2) or "") if parts else ""
@@ -938,7 +1007,7 @@ class CatLottery(Star):
             if command in {"帮助", "help"}:
                 await self.card(
                     event,
-                    "把好运留给你，喵！",
+                    "喵喵抽奖 · 使用帮助",
                     HELP,
                     "群聊报名 · 私聊填写 · 定时开奖",
                     "使用帮助",
@@ -974,7 +1043,7 @@ class CatLottery(Star):
                     )
                 await self.card(
                     event,
-                    "这里藏着下一份好运",
+                    "当前抽奖活动",
                     sections
                     or [("暂时没有抽奖", "当前平台和群还没有允许参与的抽奖。")],
                     "显示最近 20 个抽奖 · /抽奖 详情 编号",
@@ -1119,7 +1188,7 @@ class CatLottery(Star):
                 self.wake.set()
                 await self.card(
                     event,
-                    "新的好运已准备好",
+                    "抽奖已创建",
                     [
                         ("抽奖编号", item["id"]),
                         (
@@ -1199,7 +1268,7 @@ class CatLottery(Star):
                         [
                             (
                                 "群通知",
-                                "通知已加入持久化发送队列，将发往本次抽奖设置的全部群。",
+                                "通知已排队，将发送到本场活动设置的全部群。",
                             )
                         ],
                         f"{item['title']} · {lottery_id}",
@@ -1210,12 +1279,12 @@ class CatLottery(Star):
             self.logger.debug(
                 "Lottery command validation rejected (%s).", type(exc).__name__
             )
-            await self.card(
-                event, "再检查一下，喵", [("操作提示", str(exc))], badge="抽奖提示"
+            await self.error_card(
+                event, "暂时无法操作", [("操作提示", str(exc))], badge="抽奖提示"
             )
         except (sqlite3.Error, RuntimeError, json.JSONDecodeError):
             self.logger.exception("Lottery command storage failure.")
-            await self.card(
+            await self.error_card(
                 event,
                 "服务暂时不可用",
                 [
@@ -1229,11 +1298,7 @@ class CatLottery(Star):
             self.logger.warning(
                 "Lottery command network failure (%s).", type(exc).__name__
             )
-            await self.card(
-                event,
-                "连接暂时打了个盹",
-                [("请稍后重试", "QQ 协议端暂时无法处理请求，请检查平台连接。")],
-            )
+            # A reply failure must not trigger another send through the same broken transport.
 
     @filter.event_message_type(filter.EventMessageType.PRIVATE_MESSAGE, priority=80)
     @filter.platform_adapter_type(filter.PlatformAdapterType.AIOCQHTTP)
@@ -1253,14 +1318,26 @@ class CatLottery(Star):
                 part.text for part in event.get_messages() if isinstance(part, Plain)
             )
         )
-        if content is None and (
-            text.lstrip().startswith(("/", "／"))
-            or re.match(r"^抽奖(?:\s|$)", text.lstrip())
-        ):
-            return
+        if content is None:
+            prefixes = self.context.get_config(event.unified_msg_origin).get(
+                "wake_prefix", ["/", "／"]
+            )
+            if text.lstrip().startswith(
+                ("/", "／", *(prefix for prefix in prefixes if prefix))
+            ) or re.match(r"^抽奖(?:\s|$)", text.lstrip()):
+                return
         raw = event.message_obj.raw_message
         if not isinstance(raw, dict) or raw.get("post_type") != "message":
             return
+        if content is None and isinstance(raw.get("message"), list):
+            text = "".join(
+                segment["data"]["text"]
+                for segment in raw["message"]
+                if isinstance(segment, dict)
+                and segment.get("type") == "text"
+                and isinstance(segment.get("data"), dict)
+                and isinstance(segment["data"].get("text"), str)
+            )
         lottery_id = ""
         stored_image: Path | None = None
         try:
@@ -1272,6 +1349,11 @@ class CatLottery(Star):
             )
             if lottery_id is None:
                 return
+            entry = await self.store.entry(lottery_id, identity["user_id"])
+            if entry and entry["platform_id"] != identity["platform_id"]:
+                if content is None:
+                    return
+                raise ValueError("请通过报名时使用的平台私聊我。")
             event.stop_event()
             item = await self.store.get(lottery_id)
             self.check_target(item, identity)
@@ -1297,25 +1379,32 @@ class CatLottery(Star):
                     "本题需要 1–1000 字非空文本，可附带一张图片；空格与换行也计入长度。"
                 )
             if images:
-                local_path = Path(
-                    await asyncio.wait_for(images[0].convert_to_file_path(), timeout=25)
-                )
-                if local_path.stat().st_size > 8 * 1024 * 1024:
-                    raise ValueError("图片不能超过 8 MB，请压缩后重新发送。")
-                with await asyncio.to_thread(PillowImage.open, local_path) as original:
+                data = await self.read_submission_image(images[0])
+                with await asyncio.to_thread(
+                    PillowImage.open, BytesIO(data)
+                ) as original:
+                    if original.format not in {"JPEG", "PNG", "WEBP", "GIF"}:
+                        raise ValueError("请发送 JPG、PNG、WebP 或 GIF 图片。")
                     if original.width * original.height > 24_000_000:
                         raise ValueError("图片分辨率过大，请缩小后发送。")
                     await asyncio.to_thread(original.load)
-                    with await asyncio.to_thread(original.convert, "RGB") as picture:
-                        await asyncio.to_thread(picture.thumbnail, (2000, 2000))
-                        stored_image = (
-                            self.store.directory
-                            / "uploads"
-                            / f"{secrets.token_hex(16)}.jpg"
-                        )
-                        await asyncio.to_thread(
-                            picture.save, stored_image, "JPEG", quality=88
-                        )
+                    with await asyncio.to_thread(
+                        ImageOps.exif_transpose, original
+                    ) as oriented:
+                        with await asyncio.to_thread(oriented.convert, "RGBA") as rgba:
+                            with PillowImage.new("RGB", rgba.size, "white") as picture:
+                                await asyncio.to_thread(
+                                    picture.paste, rgba, (0, 0), rgba
+                                )
+                                await asyncio.to_thread(picture.thumbnail, (2000, 2000))
+                                stored_image = (
+                                    self.store.directory
+                                    / "uploads"
+                                    / f"{secrets.token_hex(16)}.jpg"
+                                )
+                                await asyncio.to_thread(
+                                    picture.save, stored_image, "JPEG", quality=88
+                                )
             if question["kind"] == "image":
                 answer = {"kind": "image", "value": stored_image.name, "text": text}
             else:
@@ -1340,7 +1429,17 @@ class CatLottery(Star):
                     lottery_id,
                     len(entry["answers"]) + 1,
                 )
-                await self.show_question(event, item, entry)
+                try:
+                    await self.show_question(event, item, entry)
+                except NETWORK_ERRORS as exc:
+                    await self.store.queue_question(
+                        lottery_id, identity["bot_id"], identity["user_id"]
+                    )
+                    self.wake.set()
+                    self.logger.warning(
+                        "Private question reply failed (%s); retry queued.",
+                        type(exc).__name__,
+                    )
         except (
             ValueError,
             OSError,
@@ -1357,19 +1456,24 @@ class CatLottery(Star):
             message = (
                 str(exc)
                 if isinstance(exc, ValueError)
-                else "图片读取失败，请重新发送有效的 JPG、PNG 或 GIF 图片。"
+                else "图片读取失败，请重新发送有效的 JPG、PNG、WebP 或 GIF 图片。"
             )
-            await self.card(
+            await self.error_card(
                 event, "这一步还没有完成", [("填写提示", message)], f"抽奖 {lottery_id}"
             )
         except (sqlite3.Error, RuntimeError, json.JSONDecodeError):
             self.logger.exception(
                 "Lottery %s private form storage failure.", lottery_id
             )
-            await self.card(
+            await self.error_card(
                 event,
                 "资料暂时未能确认",
                 [("请查询状态", "请稍后发送 /抽奖 状态 编号，检查这一步是否已保存。")],
+            )
+        except OneBotError as exc:
+            self.logger.warning(
+                "Private form reply failed (%s); saved progress is retained.",
+                type(exc).__name__,
             )
         finally:
             if stored_image is not None:
@@ -1379,6 +1483,88 @@ class CatLottery(Star):
                     self.logger.warning(
                         "An uncommitted private image could not be removed."
                     )
+
+    async def read_submission_image(self, image: Image) -> bytes:
+        """Read a bounded QQ image without arbitrary URL fetching or local file access.
+
+        Args:
+            image: Image component from the authenticated OneBot message.
+
+        Returns:
+            At most 8 MB of image data, ready for format and pixel validation.
+
+        Raises:
+            ValueError: The source is unsupported, inaccessible, or exceeds the byte limit.
+        """
+        limit = 8 * 1024 * 1024
+        source = image.url or image.file or ""
+        try:
+            async with self.image_slots:
+                if source.startswith(("http://", "https://")):
+                    url = urlsplit(source)
+                    host = (url.hostname or "").lower()
+                    if (
+                        url.username
+                        or url.password
+                        or url.port not in {None, 80, 443}
+                        or not (
+                            host.endswith(".qpic.cn") or host == "multimedia.nt.qq.com"
+                        )
+                    ):
+                        raise ValueError(
+                            "图片来源不受支持，请直接发送 QQ 图片，不要提交外部链接。"
+                        )
+                    if self.image_session is None or self.image_session.closed:
+                        self.image_session = aiohttp.ClientSession(
+                            timeout=aiohttp.ClientTimeout(total=25, connect=8),
+                            connector=aiohttp.TCPConnector(limit=4),
+                        )
+                    async with self.image_session.get(
+                        source, allow_redirects=False
+                    ) as response:
+                        if response.status != 200:
+                            raise ValueError("图片已失效或暂时无法下载，请重新发送。")
+                        if (
+                            response.content_length is not None
+                            and response.content_length > limit
+                        ):
+                            raise ValueError("图片不能超过 8 MB，请压缩后重新发送。")
+                        data = bytearray()
+                        async for chunk in response.content.iter_chunked(65536):
+                            data.extend(chunk)
+                            if len(data) > limit:
+                                raise ValueError(
+                                    "图片不能超过 8 MB，请压缩后重新发送。"
+                                )
+                        return bytes(data)
+                if source.startswith("base64://"):
+                    encoded = source.removeprefix("base64://")
+                    if len(encoded) > ((limit + 2) // 3) * 4:
+                        raise ValueError("图片不能超过 8 MB，请压缩后重新发送。")
+                    data = base64.b64decode(encoded, validate=True)
+                else:
+                    if source.startswith(("\\\\", "//")):
+                        raise ValueError("不支持网络共享图片，请重新发送 QQ 图片。")
+                    if source.startswith("file://"):
+                        url = urlsplit(source)
+                        if url.netloc:
+                            raise ValueError("不支持网络共享图片，请重新发送 QQ 图片。")
+                        source = unquote(url.path)
+                        if re.match(r"^/[A-Za-z]:/", source):
+                            source = source[1:]
+                    path = Path(source).resolve()
+                    if not path.is_relative_to(Path(get_astrbot_temp_path()).resolve()):
+                        raise ValueError("图片不在消息缓存中，请重新发送 QQ 图片。")
+                    with path.open("rb") as file:
+                        data = await asyncio.to_thread(file.read, limit + 1)
+                if len(data) > limit:
+                    raise ValueError("图片不能超过 8 MB，请压缩后重新发送。")
+                return data
+        except binascii.Error as exc:
+            raise ValueError("图片数据无效，请重新发送 QQ 图片。") from exc
+        except (aiohttp.ClientError, OSError, asyncio.TimeoutError) as exc:
+            self.logger.warning("Private image read failed (%s).", type(exc).__name__)
+            raise ValueError("图片暂时无法读取，请重新发送。") from exc
 
     async def scheduler(self) -> None:
         """Finalize due draws independently of slow or failing QQ delivery attempts."""
@@ -1442,11 +1628,24 @@ class CatLottery(Star):
         """Send persisted results and enrollment cards to exact OneBot recipients."""
         async with self.delivery_lock:
             for row in await self.store.deliveries():
-                message = json.loads(row["body"])
-                item, target = message["item"], message["target"]
                 try:
+                    message = json.loads(row["body"])
+                    item, target = message["item"], message["target"]
+                    async with self.store.lock:
+                        async with self.store.db.execute(
+                            "SELECT 1 FROM outbox WHERE id=? AND delivered_at IS NULL",
+                            (row["id"],),
+                        ) as cursor:
+                            if await cursor.fetchone() is None:
+                                continue
                     live = await self.store.participation_state(item["id"])
                     kind = message["kind"]
+                    if kind == "closed" and (
+                        live["item"]["status"] != "open"
+                        or time.time() < live["item"]["close_at"]
+                    ):
+                        await self.store.delivery_done(row["id"], skipped=True)
+                        continue
                     if kind in {"announcement", "participation_guide"} and (
                         live["item"]["status"] != "open"
                         or time.time() >= live["item"]["close_at"]
@@ -1454,7 +1653,7 @@ class CatLottery(Star):
                         and item["announcement_schedule"]
                         != live["item"]["announcement_schedule"]
                     ):
-                        await self.store.delivery_done(row["id"])
+                        await self.store.delivery_done(row["id"], skipped=True)
                         self.logger.debug(
                             "Lottery %s obsolete recruitment notice skipped.",
                             item["id"],
@@ -1474,12 +1673,15 @@ class CatLottery(Star):
                             and message["entry"].get("review_status") == "pending"
                         )
                     ):
-                        await self.store.delivery_done(row["id"])
+                        await self.store.delivery_done(row["id"], skipped=True)
                         self.logger.debug(
                             "Lottery %s group enrollment notice suppressed by current policy.",
                             item["id"],
                         )
                         continue
+                    if kind not in {"result", "tier_result", "cancelled"}:
+                        # Recruitment and receipts describe current rules; draw records stay frozen.
+                        item = live["item"]
                     platform = self.context.get_platform_inst(target["platform_id"])
                     if (
                         platform is None
@@ -1510,7 +1712,7 @@ class CatLottery(Star):
                             or active != item["id"]
                             or index != message["entry"]["question_index"]
                         ):
-                            await self.store.delivery_done(row["id"])
+                            await self.store.delivery_done(row["id"], skipped=True)
                             continue
                         title = f"第 {index + 1} / {len(item['questions'])} 题"
                         sections = question_sections(item, entry, index)
@@ -1548,11 +1750,7 @@ class CatLottery(Star):
                             ),
                         ]
                     elif kind in {"result", "tier_result"}:
-                        title = (
-                            "开奖啦！看看谁接住了好运"
-                            if kind == "result"
-                            else "一份好运，提前揭晓啦"
-                        )
+                        title = "开奖结果" if kind == "result" else "奖项提前开奖"
                         winners = item["winners"]
                         sections = prize_sections(
                             item, self.store.directory / "artwork", results=True
@@ -1587,7 +1785,7 @@ class CatLottery(Star):
                                 "活动状态",
                                 "本次活动已取消，不再接受报名或开奖。"
                                 if kind == "cancelled"
-                                else f"已停止报名，已报名的用户可等待管理员审核完成后开奖，祝大家好运连连~\n自动开奖：{date_text(item['draw_at'])}（北京时间）",
+                                else f"已停止报名与填写，已提交的资料仍可在开奖前审核\n自动开奖：{date_text(item['draw_at'])}（北京时间）",
                             )
                         ]
                     else:
@@ -1660,6 +1858,23 @@ class CatLottery(Star):
                     parameters[
                         "group_id" if target["channel"] == "group" else "user_id"
                     ] = int(target["recipient"])
+                    # Rendering and avatar downloads can yield while a review, withdrawal,
+                    # cancellation, or notification policy update revokes this message.
+                    async with self.store.lock:
+                        async with self.store.db.execute(
+                            "SELECT 1 FROM outbox WHERE id=? AND delivered_at IS NULL",
+                            (row["id"],),
+                        ) as cursor:
+                            if await cursor.fetchone() is None:
+                                continue
+                    if kind in {"announcement", "participation_guide", "question"}:
+                        current = await self.store.get(item["id"])
+                        if (
+                            current["status"] != "open"
+                            or time.time() >= current["close_at"]
+                        ):
+                            await self.store.delivery_done(row["id"], skipped=True)
+                            continue
                     await asyncio.wait_for(
                         client.call_action(
                             "send_group_msg"
@@ -1683,6 +1898,13 @@ class CatLottery(Star):
                         item["id"],
                         message["kind"],
                         target["channel"],
+                        type(exc).__name__,
+                    )
+                except (ValueError, KeyError, TypeError) as exc:
+                    await self.store.delivery_done(row["id"], type(exc).__name__)
+                    self.logger.error(
+                        "Lottery %s notice preparation failed (%s); retry queued.",
+                        row["lottery_id"],
                         type(exc).__name__,
                     )
 
@@ -1722,7 +1944,8 @@ class CatLottery(Star):
         """Create or edit complete per-lottery rules with live target validation."""
         try:
             payload = await request.json()
-            rules = validate_lottery(payload)
+            # Store.save enforces deadlines against the current saved activity under its lock.
+            rules = validate_lottery(payload, now=0)
             lottery_id = str(payload.get("id", ""))
             # Existing, unchanged targets can retain an offline account's schedules.
             existing = await self.store.get(lottery_id) if lottery_id else None
@@ -1798,7 +2021,7 @@ class CatLottery(Star):
         Returns:
             Private entry and current rules, including qualification lock status.
         """
-        if not re.fullmatch(r"[1-9]\d{4,19}", user_id):
+        if not re.fullmatch(r"[1-9][0-9]{4,19}", user_id):
             return error_response("报名不存在", status_code=404)
         try:
             item = await self.store.get(lottery_id)
@@ -2179,7 +2402,7 @@ class CatLottery(Star):
                 ensure_ascii=False,
             )
         except ValueError as exc:
-            await self.card(event, "无法查看该抽奖", [("操作提示", str(exc))])
+            await self.error_card(event, "无法查看该抽奖", [("操作提示", str(exc))])
             return str(exc)
 
     @filter.llm_tool(name="catlottery_join")
@@ -2208,7 +2431,7 @@ class CatLottery(Star):
         try:
             return await self.join(event, lottery_id)
         except ValueError as exc:
-            await self.card(event, "这次还不能参加", [("报名提示", str(exc))])
+            await self.error_card(event, "这次还不能参加", [("报名提示", str(exc))])
             return str(exc)
 
     @filter.llm_tool(name="catlottery_status")
@@ -2268,7 +2491,7 @@ class CatLottery(Star):
             )
             return "已退出，该发送者的报名和资料已移除。"
         except ValueError as exc:
-            await self.card(event, "暂时不能退出", [("操作提示", str(exc))])
+            await self.error_card(event, "暂时不能退出", [("操作提示", str(exc))])
             return str(exc)
 
     @filter.llm_tool(name="catlottery_fill")
@@ -2318,7 +2541,7 @@ class CatLottery(Star):
             await self.show_question(event, item, entry)
             return "已发送当前题，等待用户真实私聊回答；尚未报名成功。"
         except ValueError as exc:
-            await self.card(event, "暂时无法填写", [("填写提示", str(exc))])
+            await self.error_card(event, "暂时无法填写", [("填写提示", str(exc))])
             return str(exc)
 
     @filter.llm_tool(name="catlottery_create")
@@ -2387,7 +2610,7 @@ class CatLottery(Star):
             self.wake.set()
             await self.card(
                 event,
-                "新的好运已准备好",
+                "抽奖已创建",
                 [
                     ("抽奖编号", item["id"]),
                     ("活动规则", "本群抽奖已创建，群公告已排队发送。"),
@@ -2398,7 +2621,7 @@ class CatLottery(Star):
                 {"created": item["id"], "announcement_queued": True}, ensure_ascii=False
             )
         except ValueError as exc:
-            await self.card(event, "还不能创建抽奖", [("操作提示", str(exc))])
+            await self.error_card(event, "还不能创建抽奖", [("操作提示", str(exc))])
             return str(exc)
 
     @filter.llm_tool(name="catlottery_manage")
@@ -2504,7 +2727,7 @@ class CatLottery(Star):
                 ensure_ascii=False,
             )
         except ValueError as exc:
-            await self.card(event, "操作未执行", [("操作提示", str(exc))])
+            await self.error_card(event, "操作未执行", [("操作提示", str(exc))])
             return str(exc)
 
     @filter.llm_tool(name="catlottery_notifications")
@@ -2612,5 +2835,5 @@ class CatLottery(Star):
                 ensure_ascii=False,
             )
         except ValueError as exc:
-            await self.card(event, "通知设置未修改", [("操作提示", str(exc))])
+            await self.error_card(event, "通知设置未修改", [("操作提示", str(exc))])
             return str(exc)

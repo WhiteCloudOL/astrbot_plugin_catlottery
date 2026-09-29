@@ -1,0 +1,131 @@
+/* Quiet pink stationery, with the cat ticket as the main illustration. */
+:root {
+  --pink: #fce1eb;
+  --pink-deep: #aa3563;
+  --blue: #eef3fc;
+  --blue-deep: #496283;
+  --ink: #493747;
+  --muted: #806575;
+  --line: #eddce5;
+  --blue-line: #dce4f0;
+}
+body {
+  background: #fff8fb;
+  color: var(--ink);
+  font-family: MeowSans, "Microsoft YaHei", sans-serif;
+  font-size: 14px;
+  -webkit-tap-highlight-color: #d8688d24;
+}
+button, input, textarea { font: inherit; }
+button, a { touch-action: manipulation; }
+button:focus-visible, a:focus-visible, input:focus-visible, textarea:focus-visible {
+  outline: 3px solid #b94273;
+  outline-offset: 3px;
+}
+h1, h2, h3, h4 { color: var(--ink); text-wrap: balance; }
+code, time, .summary-metric strong, .card-details dd { font-variant-numeric: tabular-nums; }
+.main { max-width: 1700px; padding: 32px 40px; }
+.sidebar { background: #fff; border-right-color: var(--line); }
+.brand { color: var(--ink); }
+.brand img { width: 43px; height: 43px; }
+.brand small, .sidebar-label, .sidebar-note p, .sidebar-footer { font-size: 12px; }
+.sidebar-note { background: #fff8fb; border: 1px solid var(--line); }
+.topbar { margin-bottom: 25px; }
+.topbar h1 { font: 600 25px/1.5 MeowSans, "Microsoft YaHei", sans-serif; }
+.eyebrow, .time-label, .rail-footnote { font-size: 12px; letter-spacing: .04em; }
+.hero {
+  padding: 0 32px 0 0;
+  min-height: 300px;
+  border: 1px solid #efcedc;
+  border-radius: 28px;
+  background: linear-gradient(115deg, #fce3ec 0%, #fff1f6 65%, #eef3fc 100%);
+  box-shadow: none;
+  margin-bottom: 34px;
+}
+.hero-copy { padding: 34px 0 34px 38px; }
+.hero-stamp { font-size: 12px; color: #9a4165; }
+.hero h2 { font: 600 clamp(28px, 3vw, 40px)/1.4 MeowSans, "Microsoft YaHei", sans-serif; letter-spacing: .04em; margin: 14px 0; }
+.hero-copy > p { color: #725565; font-size: 14px; line-height: 1.9; }
+.hero-caption { color: #765769; font-size: 12px; }
+.hero-art { transform: scale(.91); }
+.raffle-ticket { box-shadow: 9px 12px 0 #db82a222, 0 12px 24px #a53d6510; }
+.raffle-ticket img { width: 92px; height: 92px; object-fit: contain; }
+.raffle-ticket > strong { color: #a63a63; font-size: 20px; }
+.ticket-label { color: #825769; }
+.floating-star { animation: none; }
+.content-grid { grid-template-columns: minmax(0, 1fr) 278px; gap: 24px; }
+.lottery-grid { gap: 20px; }
+.lottery-card { border: 1px solid var(--line); border-radius: 20px; padding: 23px; box-shadow: 0 4px 16px #6f375708; }
+.lottery-card:hover { border-color: #dba4bd; box-shadow: 0 8px 24px #6f375712; }
+.lottery-card h3 { font: 600 21px/1.65 MeowSans, "Microsoft YaHei", sans-serif; }
+.section-heading h2 { font: 600 24px/1.5 MeowSans, "Microsoft YaHei", sans-serif; }
+.prize-line { font-size: 14px; line-height: 1.8; }
+.card-details dt, .card-details dd, .participation, .participation small, .card-meta code { font-size: 12px; }
+.tier-chips span { font-size: 12px; padding: 5px 10px; }
+.rail-panel { background: #fff; border-color: var(--line); border-radius: 18px; }
+.rail-panel p, .platform-card small, .onboarding span { font-size: 12px; line-height: 1.9; }
+.rail-title h3 { font-size: 15px; }
+.platform-card strong { font-size: 13px; }
+.btn { min-height: 42px; font-size: 13px; border-radius: 12px; padding: 10px 16px; }
+.btn-primary { background: #b43a68; color: #fff; box-shadow: 0 4px 10px #9e365722; }
+.btn-primary:hover { background: #98305b; }
+.btn-tonal { background: #f9e5ed; color: #963257; }
+.btn-tonal:hover { background: #f2cfde; }
+.btn-text { color: #904165; }
+.btn-text:hover { background: #fdf0f5; }
+.field-label { font-size: 14px; color: var(--ink); }
+.field input, .field textarea, .choice-trigger, .date-trigger { font-size: 14px; min-height: 45px; }
+.field-hint, .notice, .answer-mode p, .muted, .settings-feedback, .confirm-copy { font-size: 13px; line-height: 1.9; }
+.field textarea { line-height: 1.8; }
+.choice-menu [role="option"] { font-size: 13px; min-height: 40px; }
+.page-panel, .editor-page-body { border-color: var(--line); box-shadow: none; }
+.editor-section-title h3 { font-size: 20px; }
+.editor-section-title p { font-size: 13px; line-height: 1.9; }
+.section-number { color: #a4496a; background: #fbe6ef; }
+.page-intro h2, .activity-header h2 { font-family: MeowSans, "Microsoft YaHei", sans-serif; font-weight: 600; }
+.activity-metrics { gap: 16px; }
+.summary-metric { background: #fff; border: 1px solid var(--line); }
+.summary-metric span, .activity-tabs > button { font-size: 14px; }
+.participant-person strong, .review-prompt { font-size: 15px; }
+.participant-person small, .participant-progress small, .notification-row small { font-size: 12px; }
+.participant-row .entry-status { font-size: 12px; }
+.review-answer-text { font-size: 15px; line-height: 1.9; color: var(--ink); }
+.review-reference, .review-options, .review-mark-panel p { font-size: 13px; }
+.review-mark { min-height: 42px; font-size: 13px; }
+.modal { border: 1px solid #e9c9d9; box-shadow: 0 24px 80px #4937472e; }
+.modal-body, .choice-menu, .calendar-popover { overscroll-behavior: contain; }
+.modal-backdrop { background: #49374755; }
+.page-footer { font-size: 12px; color: var(--muted); }
+.activity-description p, .lottery-card h3, .participant-person strong { overflow-wrap: anywhere; }
+@media (min-width: 1500px) { .lottery-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+@media (max-width: 1100px) {
+  .main { padding: 28px; }
+  .content-grid { grid-template-columns: minmax(0, 1fr); }
+}
+@media (max-width: 640px) {
+  .main { padding: 24px 16px; }
+  .topbar h1 { font-size: 21px; }
+  .topbar .eyebrow { font-size: 11px; }
+  .hero { padding: 0; min-height: 265px; border-radius: 22px; overflow: hidden; }
+  .hero-copy { padding: 23px 0 23px 22px; width: 61%; position: relative; z-index: 2; }
+  .hero h2 { font-size: 28px; }
+  .hero-copy > p { font-size: 13px; max-width: 220px; }
+  .hero-art { position: absolute; right: 8px; top: 34px; margin: 0; transform: scale(.85); transform-origin: top right; opacity: .9; }
+  .hero-caption { font-size: 11px; }
+  .ticket-label, .floating-star { display: none; }
+  .hero .btn { font-size: 13px; }
+  .section-heading h2 { font-size: 22px; }
+  .lottery-card { padding: 20px; }
+  .lottery-card h3 { font-size: 20px; }
+  .content-grid { gap: 22px; }
+  .filterbar { gap: 12px; }
+  .segmented button { min-height: 38px; font-size: 12px; }
+  .page-panel { padding: 22px 18px; }
+  .editor-page-footer { bottom: max(8px, env(safe-area-inset-bottom)); }
+  .review-dialog .modal-footer { padding: 12px 14px max(15px, env(safe-area-inset-bottom)); }
+  .review-mark { font-size: 12px; }
+  .calendar-popover { max-width: calc(100vw - 68px); }
+}
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { animation: none !important; transition: none !important; scroll-behavior: auto !important; }
+}

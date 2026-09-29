@@ -55,7 +55,7 @@ async function setup(t, { lotteries = [], entries = [], hash = "" } = {}) {
       }
       if (endpoint === "settings") { data.settings = structuredClone(payload); return data.settings; }
       if (endpoint === "lotteries") {
-        const item = { ...structuredClone(payload), close_at: Date.parse(payload.close_at) / 1000, draw_at: Date.parse(payload.draw_at) / 1000, id: "a1234567", prize: "分级奖品", winner_count: payload.prize_tiers.reduce((sum, tier) => sum + tier.count, 0), phase: "open", status: "open", entry_count: 0, complete_count: 0, pending_deliveries: 0, winners: [], tier_draws: [] };
+        const item = { ...structuredClone(payload), close_at: typeof payload.close_at === "number" ? payload.close_at : Date.parse(payload.close_at) / 1000, draw_at: typeof payload.draw_at === "number" ? payload.draw_at : Date.parse(payload.draw_at) / 1000, id: "a1234567", prize: "分级奖品", winner_count: payload.prize_tiers.reduce((sum, tier) => sum + tier.count, 0), phase: "open", status: "open", entry_count: 0, complete_count: 0, pending_deliveries: 0, winners: [], tier_draws: [] };
         data.lotteries = [item]; return item;
       }
       if (endpoint.endsWith("/action")) {
@@ -345,4 +345,62 @@ test("avatar cache duration is retained during polling and clearing requires an 
   assert.equal(calls.length,1);
   document.querySelector('[data-action="confirm-avatar-clear"]').click(); await flush();
   assert.deepEqual(calls[1],{endpoint:"avatars/clear",payload:{confirmed:true}});
+});
+
+test("failed scheduled form save can be retried without losing dates or input", async t => {
+  const item = reviewActivity();
+  item.announcement_schedule = {mode:"repeat",start_at:Date.now()/1000+600,interval_minutes:30};
+  const {document,window,calls} = await setup(t,{lotteries:[item],hash:"#edit/a1234567"});
+  const originalPost = window.AstrBotPluginPage.apiPost;
+  let attempts = 0;
+  window.AstrBotPluginPage.apiPost = async (...args) => {
+    if (args[0] === "lotteries" && attempts++ === 0) throw Error("暂时无法保存");
+    return originalPost(...args);
+  };
+  document.querySelector('[name="title"]').value = "修改后保留";
+  const calendar = document.querySelector('[name="announcement_start_at"]');
+  calendar.value = calendar.value.slice(0,14) + "59";
+  document.querySelector('[data-action="save-lottery"]').click(); await flush();
+  assert.match(document.querySelector(".form-error").textContent,/暂时无法保存/);
+  assert.equal(document.querySelector('[name="title"]').value,"修改后保留");
+  document.querySelector('[data-action="save-lottery"]').click(); await flush();
+  assert.equal(attempts,2);
+  assert.ok(document.querySelector(".activity-page"));
+  const saved = calls.find(call=>call.endpoint === "lotteries").payload;
+  assert.equal(saved.close_at,item.close_at);
+  assert.equal(saved.draw_at,item.draw_at);
+  assert.equal(saved.title,"修改后保留");
+});
+
+test("page unload protects unsaved forms and does not cancel future polling", async t => {
+  const {document,window,polling} = await setup(t);
+  document.querySelector('[data-action="create"]').click(); await flush();
+  const title = document.querySelector('[name="title"]');
+  title.value = "未保存";
+  title.dispatchEvent(new window.Event("input",{bubbles:true}));
+  const unload = new window.Event("beforeunload",{cancelable:true});
+  window.dispatchEvent(unload);
+  assert.equal(unload.defaultPrevented,true);
+  polling[0](); await flush();
+  assert.equal(document.querySelector('[name="title"]').value,"未保存");
+});
+
+test("calendar keeps keyboard focus after picking a day and fields have labels", async t => {
+  const {document} = await setup(t);
+  document.querySelector('[data-action="create"]').click(); await flush();
+  const calendar = document.querySelector('[name="close_at"]');
+  assert.match(calendar.querySelector(".date-trigger").getAttribute("aria-label"),/报名截止/);
+  calendar.querySelector(".date-trigger").click();
+  assert.ok(document.activeElement.hasAttribute("data-day"));
+  calendar.querySelector('[data-day="10"]').click();
+  assert.equal(document.activeElement.dataset.day,"10");
+  document.querySelectorAll(".choice-trigger").forEach(element=>assert.ok(element.getAttribute("aria-label")));
+});
+
+test("confirmation isolates the background and restores it on close", async t => {
+  const {document} = await setup(t,{lotteries:[reviewActivity()],hash:"#detail/a1234567"});
+  document.querySelector('[data-action="close"]').click();
+  assert.equal(document.getElementById("app").inert,true);
+  document.querySelector('.modal-close').click();
+  assert.equal(document.getElementById("app").inert,false);
 });

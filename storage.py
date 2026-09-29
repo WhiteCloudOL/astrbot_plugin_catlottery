@@ -3,10 +3,10 @@
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import copy
 import hashlib
 import json
+import logging
 import re
 import secrets
 import time
@@ -18,6 +18,7 @@ from typing import Any
 import aiosqlite
 
 CHINA_TZ = timezone(timedelta(hours=8))
+logger = logging.getLogger("astrbot.plugin.astrbot_plugin_catlottery")
 
 
 def timestamp(value: Any) -> float:
@@ -220,8 +221,8 @@ def validate_lottery(payload: dict, *, now: float | None = None) -> dict:
         group_id = str(target.get("group_id", ""))
         if not isinstance(platform_id, str) or not 1 <= len(platform_id) <= 160:
             raise ValueError("请选择有效的 AioCqhttp 平台。")
-        if not re.fullmatch(r"[1-9]\d{4,19}", bot_id) or not re.fullmatch(
-            r"[1-9]\d{4,19}", group_id
+        if not re.fullmatch(r"[1-9][0-9]{4,19}", bot_id) or not re.fullmatch(
+            r"[1-9][0-9]{4,19}", group_id
         ):
             raise ValueError("QQ 账号或群号无效。")
         identity = (platform_id, bot_id, group_id)
@@ -274,6 +275,10 @@ def validate_lottery(payload: dict, *, now: float | None = None) -> dict:
         if options and kind != "quiz":
             raise ValueError("只有答题问题可以设置选项。")
         options = [option.strip() for option in options]
+        if len(
+            {unicodedata.normalize("NFKC", option).casefold() for option in options}
+        ) != len(options):
+            raise ValueError("选择题选项不能重复，请检查大小写和全角／半角字符。")
         if options and any(answer.strip() not in options for answer in answers):
             raise ValueError("选择题的正确答案必须填写完整的选项文本。")
         result["questions"].append(
@@ -523,7 +528,8 @@ class Store:
                     not isinstance(ids, list)
                     or len(ids) > 100
                     or any(
-                        not isinstance(x, str) or not re.fullmatch(r"[1-9]\d{4,19}", x)
+                        not isinstance(x, str)
+                        or not re.fullmatch(r"[1-9][0-9]{4,19}", x)
                         for x in ids
                     )
                 ):
@@ -567,7 +573,27 @@ class Store:
             ValueError: The activity is final or enrolled rules would change.
         """
         async with self.lock:
-            rules = validate_lottery(payload)
+            # An unchanged cutoff may already have passed while review is still open.
+            if not isinstance(payload, dict):
+                raise ValueError("抽奖设置必须为对象。")
+            previous = None
+            if lottery_id:
+                async with self.db.execute(
+                    "SELECT body FROM lotteries WHERE id=?", (lottery_id,)
+                ) as cursor:
+                    row = await cursor.fetchone()
+                previous = json.loads(row[0]) if row else None
+            now = time.time()
+            validation_time = now
+            if (
+                previous
+                and timestamp(payload.get("close_at")) == previous["close_at"]
+                and now >= previous["close_at"]
+            ):
+                validation_time = previous["close_at"] - 1
+            rules = validate_lottery(payload, now=validation_time)
+            if rules["draw_at"] <= now:
+                raise ValueError("开奖时间必须晚于当前时间；立即开奖请使用开奖操作。")
             for filename in [
                 rules["cover"],
                 *(tier["image"] for tier in rules["prize_tiers"]),
@@ -585,6 +611,10 @@ class Store:
                 item = json.loads(row[0])
                 if item["status"] != "open":
                     raise ValueError("已开奖或已取消的抽奖不能编辑。")
+                if now >= item["draw_at"]:
+                    raise ValueError(
+                        "已到开奖时间，不能再修改活动，请刷新查看开奖结果。"
+                    )
                 async with self.db.execute(
                     "SELECT count(*) FROM entries WHERE lottery_id=?", (lottery_id,)
                 ) as cursor:
@@ -667,6 +697,12 @@ class Store:
                     await self.db.execute(
                         "DELETE FROM outbox WHERE lottery_id=? AND delivered_at IS NULL "
                         "AND json_extract(body,'$.scheduled')=1",
+                        (lottery_id,),
+                    )
+                if previous and previous["targets"] != rules["targets"]:
+                    await self.db.execute(
+                        "DELETE FROM outbox WHERE lottery_id=? AND delivered_at IS NULL "
+                        "AND json_extract(body,'$.kind') IN ('announcement','participation_guide')",
                         (lottery_id,),
                     )
                 await self.db.commit()
@@ -824,10 +860,21 @@ class Store:
                     (bot_id, user_id, lottery_id, len(entry["answers"])),
                 )
             async with self.db.execute(
-                "SELECT lottery_id FROM sessions WHERE bot_id=? AND user_id=?",
-                (bot_id, user_id),
+                "SELECT s.lottery_id FROM sessions s "
+                "JOIN entries e ON e.lottery_id=s.lottery_id AND e.user_id=s.user_id "
+                "JOIN lotteries l ON l.id=s.lottery_id "
+                "WHERE s.bot_id=? AND s.user_id=? "
+                "AND json_extract(e.body,'$.status')='pending' "
+                "AND json_extract(l.body,'$.status')='open' "
+                "AND json_extract(l.body,'$.close_at')>?",
+                (bot_id, user_id, time.time()),
             ) as cursor:
                 row = await cursor.fetchone()
+            if row is None:
+                await self.db.execute(
+                    "DELETE FROM sessions WHERE bot_id=? AND user_id=?",
+                    (bot_id, user_id),
+                )
         return row[0] if row else None
 
     async def form_position(self, bot_id: str, user_id: str, direction: int = 0) -> int:
@@ -1011,7 +1058,7 @@ class Store:
                         choice = unicodedata.normalize("NFKC", text).upper()
                         if choice in [chr(65 + n) for n in range(len(options))]:
                             text = options[ord(choice) - 65]
-                        elif choice.isdigit() and 1 <= int(choice) <= len(options):
+                        elif choice.isdecimal() and 1 <= int(choice) <= len(options):
                             text = options[int(choice) - 1]
                         elif unicodedata.normalize("NFKC", text).casefold() not in {
                             unicodedata.normalize("NFKC", option).casefold()
@@ -1069,10 +1116,12 @@ class Store:
                 )
                 await self.db.commit()
                 if old_image and old_image != filename:
-                    with contextlib.suppress(OSError):
+                    try:
                         (self.directory / "uploads" / Path(old_image).name).unlink(
                             missing_ok=True
                         )
+                    except OSError:
+                        logger.warning("Replaced lottery attachment cleanup deferred.")
                 return item, entry
             except BaseException:
                 await self.db.rollback()
@@ -1108,7 +1157,7 @@ class Store:
                 or not 1 <= len(selected_ids) <= 100
                 or any(
                     not isinstance(value, str)
-                    or not re.fullmatch(r"[1-9]\d{4,19}", value)
+                    or not re.fullmatch(r"[1-9][0-9]{4,19}", value)
                     for value in selected_ids
                 )
                 or not isinstance(correct, bool)
@@ -1121,7 +1170,7 @@ class Store:
             correct = payload.get("correct")
             if (
                 not isinstance(user_id, str)
-                or not re.fullmatch(r"[1-9]\d{4,19}", user_id)
+                or not re.fullmatch(r"[1-9][0-9]{4,19}", user_id)
                 or not isinstance(index, int)
                 or isinstance(index, bool)
                 or "correct" not in payload
@@ -1205,7 +1254,7 @@ class Store:
                                 text = options[ord(choice) - 65]
                             elif (
                                 options
-                                and choice.isdigit()
+                                and choice.isdecimal()
                                 and 1 <= int(choice) <= len(options)
                             ):
                                 text = options[int(choice) - 1]
@@ -1310,9 +1359,12 @@ class Store:
                 answer["value"] if answer["kind"] == "image" else answer.get("image")
             )
             if filename:
-                (self.directory / "uploads" / Path(filename).name).unlink(
-                    missing_ok=True
-                )
+                try:
+                    (self.directory / "uploads" / Path(filename).name).unlink(
+                        missing_ok=True
+                    )
+                except OSError:
+                    logger.warning("Withdrawn lottery attachment cleanup deferred.")
 
     async def queue(
         self,
@@ -1653,15 +1705,24 @@ class Store:
             ) as cursor:
                 return [dict(row) for row in await cursor.fetchall()]
 
-    async def delivery_done(self, delivery_id: str, error: str = "") -> None:
+    async def delivery_done(
+        self, delivery_id: str, error: str = "", *, skipped: bool = False
+    ) -> None:
         """Record success or back off a failed network attempt.
 
         Args:
             delivery_id: Outbox message identifier.
             error: A safe error category, empty for successful delivery.
+            skipped: Remove an obsolete notice and its dependent text without claiming delivery.
         """
         async with self.lock:
-            if error:
+            if skipped:
+                await self.db.execute(
+                    "DELETE FROM outbox WHERE delivered_at IS NULL AND "
+                    "(id=? OR json_extract(body,'$.depends_on')=?)",
+                    (delivery_id, delivery_id),
+                )
+            elif error:
                 async with self.db.execute(
                     "SELECT attempts FROM outbox WHERE id=?", (delivery_id,)
                 ) as cursor:
@@ -1836,9 +1897,12 @@ class Store:
                         tier.get("image", "") for tier in prize_tiers(other)
                     )
             for filename in artwork:
-                (self.directory / "artwork" / Path(filename).name).unlink(
-                    missing_ok=True
-                )
+                try:
+                    (self.directory / "artwork" / Path(filename).name).unlink(
+                        missing_ok=True
+                    )
+                except OSError:
+                    logger.warning("Deleted lottery artwork cleanup deferred.")
         for entry in entries:
             for answer in entry["answers"]:
                 filename = (
@@ -1847,12 +1911,15 @@ class Store:
                     else answer.get("image")
                 )
                 if filename:
-                    (self.directory / "uploads" / Path(filename).name).unlink(
-                        missing_ok=True
-                    )
+                    try:
+                        (self.directory / "uploads" / Path(filename).name).unlink(
+                            missing_ok=True
+                        )
+                    except OSError:
+                        logger.warning("Deleted lottery attachment cleanup deferred.")
 
     async def cleanup_artwork(self) -> int:
-        """Remove unbound uploads after one day, retaining current and queued artwork.
+        """Remove unbound artwork and private attachments after one day.
 
         Returns:
             Number of stale, unreferenced files removed.
@@ -1869,11 +1936,29 @@ class Store:
                         tier.get("image", "") for tier in prize_tiers(item)
                     )
             removed = 0
-            for path in (self.directory / "artwork").glob("*.jpg"):
-                if (
-                    path.name not in references
-                    and path.stat().st_mtime < time.time() - 86400
-                ):
-                    path.unlink(missing_ok=True)
-                    removed += 1
+            attachments = set()
+            async with self.db.execute("SELECT body FROM entries") as cursor:
+                for row in await cursor.fetchall():
+                    for answer in json.loads(row[0])["answers"]:
+                        attachments.add(
+                            answer["value"]
+                            if answer["kind"] == "image"
+                            else answer.get("image")
+                        )
+            for directory, retained in (
+                ("artwork", references),
+                ("uploads", attachments),
+            ):
+                for path in (self.directory / directory).glob("*.jpg"):
+                    try:
+                        if (
+                            path.name not in retained
+                            and path.stat().st_mtime < time.time() - 86400
+                        ):
+                            path.unlink(missing_ok=True)
+                            removed += 1
+                    except OSError:
+                        logger.warning(
+                            "Lottery orphan cleanup failed in %s.", directory
+                        )
             return removed

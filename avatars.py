@@ -39,7 +39,9 @@ class AvatarCache:
         Raises:
             ValueError: The QQ identifier is invalid.
         """
-        if not isinstance(user_id, str) or not re.fullmatch(r"[1-9]\d{4,19}", user_id):
+        if not isinstance(user_id, str) or not re.fullmatch(
+            r"[1-9][0-9]{4,19}", user_id
+        ):
             raise ValueError("QQ 号无效")
         path = self.directory / f"{user_id}.jpg"
         try:

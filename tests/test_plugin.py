@@ -25,6 +25,141 @@ from PIL import Image as PillowImage
 from starlette.requests import Request
 
 
+@pytest.mark.parametrize("command", [False, True])
+async def test_original_onebot_text_survives_adapter_whitespace_trimming(
+    plugin, rules, command
+):
+    rules["questions"] = [{"kind": "text", "prompt": "保留原文"}]
+    item = await plugin.store.save(rules, "admin")
+    await plugin.store.enroll(item["id"], plugin.identity(event(plugin)))
+    original = "  first  line\nsecond  line  "
+    raw = f"/抽奖 回答 {original}" if command else original
+    current = event(plugin, group="", text=raw.strip())
+    current.message_obj.raw_message["message"] = [
+        {"type": "text", "data": {"text": raw}}
+    ]
+    await (
+        plugin.lottery_command(current) if command else plugin.collect_private(current)
+    )
+    assert (await plugin.store.entry(item["id"], "4444444"))["answers"][0][
+        "value"
+    ] == original
+
+
+@pytest.mark.parametrize("prefix", ["!", "猫猫 "])
+async def test_custom_wake_prefix_preserves_answers_and_ignores_other_commands(
+    plugin, rules, prefix
+):
+    plugin.context.get_config = lambda umo=None: {"wake_prefix": [prefix]}
+    rules["questions"] = [{"kind": "text", "prompt": "保留原文"}]
+    item = await plugin.store.save(rules, "admin")
+    await plugin.store.enroll(item["id"], plugin.identity(event(plugin)))
+    unrelated = event(plugin, group="", text=f"{prefix}help")
+    await plugin.collect_private(unrelated)
+    assert not (await plugin.store.entry(item["id"], "4444444"))["answers"]
+    original = "  first  line\nsecond  line  "
+    raw = f"{prefix}抽奖 回答 {original}"
+    current = event(plugin, group="", text=raw.strip())
+    current.message_str = f"抽奖 回答 {original.strip()}"
+    current.message_obj.raw_message["message"] = [
+        {"type": "text", "data": {"text": raw}}
+    ]
+    await plugin.lottery_command(current)
+    assert (await plugin.store.entry(item["id"], "4444444"))["answers"][0][
+        "value"
+    ] == original
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "http://127.0.0.1/secret",
+        "http://169.254.169.254/latest/",
+        "https://gchat.qpic.cn.example.org/x",
+        "https://user:password@gchat.qpic.cn/x",
+        "https://gchat.qpic.cn:444/x",
+        "file://server/share/image.jpg",
+        "C:/Windows/private.jpg",
+    ],
+)
+async def test_untrusted_private_image_sources_are_rejected_before_io(plugin, source):
+    with pytest.raises(ValueError):
+        await plugin.read_submission_image(Image(file=source))
+    assert plugin.image_session is None
+
+
+async def test_private_image_download_stops_at_limit_and_disables_redirects(plugin):
+    response = AsyncMock()
+    response.status = 200
+    response.content_length = None
+
+    async def chunks(size):
+        for _ in range(130):
+            yield b"x" * size
+        pytest.fail("Oversized response was fully consumed")
+
+    response.content.iter_chunked = chunks
+    context = AsyncMock()
+    context.__aenter__.return_value = response
+    plugin.image_session = Mock(
+        closed=False, get=Mock(return_value=context), close=AsyncMock()
+    )
+    with pytest.raises(ValueError, match="8 MB"):
+        await plugin.read_submission_image(Image.fromURL("https://gchat.qpic.cn/image"))
+    assert plugin.image_session.get.call_args.kwargs["allow_redirects"] is False
+
+
+async def test_private_image_orientation_and_transparency_are_sanitized(plugin, rules):
+    rules["questions"] = [{"kind": "image", "prompt": "图片"}]
+    item = await plugin.store.save(rules, "admin")
+    await plugin.store.enroll(item["id"], plugin.identity(event(plugin)))
+    data = BytesIO()
+    with PillowImage.new("RGBA", (30, 50), (0, 0, 0, 0)) as source:
+        exif = source.getexif()
+        exif[274] = 6
+        source.save(data, "PNG", exif=exif)
+    await plugin.collect_private(
+        event(plugin, group="", components=[Image.fromBytes(data.getvalue())])
+    )
+    entry = await plugin.store.entry(item["id"], "4444444")
+    with PillowImage.open(
+        plugin.store.directory / "uploads" / entry["answers"][0]["value"]
+    ) as image:
+        assert image.size == (50, 30)
+        assert min(image.getpixel((0, 0))) > 245
+        assert not image.getexif()
+
+
+async def test_notice_revoked_during_render_is_not_sent(plugin, rules, monkeypatch):
+    item = await plugin.store.save(rules, "admin")
+    await plugin.store.enroll(item["id"], plugin.identity(event(plugin)))
+    reached = asyncio.Event()
+    release = asyncio.Event()
+
+    async def avatar(*args):
+        reached.set()
+        await release.wait()
+        return None
+
+    plugin.avatars.get = avatar
+    monkeypatch.setattr(
+        "astrbot_plugin_catlottery.main.render_pages", lambda *a, **k: [b"image"]
+    )
+    sending = asyncio.create_task(plugin.send_deliveries())
+    await asyncio.wait_for(reached.wait(), 2)
+    await plugin.store.withdraw(item["id"], plugin.identity(event(plugin)))
+    release.set()
+    await sending
+    assert not plugin.context.get_platform_inst("napcat").client.calls
+
+
+async def test_failed_error_reply_does_not_raise_again(plugin):
+    current = event(plugin, text="抽奖 不存在")
+    current.send = AsyncMock(side_effect=ConnectionError("offline"))
+    await plugin.lottery_command(current)
+    current.send.assert_awaited_once()
+
+
 class Client:
     """Fake only the external OneBot transport, preserving framework event behavior."""
 
@@ -77,7 +212,10 @@ class Platform:
 
 
 @pytest.fixture
-async def plugin(tmp_path):
+async def plugin(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        "astrbot_plugin_catlottery.main.get_astrbot_temp_path", lambda: str(tmp_path)
+    )
     clients = [Client(), Client("7654321", ["3333333"])]
     platforms = [Platform("napcat", clients[0]), Platform("snowluma", clients[1])]
     context = SimpleNamespace(
@@ -86,7 +224,7 @@ async def plugin(tmp_path):
             (platform for platform in platforms if platform.meta().id == platform_id),
             None,
         ),
-        get_config=lambda: {"admins_id": ["9999999"]},
+        get_config=lambda umo=None: {"admins_id": ["9999999"]},
         registered_web_apis=[],
         register_web_api=lambda *args: None,
         activate_llm_tool_async=AsyncMock(return_value=True),

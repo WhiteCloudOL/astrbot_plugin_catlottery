@@ -10,6 +10,112 @@ import pytest
 from astrbot_plugin_catlottery.storage import Store, timestamp, validate_lottery
 
 
+async def test_expired_session_releases_sender_for_another_lottery(
+    store, rules, sender, monkeypatch
+):
+    rules["questions"] = [{"kind": "text", "prompt": "资料"}]
+    item = await store.save(rules, "admin")
+    await store.enroll(item["id"], sender)
+    monkeypatch.setattr(
+        "astrbot_plugin_catlottery.storage.time.time", lambda: item["close_at"]
+    )
+    assert await store.private_session(sender["bot_id"], sender["user_id"]) is None
+
+
+async def test_closed_activity_allows_notice_edits_but_due_draw_cannot_be_postponed(
+    store, rules, monkeypatch
+):
+    item = await store.save(rules, "admin")
+    monkeypatch.setattr(
+        "astrbot_plugin_catlottery.storage.time.time", lambda: item["close_at"] + 1
+    )
+    saved = await store.save(
+        {**item, "group_success_notify": False}, "admin", item["id"]
+    )
+    assert saved["close_at"] == item["close_at"]
+    assert not saved["group_success_notify"]
+    with pytest.raises(ValueError, match="开奖时间"):
+        await store.save({**item, "draw_at": item["close_at"]}, "admin", item["id"])
+    monkeypatch.setattr(
+        "astrbot_plugin_catlottery.storage.time.time", lambda: item["draw_at"]
+    )
+    with pytest.raises(ValueError, match="开奖时间"):
+        await store.save(
+            {
+                **item,
+                "close_at": item["draw_at"] + 100,
+                "draw_at": item["draw_at"] + 200,
+            },
+            "admin",
+            item["id"],
+        )
+
+
+async def test_changed_targets_revoke_queued_announcements(store, rules):
+    item = await store.save(rules, "admin")
+    await store.action(item["id"], "publish")
+    rules["targets"] = [{**rules["targets"][0], "group_id": "8888888"}]
+    await store.save(rules, "admin", item["id"])
+    assert not await store.deliveries()
+
+
+async def test_nondecimal_quiz_symbol_does_not_abort_bulk_matching(
+    store, rules, sender
+):
+    rules.update(
+        require_correct=False,
+        questions=[
+            {
+                "kind": "quiz",
+                "prompt": "选项",
+                "options": ["猫", "狗"],
+                "answers": ["猫"],
+            }
+        ],
+    )
+    item = await store.save(rules, "admin")
+    await store.enroll(item["id"], sender)
+    await store.answer(
+        item["id"], {**sender, "group_id": ""}, {"kind": "text", "value": "❶"}, 0
+    )
+    result = await store.review(item["id"], {"action": "match"}, "admin")
+    assert result["marked_answers"] == 1
+    assert (await store.entry(item["id"], sender["user_id"]))[
+        "review_status"
+    ] == "rejected"
+
+
+def test_equivalent_choice_options_are_rejected(rules):
+    rules["questions"] = [
+        {
+            "kind": "quiz",
+            "prompt": "重复选项",
+            "options": ["Cat", "ＣＡＴ"],
+            "answers": ["Cat"],
+        }
+    ]
+    with pytest.raises(ValueError, match="重复"):
+        validate_lottery(rules)
+
+
+async def test_private_orphan_sweep_preserves_current_attachments(store, rules, sender):
+    rules["questions"] = [{"kind": "image", "prompt": "图片"}]
+    item = await store.save(rules, "admin")
+    await store.enroll(item["id"], sender)
+    retained = "a" * 32 + ".jpg"
+    orphan = "b" * 32 + ".jpg"
+    for filename in (retained, orphan):
+        path = store.directory / "uploads" / filename
+        path.write_bytes(b"image")
+        os.utime(path, (time.time() - 90000,) * 2)
+    await store.answer(
+        item["id"], {**sender, "group_id": ""}, {"kind": "image", "value": retained}, 0
+    )
+    assert await store.cleanup_artwork() == 1
+    assert (store.directory / "uploads" / retained).is_file()
+    assert not (store.directory / "uploads" / orphan).exists()
+
+
 @pytest.fixture
 def tier_rules(rules):
     rules["prize_tiers"] = [

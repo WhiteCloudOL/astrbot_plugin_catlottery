@@ -72,7 +72,7 @@ def render_announcement(
             for tier in tiers[offset : offset + 3]
         )
         shift = 122 if compact else 0
-        canvas = Image.new("RGB", (1280, 860 - shift), "#fff4f6")
+        canvas = Image.new("RGB", (1280, 860 - shift), "#fff8fb")
         draw = ImageDraw.Draw(canvas)
 
         def draw_lines(text, position, font, width, count, color="#633c47", spacing=34):
@@ -102,7 +102,7 @@ def render_announcement(
                     anchor="lt",
                 )
 
-        draw.rounded_rectangle((24, 22, 1256, 224), radius=30, fill="#ffdde7")
+        draw.rounded_rectangle((24, 22, 1256, 224), radius=30, fill="#fbe3ed")
         draw.rounded_rectangle((48, 42, 170, 77), radius=17, fill="white")
         draw.text((65, 49), "抽奖公告", font=small_font, fill="#c83c6b", anchor="lt")
         if participation_counts is not None:
@@ -134,7 +134,7 @@ def render_announcement(
                 (x, 246, x + tile_width, 548 - shift),
                 radius=24,
                 fill="white",
-                outline="#f2c7d5",
+                outline="#ead3df",
                 width=1,
             )
             draw.rounded_rectangle((x + 22, 268, x + 27, 294), radius=2, fill="#db5780")
@@ -160,7 +160,7 @@ def render_announcement(
             )
             draw.text(
                 (x + 24, 513 - shift),
-                f"{tier['count']} 位  ·  {'已提前揭晓' if drawn else '等待好运'}",
+                f"{tier['count']} 位  ·  {'已提前揭晓' if drawn else '未开奖'}",
                 font=small_font,
                 fill="#a56d7d",
                 anchor="lt",
@@ -190,7 +190,7 @@ def render_announcement(
             anchor="lt",
         )
         draw.rounded_rectangle(
-            (607, 570 - shift, 1248, 724 - shift), radius=24, fill="#ffe2ec"
+            (607, 570 - shift, 1248, 724 - shift), radius=24, fill="#edf2fb"
         )
         draw.text(
             (632, 590 - shift),
@@ -297,10 +297,14 @@ def render(
         lines = wrap(text, body_font, 720) if text else []
         labels = wrap(label, label_font, 728)
         picture = None
-        if len(section) == 3 and section[2].is_file():
-            with Image.open(section[2]) as source:
-                source.thumbnail((732, 320), Image.Resampling.LANCZOS)
-                picture = source.convert("RGB")
+        if len(section) == 3:
+            try:
+                with Image.open(section[2]) as source:
+                    source.thumbnail((732, 320), Image.Resampling.LANCZOS)
+                    picture = source.convert("RGB")
+            except OSError:
+                # Optional artwork must not prevent delivery of the result text.
+                pass
         image_height = picture.height + 20 if picture is not None else 0
         blocks.append(
             (
@@ -311,16 +315,19 @@ def render(
             )
         )
     height = header_height + sum(block[3] + 18 for block in blocks) + 86
-    canvas = Image.new("RGB", (860, height), "#fff3f6")
+    canvas = Image.new("RGB", (860, height), "#fff8fb")
     draw = ImageDraw.Draw(canvas)
     # Pink stationery uses explicit top anchors to avoid font-bearing layout drift.
     for y in range(header_height):
         ratio = y / max(header_height, 1)
         draw.line(
             (0, y, 860, y),
-            fill=(255, int(213 + ratio * 20), int(225 + ratio * 16)),
+            fill=(255, int(227 + ratio * 14), int(236 + ratio * 10)),
         )
     draw.ellipse((-100, -140, 195, 150), fill="#ffd8e3")
+    draw.line(
+        (42, header_height - 12, 818, header_height - 12), fill="#edc9da", width=1
+    )
     draw.rounded_rectangle(
         (42, 30, 42 + int(small_font.getlength(badge)) + 34, 64),
         radius=17,
@@ -352,8 +359,14 @@ def render(
         y += 29
     # Participant avatars fill the rounded frame; the brand mark keeps its padding.
     draw.rounded_rectangle((672, 40, 824, 192), radius=24, fill="#ffffff")
-    has_avatar = bool(avatar_path and avatar_path.is_file())
-    with Image.open(avatar_path if has_avatar else LOGO_PATH) as logo:
+    has_avatar = False
+    try:
+        logo = Image.open(avatar_path or LOGO_PATH)
+        logo.load()
+        has_avatar = avatar_path is not None
+    except OSError:
+        logo = Image.open(LOGO_PATH)
+    with logo:
         with logo.convert("RGB") as picture:
             if has_avatar:
                 with (
@@ -378,7 +391,7 @@ def render(
     y = header_height + 10
     for labels, lines, picture, block_height in blocks:
         draw.rounded_rectangle(
-            (32, y + 2, 828, y + block_height + 2), radius=22, fill="#f1ceda"
+            (32, y + 2, 828, y + block_height + 2), radius=22, fill="#efdee7"
         )
         draw.rounded_rectangle(
             (32, y, 828, y + block_height), radius=22, fill="#ffffff"
@@ -411,7 +424,7 @@ def render(
                 (65, line_y),
                 line,
                 font=body_font,
-                fill="#b83b65" if command or friend_hint else "#633c47",
+                fill="#a33361" if command or friend_hint else "#493747",
                 anchor="lt",
                 stroke_width=1 if friend_hint else 0,
                 stroke_fill="#b83b65",
@@ -422,15 +435,20 @@ def render(
             picture.close()
         y += block_height + 18
     draw.line((46, height - 59, 814, height - 59), fill="#f0ccd8", width=1)
+    with Image.open(LOGO_PATH) as mark:
+        with mark.convert("RGBA") as rgba:
+            rgba.thumbnail((34, 34), Image.Resampling.LANCZOS)
+            canvas.paste(rgba, (47, height - 47), rgba)
     draw.text(
-        (49, height - 44),
-        "喵喵抽奖  ·  每一份期待，都认真收好",
+        (91, height - 39),
+        "喵喵抽奖  ·  群里的小惊喜",
         font=small_font,
         fill="#aa7183",
         anchor="lt",
     )
     output = BytesIO()
     canvas.save(output, format="PNG", optimize=True)
+    canvas.close()
     return output.getvalue()
 
 

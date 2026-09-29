@@ -84,7 +84,9 @@ class Choice extends HTMLElement {
       }
     });
     this.addEventListener("keydown", event => {
+      if (this.hasAttribute("disabled")) return;
       if (event.key === "Escape") {
+        event.stopPropagation();
         this.opened = false;
         this.render();
         this.querySelector(".choice-trigger").focus();
@@ -108,7 +110,7 @@ class Choice extends HTMLElement {
   render() {
     const selected = this.items.find(item => String(item.value) === this.value);
     const disabled = this.hasAttribute("disabled");
-    this.innerHTML = `<button type="button" class="choice-trigger" aria-haspopup="listbox" aria-expanded="${this.opened}" ${disabled ? "disabled" : ""}><span>${escapeHTML(selected?.label || this.getAttribute("placeholder") || "请选择")}</span>${icon("chevron")}</button>${this.opened && !disabled ? `<div class="choice-menu" role="listbox" aria-label="${escapeHTML(this.getAttribute("label") || "选项")}">${this.items.map(item => `<button type="button" role="option" aria-selected="${String(item.value) === this.value}" data-value="${escapeHTML(item.value)}">${escapeHTML(item.label)}${String(item.value) === this.value ? icon("check") : ""}</button>`).join("") || '<div class="choice-empty">没有可选项目</div>'}</div>` : ""}`;
+    this.innerHTML = `<button type="button" class="choice-trigger" aria-label="${escapeHTML(this.getAttribute("label") || this.getAttribute("placeholder") || "请选择")}" aria-haspopup="listbox" aria-expanded="${this.opened}" ${disabled ? "disabled" : ""}><span>${escapeHTML(selected?.label || this.getAttribute("placeholder") || "请选择")}</span>${icon("chevron")}</button>${this.opened && !disabled ? `<div class="choice-menu" role="listbox" aria-label="${escapeHTML(this.getAttribute("label") || "选项")}">${this.items.map(item => `<button type="button" role="option" aria-selected="${String(item.value) === this.value}" data-value="${escapeHTML(item.value)}">${escapeHTML(item.label)}${String(item.value) === this.value ? icon("check") : ""}</button>`).join("") || '<div class="choice-empty">没有可选项目</div>'}</div>` : ""}`;
   }
 }
 customElements.define("meow-choice", Choice);
@@ -150,12 +152,12 @@ class Stepper extends HTMLElement {
       if (step) { this.value = Math.min(this.max, Math.max(this.min, this.value + Number(step.dataset.step))); this.querySelector("input").value = this.value; this.dispatchEvent(new Event("change", { bubbles: true })); }
     });
     this.querySelector("input").addEventListener("input", event => {
-      this.value = Math.min(this.max, Math.max(this.min, Number(event.target.value) || this.min));
+      this.value = Math.min(this.max, Math.max(this.min, Math.trunc(Number(event.target.value)) || this.min));
       this.dispatchEvent(new Event("change", { bubbles: true }));
     });
     this.querySelector("input").addEventListener("change", event => {
       event.stopPropagation();
-      this.value = Math.min(this.max, Math.max(this.min, Number(event.target.value) || this.min));
+      this.value = Math.min(this.max, Math.max(this.min, Math.trunc(Number(event.target.value)) || this.min));
       event.target.value = this.value;
       this.dispatchEvent(new Event("change", { bubbles: true }));
     });
@@ -192,7 +194,10 @@ class Artwork extends HTMLElement {
   async loadPreview() {
     const filename = this.value;
     try {
-      if (!artworkCache.has(filename)) artworkCache.set(filename, window.AstrBotPluginPage.apiGet(`artwork/${filename}`));
+      if (!artworkCache.has(filename)) {
+        if (artworkCache.size >= 64) artworkCache.delete(artworkCache.keys().next().value);
+        artworkCache.set(filename, window.AstrBotPluginPage.apiGet(`artwork/${filename}`));
+      }
       const data = await artworkCache.get(filename);
       if (this.value === filename) { this.preview = data.preview; this.render(); }
     } catch { artworkCache.delete(filename); if (this.value === filename) { this.preview = ""; this.failed = true; this.render(); } }
@@ -221,14 +226,17 @@ customElements.define("meow-upload", Artwork);
 export const artwork = (name, value = "", label = "图片", { disabled = false, cover = false } = {}) => `<meow-upload name="${escapeHTML(name)}" value="${escapeHTML(value)}" label="${escapeHTML(label)}" variant="${cover ? "cover" : "prize"}" ${disabled ? "disabled" : ""}></meow-upload>`;
 
 export async function loadArtwork(container) {
-  for (const image of container.querySelectorAll("img[data-artwork]")) {
+  await Promise.all([...container.querySelectorAll("img[data-artwork]")].map(async image => {
     const filename = image.dataset.artwork;
     try {
-      if (!artworkCache.has(filename)) artworkCache.set(filename, window.AstrBotPluginPage.apiGet(`artwork/${filename}`));
+      if (!artworkCache.has(filename)) {
+        if (artworkCache.size >= 64) artworkCache.delete(artworkCache.keys().next().value);
+        artworkCache.set(filename, window.AstrBotPluginPage.apiGet(`artwork/${filename}`));
+      }
       const data = await artworkCache.get(filename);
       if (image.isConnected) { image.src = data.preview; image.classList.add("loaded"); }
     } catch { artworkCache.delete(filename); image.replaceWith(Object.assign(document.createElement("span"), { className: "artwork-unavailable", textContent: "图片暂不可用" })); }
-  }
+  }));
 }
 
 export const chinaDate = seconds => new Date(seconds * 1000 + 8 * 3600000).toISOString().slice(0, 16).replace("T", " ");
@@ -243,28 +251,31 @@ class Calendar extends HTMLElement {
     this.opened = false;
     this.render();
     this.addEventListener("click", event => {
-      if (event.target.closest(".date-trigger")) { this.opened = !this.opened; this.render(); }
+      if (event.target.closest(".date-trigger")) { this.opened = !this.opened; this.render(); (this.querySelector("[data-day].selected") || this.querySelector("[data-day]") || this.querySelector(".date-trigger"))?.focus(); }
       const nav = event.target.closest("[data-month]");
       if (nav) {
         const date = new Date(`${this.month}-01T00:00:00Z`);
         date.setUTCMonth(date.getUTCMonth() + Number(nav.dataset.month));
         this.month = date.toISOString().slice(0, 7);
         this.render();
+        this.querySelector(`[data-month="${nav.dataset.month}"]`)?.focus();
       }
       const day = event.target.closest("[data-day]");
-      if (day) { this.value = `${this.month}-${day.dataset.day.padStart(2, "0")} ${this.value.slice(11)}`; this.render(); this.dispatchEvent(new Event("change", { bubbles: true })); }
+      if (day) { this.value = `${this.month}-${day.dataset.day.padStart(2, "0")} ${this.value.slice(11)}`; this.render(); this.querySelector(`[data-day="${day.dataset.day}"]`)?.focus(); this.dispatchEvent(new Event("change", { bubbles: true })); }
       if (event.target.closest(".date-done")) { this.opened = false; this.render(); this.querySelector(".date-trigger").focus(); }
     });
     this.addEventListener("change", event => {
       if (!event.target.matches("[data-time]")) return;
-      const hour = Math.min(23, Math.max(0, Number(this.querySelector('[data-time="hour"]').value) || 0));
-      const minute = Math.min(59, Math.max(0, Number(this.querySelector('[data-time="minute"]').value) || 0));
+      const hour = Math.min(23, Math.max(0, Math.trunc(Number(this.querySelector('[data-time="hour"]').value)) || 0));
+      const minute = Math.min(59, Math.max(0, Math.trunc(Number(this.querySelector('[data-time="minute"]').value)) || 0));
       this.value = `${this.value.slice(0, 10)} ${String(hour).padStart(2, "0")}:${String(minute).padStart(2, "0")}`;
       event.target.value = String(event.target.dataset.time === "hour" ? hour : minute).padStart(2, "0");
       this.querySelector(".date-label").textContent = this.value;
     });
     this.addEventListener("keydown", event => {
-      if (event.key === "Escape") { this.opened = false; this.render(); this.querySelector(".date-trigger").focus(); event.stopPropagation(); }
+      if (this.hasAttribute("disabled")) return;
+      if (event.key === "Escape") {
+        event.stopPropagation(); this.opened = false; this.render(); this.querySelector(".date-trigger").focus(); event.stopPropagation(); }
       if (["ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown"].includes(event.key) && event.target.matches("[data-day]")) {
         event.preventDefault();
         const days = [...this.querySelectorAll("[data-day]")];
@@ -280,7 +291,7 @@ class Calendar extends HTMLElement {
     const [year, month] = this.month.split("-").map(Number);
     const first = new Date(Date.UTC(year, month - 1, 1)).getUTCDay();
     const days = new Date(Date.UTC(year, month, 0)).getUTCDate();
-    this.innerHTML = `<button type="button" class="date-trigger" aria-haspopup="dialog" aria-expanded="${this.opened}">${icon("calendar")}<span class="date-label">${this.value}</span></button>${this.opened ? `<div class="calendar-popover" role="dialog" aria-label="选择北京时间"><div class="calendar-heading"><button type="button" data-month="-1" aria-label="上个月">‹</button><strong>${year} 年 ${month} 月</strong><button type="button" data-month="1" aria-label="下个月">›</button></div><div class="calendar-grid">${["日", "一", "二", "三", "四", "五", "六"].map(day => `<span>${day}</span>`).join("")}${'<span></span>'.repeat(first)}${Array.from({ length: days }, (_, index) => `<button type="button" data-day="${index + 1}" class="${this.value.slice(0, 10) === `${this.month}-${String(index + 1).padStart(2, "0")}` ? "selected" : ""}" aria-label="${month} 月 ${index + 1} 日">${index + 1}</button>`).join("")}</div><div class="time-editor"><span>北京时间</span><input type="text" inputmode="numeric" data-time="hour" aria-label="小时" maxlength="2" value="${this.value.slice(11, 13)}"/><span>:</span><input type="text" inputmode="numeric" data-time="minute" aria-label="分钟" maxlength="2" value="${this.value.slice(14, 16)}"/><button type="button" class="date-done btn btn-tonal">确定</button></div></div>` : ""}`;
+    this.innerHTML = `<button type="button" class="date-trigger" aria-label="${escapeHTML(this.getAttribute("label") || "选择北京时间")}" aria-haspopup="dialog" aria-expanded="${this.opened}">${icon("calendar")}<span class="date-label">${this.value}</span></button>${this.opened ? `<div class="calendar-popover" role="dialog" aria-label="选择北京时间"><div class="calendar-heading"><button type="button" data-month="-1" aria-label="上个月">‹</button><strong>${year} 年 ${month} 月</strong><button type="button" data-month="1" aria-label="下个月">›</button></div><div class="calendar-grid">${["日", "一", "二", "三", "四", "五", "六"].map(day => `<span>${day}</span>`).join("")}${'<span></span>'.repeat(first)}${Array.from({ length: days }, (_, index) => `<button type="button" data-day="${index + 1}" class="${this.value.slice(0, 10) === `${this.month}-${String(index + 1).padStart(2, "0")}` ? "selected" : ""}" aria-label="${month} 月 ${index + 1} 日">${index + 1}</button>`).join("")}</div><div class="time-editor"><span>北京时间</span><input type="text" inputmode="numeric" data-time="hour" aria-label="小时" maxlength="2" value="${this.value.slice(11, 13)}"/><span>:</span><input type="text" inputmode="numeric" data-time="minute" aria-label="分钟" maxlength="2" value="${this.value.slice(14, 16)}"/><button type="button" class="date-done btn btn-tonal">确定</button></div></div>` : ""}`;
   }
 }
 customElements.define("meow-calendar", Calendar);
@@ -288,7 +299,7 @@ customElements.define("meow-calendar", Calendar);
 let modalSequence = 0;
 export function pageForm(title, subtitle, body, footer) {
   const holder = document.querySelector(".activity-outlet");
-  holder.innerHTML = `<article class="editor-page"><div class="page-breadcrumb">${button("返回上一页", {action:"form-back",style:"text",glyph:"arrow"})}<span>活动设置</span></div><header class="activity-header"><div><span class="guide-category">准备这份惊喜</span><h2>${escapeHTML(title)}</h2><p>${escapeHTML(subtitle)}</p></div></header><div class="page-panel editor-page-body">${body}</div><footer class="editor-page-footer">${footer}</footer></article>`;
+  holder.innerHTML = `<article class="editor-page"><div class="page-breadcrumb">${button("返回上一页", {action:"form-back",style:"text",glyph:"arrow"})}<span>活动设置</span></div><header class="activity-header"><div><span class="guide-category">抽奖设置</span><h2>${escapeHTML(title)}</h2><p>${escapeHTML(subtitle)}</p></div></header><div class="page-panel editor-page-body">${body}</div><footer class="editor-page-footer">${footer}</footer></article>`;
   return { holder, close: () => holder.replaceChildren() };
 }
 
@@ -299,16 +310,21 @@ export function modal(title, subtitle, body, footer, { wide = false, onClose, ca
   const titleId = `meow-modal-title-${++modalSequence}`;
   holder.className = "modal-backdrop";
   holder.innerHTML = `<section class="modal ${wide ? "modal-wide" : ""}" role="dialog" aria-modal="true" aria-labelledby="${titleId}"><header class="modal-header"><div><p class="eyebrow">喵喵抽奖 / 管理工作台</p><h2 id="${titleId}" class="text-h3 pa-4 pb-0 pl-6">${escapeHTML(title)}</h2><p>${escapeHTML(subtitle)}</p></div><button class="icon-btn modal-close" aria-label="关闭">${icon("close")}</button></header><div class="modal-body">${body}</div>${footer ? `<footer class="modal-footer">${footer}</footer>` : ""}</section>`;
+  const background = document.getElementById("app");
+  const previousDialog = root.lastElementChild;
+  if (background) background.inert = true;
+  if (previousDialog) previousDialog.inert = true;
   root.append(holder);
   document.body.classList.add("has-modal");
-  const close = () => { if (!canClose()) return; holder.remove(); if (!root.children.length) document.body.classList.remove("has-modal"); if (previous?.isConnected) previous.focus(); onClose?.(); };
+  const close = () => { if (!canClose()) return; holder.remove(); if (!root.children.length) { document.body.classList.remove("has-modal"); if (background) background.inert = false; } if (previousDialog?.isConnected) previousDialog.inert = false; if (previous?.isConnected) previous.focus(); onClose?.(); };
   holder.querySelector(".modal-close").addEventListener("click", close);
   holder.addEventListener("click", event => { if (event.target === holder || event.target.closest('[data-action="dismiss"]')) close(); });
   holder.addEventListener("keydown", event => {
     if (event.key === "Escape") { event.preventDefault(); event.stopPropagation(); close(); }
     if (event.key === "Tab") {
-      const focusable = [...holder.querySelectorAll('button:not(:disabled), input:not(:disabled), textarea:not(:disabled), [tabindex="0"]')].filter(element => element.offsetParent !== null);
+      const focusable = [...holder.querySelectorAll('button:not(:disabled), input:not(:disabled), textarea:not(:disabled), a[href], [tabindex="0"]')].filter(element => element.offsetParent !== null);
       const first = focusable[0], last = focusable.at(-1);
+      if (!focusable.length) { event.preventDefault(); return; }
       if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last?.focus(); }
       else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first?.focus(); }
     }
