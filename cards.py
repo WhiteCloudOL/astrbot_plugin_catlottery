@@ -125,6 +125,7 @@ def render_announcement(
             (
                 directory / item["cover"] if item.get("cover") else LOGO_PATH,
                 (1048, 52, 1230, 194),
+                False,
             )
         ]
         for index, tier in enumerate(tiers[offset : offset + 3]):
@@ -143,7 +144,9 @@ def render_announcement(
             image_path = directory / tier.get("image", "")
             has_image = bool(tier.get("image")) and image_path.is_file()
             if has_image:
-                images.append((image_path, (x + 24, 312, x + tile_width - 24, 422)))
+                images.append(
+                    (image_path, (x + 24, 312, x + tile_width - 24, 422), True)
+                )
             draw_lines(
                 tier["prize"],
                 (x + 24, 438 if has_image else 324),
@@ -230,7 +233,7 @@ def render_announcement(
         draw.text(
             (48, 802 - shift), footer, font=small_font, fill="#aa7183", anchor="lt"
         )
-        for path, box in images:
+        for path, box, left_aligned in images:
             if not path.is_file():
                 continue
             try:
@@ -242,7 +245,9 @@ def render_announcement(
                         canvas.paste(
                             picture,
                             (
-                                box[0] + (box[2] - box[0] - picture.width) // 2,
+                                box[0]
+                                if left_aligned
+                                else box[0] + (box[2] - box[0] - picture.width) // 2,
                                 box[1] + (box[3] - box[1] - picture.height) // 2,
                             ),
                         )
@@ -263,6 +268,7 @@ def render(
     *,
     avatar_path: Path | None = None,
     participation_counts: dict | None = None,
+    bold_title: bool = False,
 ) -> bytes:
     """Render a complete cat-themed PNG with dynamically sized text blocks.
 
@@ -273,6 +279,7 @@ def render(
         badge: Short category printed above the title.
         avatar_path: Optional cached QQ avatar for enrollment receipts.
         participation_counts: Optional live enrollment totals in the card header.
+        bold_title: Emphasize the title with a one-pixel stroke in the bundled font.
 
     Returns:
         PNG bytes suitable for AstrBot Image.fromBytes and OneBot base64.
@@ -330,7 +337,15 @@ def render(
         )
     y = 91
     for line in title_lines:
-        draw.text((46, y), line, font=title_font, fill="#923750", anchor="lt")
+        draw.text(
+            (46, y),
+            line,
+            font=title_font,
+            fill="#923750",
+            anchor="lt",
+            stroke_width=1 if bold_title else 0,
+            stroke_fill="#923750",
+        )
         y += 54
     for line in subtitle_lines:
         draw.text((48, y + 14), line, font=small_font, fill="#956070", anchor="lt")
@@ -380,7 +395,8 @@ def render(
         line_y = y + 34 + len(labels) * 30
         for line in lines:
             command = line.startswith("/抽奖")
-            if command:
+            friend_hint = line.startswith("请先添加我")
+            if command or friend_hint:
                 draw.rounded_rectangle(
                     (
                         59,
@@ -389,14 +405,16 @@ def render(
                         line_y + 30,
                     ),
                     radius=8,
-                    fill="#fff0f5",
+                    fill="#ffe0eb" if friend_hint else "#fff0f5",
                 )
             draw.text(
                 (65, line_y),
                 line,
                 font=body_font,
-                fill="#b83b65" if command else "#633c47",
+                fill="#b83b65" if command or friend_hint else "#633c47",
                 anchor="lt",
+                stroke_width=1 if friend_hint else 0,
+                stroke_fill="#b83b65",
             )
             line_y += 38
         if picture is not None:
@@ -424,6 +442,7 @@ def render_pages(
     *,
     avatar_path: Path | None = None,
     participation_counts: dict | None = None,
+    bold_title: bool = False,
 ) -> list[bytes]:
     """Paginate complete content so large winner lists remain readable in QQ.
 
@@ -434,6 +453,7 @@ def render_pages(
         badge: Category shown on every page.
         avatar_path: Optional cached participant avatar for every receipt page.
         participation_counts: Live enrollment totals repeated on every page.
+        bold_title: Emphasize the main title consistently on every page.
 
     Returns:
         Ordered PNG pages with a bounded height and no dropped text.
@@ -508,6 +528,7 @@ def render_pages(
             badge,
             avatar_path=avatar_path,
             participation_counts=participation_counts,
+            bold_title=bold_title,
         )
         for index, content in enumerate(pages)
     ]

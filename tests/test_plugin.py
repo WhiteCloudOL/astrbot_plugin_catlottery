@@ -119,6 +119,7 @@ async def test_tool_switch_blocks_all_tools_and_leaves_qq_commands_available(
         (plugin.tool_fill, (item["id"],)),
         (plugin.tool_create, ("标题", "奖品", 1, "2030-01-01", "2030-01-02")),
         (plugin.tool_manage, (item["id"], "draw", True)),
+        (plugin.tool_notifications, (item["id"], "group_pending", "off", "", 60, True)),
     ):
         assert "已关闭" in await handler(event(plugin), *args)
     assert (await plugin.store.get(item["id"]))["status"] == "open"
@@ -530,6 +531,142 @@ async def test_llm_admin_tools_enforce_real_sender_and_per_lottery_platform(
     assert "明确指定" in outcome
     await plugin.tool_manage(event(plugin, user="9999999"), item["id"], "draw", True)
     assert (await plugin.store.get(item["id"]))["status"] == "drawn"
+
+
+async def test_llm_public_info_has_award_numbers_and_no_answer_references(
+    plugin, rules
+):
+    rules.update(
+        require_correct=False,
+        questions=[{"kind": "quiz", "prompt": "问题", "answers": ["secret-reference"]}],
+        prize_tiers=[
+            {"name": "二等奖", "prize": "玩偶", "count": 1},
+            {"name": "一等奖", "prize": "贴纸", "count": 1},
+        ],
+    )
+    item = await plugin.store.save(rules, "admin")
+    info = json.loads(await plugin.tool_info(event(plugin), item["id"]))
+    assert "secret-reference" not in json.dumps(info)
+    assert [award["award_number"] for award in info["awards"]] == [1, 2]
+    assert info["card_sent"] and info["question_count"] == 1
+    rejected = await plugin.tool_manage(
+        event(plugin, user="9999999"), item["id"], "draw", True, award_number=2
+    )
+    assert "序号" in rejected
+    assert (await plugin.store.get(item["id"]))["tier_draws"] == []
+    await plugin.tool_manage(
+        event(plugin, user="9999999"), item["id"], "draw_tier", True, award_number=2
+    )
+    saved = await plugin.store.get(item["id"])
+    assert saved["status"] == "open"
+    assert [record["tier_index"] for record in saved["tier_draws"]] == [1]
+
+
+async def test_llm_notifications_require_real_admin_explicit_confirmation_and_exact_scope(
+    plugin, rules
+):
+    item = await plugin.store.save(rules, "admin")
+    assert "仅限" in await plugin.tool_notifications(
+        event(plugin), item["id"], "group_pending", "off", confirmed=True
+    )
+    assert "明确指定" in await plugin.tool_notifications(
+        event(plugin, user="9999999"),
+        item["id"],
+        "group_pending",
+        "off",
+        confirmed="true",
+    )
+    assert (await plugin.store.get(item["id"]))["group_pending_notify"] is True
+    result = json.loads(
+        await plugin.tool_notifications(
+            event(plugin, user="9999999"),
+            item["id"],
+            "group_pending",
+            "off",
+            confirmed=True,
+        )
+    )
+    assert (
+        result["group_pending_notify"] is False
+        and result["group_success_notify"] is True
+    )
+    wrong_platform = event(plugin, platform="snowluma", user="9999999", group="8888888")
+    assert "允许列表" in await plugin.tool_notifications(
+        wrong_platform, item["id"], "group_success", "off", confirmed=True
+    )
+    assert (await plugin.store.get(item["id"]))["group_success_notify"] is True
+    start = time.time() + 120
+    scheduled = json.loads(
+        await plugin.tool_notifications(
+            event(plugin, user="9999999"),
+            item["id"],
+            "announcement",
+            "repeat",
+            start_at=start,
+            interval_minutes=15,
+            confirmed=True,
+        )
+    )
+    assert scheduled["announcement_next_at"] == start
+    assert scheduled["announcement_schedule"]["interval_minutes"] == 15
+    assert scheduled["group_pending_notify"] is False
+
+
+async def test_scheduled_announcement_uses_live_counts_and_separate_text(
+    plugin, rules, monkeypatch
+):
+    start = time.time() + 60
+    item = await plugin.store.save(
+        {**rules, "announcement_schedule": {"mode": "once", "start_at": start}}, "admin"
+    )
+    await plugin.store.schedule_announcements(now=start)
+    await plugin.store.enroll(item["id"], plugin.identity(event(plugin)))
+    captured = []
+
+    def capture(item, directory, **kwargs):
+        captured.append(kwargs["participation_counts"])
+        return [b"image"]
+
+    monkeypatch.setattr("astrbot_plugin_catlottery.main.render_announcement", capture)
+    await plugin.send_deliveries()
+    await plugin.send_deliveries()
+    assert all((value["approved"], value["pending"]) == (1, 0) for value in captured)
+    for platform in plugin.context.platform_manager.platform_insts:
+        calls = [
+            params
+            for action, params in platform.client.calls
+            if action == "send_group_msg"
+        ]
+        texts = [
+            params["message"][0]["data"]["text"]
+            for params in calls
+            if params["message"][0]["type"] == "text"
+        ]
+        assert len(texts) == 1
+        assert "成功参与 1 人 · 待审核 0 人" in texts[0]
+
+
+async def test_pending_group_switch_preserves_private_confirmation(
+    plugin, rules, monkeypatch
+):
+    rules.update(
+        group_pending_notify=False,
+        require_correct=False,
+        questions=[{"kind": "text", "prompt": "資料"}],
+    )
+    item = await plugin.store.save(rules, "admin")
+    await plugin.store.enroll(item["id"], plugin.identity(event(plugin)))
+    await plugin.collect_private(event(plugin, group="", text="submitted"))
+    monkeypatch.setattr(
+        "astrbot_plugin_catlottery.main.render_pages",
+        lambda *args, **kwargs: [b"image"],
+    )
+    for platform in plugin.context.platform_manager.platform_insts:
+        platform.client.calls.clear()
+    await plugin.send_deliveries()
+    calls = plugin.context.get_platform_inst("napcat").client.calls
+    assert [action for action, params in calls] == ["send_private_msg"]
+    assert (await plugin.store.participation_state(item["id"]))["pending"] == 1
 
 
 async def test_due_draw_recovery_not_blocked_by_slow_delivery(plugin, rules):

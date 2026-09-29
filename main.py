@@ -38,6 +38,7 @@ TOOL_NAMES = (
     "catlottery_fill",
     "catlottery_create",
     "catlottery_manage",
+    "catlottery_notifications",
 )
 HELP = [
     (
@@ -46,15 +47,11 @@ HELP = [
     ),
     (
         "私聊 · 补充报名资料",
-        "群聊报名后，机器人私聊发题，直接回答即可\n/抽奖 上一题 · 返回已回答的上一题\n/抽奖 下一题 · 前往已回答题的下一题\n/抽奖 取消回答 · 暂停并保留资料\n/抽奖 继续 · 恢复回答\n/抽奖 待办 · 查看并切换多场待办\n/抽奖 回答 内容 · 可附图片，保留空格与换行",
+        "请先添加我为好友，再私聊回答\n群聊报名后，我会私聊发题，直接回答即可\n/抽奖 上一题 · 返回已回答的上一题\n/抽奖 下一题 · 前往已回答题的下一题\n/抽奖 取消回答 · 暂停并保留资料\n/抽奖 继续 · 恢复回答\n/抽奖 待办 · 查看并切换多场待办\n/抽奖 回答 内容 · 可附图片，保留空格与换行",
     ),
     (
         "管理员 · 管理抽奖",
         "/抽奖 创建 · 快速创建无资料活动\n参数：标题 | 奖品 | 人数 | 截止 | 开奖\n多奖项、封面与奖品图片请在管理页设置\n/抽奖 发布 编号 · 向所有配置群发布\n/抽奖 截止 编号 确认 · 停止报名与填写\n/抽奖 开奖 编号 确认 · 抽出全部剩余奖项\n/抽奖 取消 编号 确认 · 取消尚未开奖的活动",
-    ),
-    (
-        "时间与管理页面",
-        "时间示例：2026-10-01 20:00 · 北京时间 UTC+8\nAstrBot 插件详情 → 喵喵抽奖 · 管理工作台\n设置每场的封面、奖项、图片、群与私聊问题\n支持当场答对或提交后审核，只抽取成功参与者\n管理员可提前抽出单个奖项，每个 QQ 最多中奖一次\n仅群聊发起报名，私聊补充已有报名资料",
     ),
 ]
 NETWORK_ERRORS = (
@@ -123,7 +120,7 @@ def prize_sections(
     Args:
         item: Current or legacy lottery snapshot.
         directory: Plugin-owned artwork directory.
-        results: Include immutable winner assignments and unfilled award counts.
+        results: Include saved winner assignments and pending award status.
 
     Returns:
         Public sections without private submissions or quiz references.
@@ -146,10 +143,6 @@ def prize_sections(
                     )
                     or "暂无符合资格的中奖者"
                 )
-                if len(winners) < tier["count"]:
-                    text += (
-                        f"\n本奖项空缺 {tier['count'] - len(winners)} 位，结果已保存"
-                    )
             else:
                 text += "\n尚未开奖，仍按原定时间揭晓"
         section = (tier["name"], text)
@@ -426,7 +419,7 @@ class CatLottery(Star):
         bot_id = str(event.get_self_id())
         group_id = str(event.get_group_id() or "")
         if any(not re.fullmatch(r"[1-9]\d{4,19}", x) for x in (user_id, bot_id)):
-            raise ValueError("无法确认 QQ 发送者或机器人身份。")
+            raise ValueError("无法确认你的 QQ 身份或我的 QQ 账号。")
         if str(raw.get("user_id")) != user_id or str(raw.get("self_id")) != bot_id:
             raise ValueError("QQ 消息身份不一致，已拒绝操作。")
         if group_id:
@@ -467,7 +460,7 @@ class CatLottery(Star):
         if not any(
             all(target[k] == identity[k] for k in keys) for target in item["targets"]
         ):
-            raise ValueError("当前机器人平台或群不在这个抽奖的允许列表中。")
+            raise ValueError("当前连接的平台或群不在这个抽奖的允许列表中。")
 
     async def check_manager(self, identity: dict) -> None:
         """Enforce operator authority even for an LLM-triggered administrative action.
@@ -617,12 +610,12 @@ class CatLottery(Star):
                 )
             except NETWORK_ERRORS as exc:
                 raise ValueError(
-                    "所选机器人离线，无法验证目标群，请连接协议端后重试。"
+                    "所选 QQ 账号离线，无法验证目标群，请连接协议端后重试。"
                 ) from exc
             if str(login.get("user_id")) != target["bot_id"] or target[
                 "group_id"
             ] not in {str(g.get("group_id")) for g in groups}:
-                raise ValueError("机器人 QQ 身份或群列表不匹配，请重新选择。")
+                raise ValueError("所选 QQ 账号或群列表不匹配，请重新选择。")
 
     async def show_item(self, event: AstrMessageEvent, item: dict) -> None:
         """Display public rules without exposing private submissions or correct answers.
@@ -890,12 +883,12 @@ class CatLottery(Star):
             )
             is_friend = identity["user_id"] in {str(f["user_id"]) for f in friends}
             guidance = (
-                f"题目会发送到机器人 QQ {entry['bot_id']} 的私聊，直接回答即可\n没有收到题目时，私聊发送 /抽奖 继续"
+                f"我会通过 QQ {entry['bot_id']} 私聊发送题目，直接回答即可\n没有收到题目时，私聊发送 /抽奖 继续"
                 if is_friend
-                else f"请先添加机器人 QQ {entry['bot_id']} 为好友，再私聊发送 /抽奖 继续"
+                else f"请先添加我（QQ {entry['bot_id']}）为好友，再私聊发送 /抽奖 继续"
             )
         except NETWORK_ERRORS + (TypeError, KeyError) as exc:
-            guidance = f"暂时无法确认好友关系，请私聊机器人 QQ {entry['bot_id']} 发送 /抽奖 继续\n如果私聊无法发送，先添加该机器人为好友"
+            guidance = f"暂时无法确认好友关系，请私聊我（QQ {entry['bot_id']}）发送 /抽奖 继续\n如果私聊无法发送，请先添加我为好友"
             self.logger.warning("Friend lookup failed (%s).", type(exc).__name__)
         await self.store.queue_question(lottery_id, entry["bot_id"], entry["user_id"])
         self.wake.set()
@@ -989,7 +982,7 @@ class CatLottery(Star):
                 )
             elif command == "待办":
                 if identity["group_id"]:
-                    raise ValueError("请私聊机器人发送 /抽奖 待办。")
+                    raise ValueError("请私聊我发送 /抽奖 待办。")
                 pending = []
                 for item in await self.store.snapshot():
                     entry = await self.store.entry(item["id"], identity["user_id"])
@@ -1021,7 +1014,7 @@ class CatLottery(Star):
                 )
             elif command in {"继续", "上一题", "下一题"}:
                 if identity["group_id"]:
-                    raise ValueError("此指令请在报名机器人的私聊中使用")
+                    raise ValueError("此指令请在报名时与我的私聊中使用")
                 lottery_id = await self.store.private_session(
                     identity["bot_id"], identity["user_id"]
                 )
@@ -1055,7 +1048,7 @@ class CatLottery(Star):
                 self.check_target(item, identity)
                 entry = await self.store.entry(lottery_id, identity["user_id"])
                 if not entry or entry["platform_id"] != identity["platform_id"]:
-                    raise ValueError("请私聊报名时使用的平台机器人")
+                    raise ValueError("请通过报名时使用的平台私聊我")
                 await self.store.form_position(
                     identity["bot_id"],
                     identity["user_id"],
@@ -1173,10 +1166,10 @@ class CatLottery(Star):
                     )
                 elif command in {"填写", "切换"}:
                     if identity["group_id"]:
-                        raise ValueError("请私聊机器人回答题目，群聊不接收报名资料")
+                        raise ValueError("请私聊我回答题目，群聊不接收报名资料")
                     entry = await self.store.entry(lottery_id, identity["user_id"])
                     if entry and entry["platform_id"] != identity["platform_id"]:
-                        raise ValueError("请私聊报名时使用的平台机器人。")
+                        raise ValueError("请通过报名时使用的平台私聊我。")
                     await self.store.private_session(
                         identity["bot_id"], identity["user_id"], lottery_id
                     )
@@ -1403,6 +1396,11 @@ class CatLottery(Star):
                         except ValueError:
                             # Another command can finalize the same draw first.
                             continue
+                for lottery_id in await self.store.schedule_announcements():
+                    self.logger.info(
+                        "Lottery %s scheduled group announcement queued.", lottery_id
+                    )
+                    self.wake.set()
                 if time.time() >= next_cleanup:
                     removed = await self.store.cleanup_artwork()
                     if removed:
@@ -1447,6 +1445,41 @@ class CatLottery(Star):
                 message = json.loads(row["body"])
                 item, target = message["item"], message["target"]
                 try:
+                    live = await self.store.participation_state(item["id"])
+                    kind = message["kind"]
+                    if kind in {"announcement", "participation_guide"} and (
+                        live["item"]["status"] != "open"
+                        or time.time() >= live["item"]["close_at"]
+                        or message.get("scheduled")
+                        and item["announcement_schedule"]
+                        != live["item"]["announcement_schedule"]
+                    ):
+                        await self.store.delivery_done(row["id"])
+                        self.logger.debug(
+                            "Lottery %s obsolete recruitment notice skipped.",
+                            item["id"],
+                        )
+                        continue
+                    if target["channel"] == "group" and (
+                        not live["item"]["group_success_notify"]
+                        and (
+                            kind == "success"
+                            or kind == "review"
+                            and message["entry"].get("review_status") == "approved"
+                        )
+                        or not live["item"]["group_pending_notify"]
+                        and (
+                            kind == "submitted"
+                            or kind == "review"
+                            and message["entry"].get("review_status") == "pending"
+                        )
+                    ):
+                        await self.store.delivery_done(row["id"])
+                        self.logger.debug(
+                            "Lottery %s group enrollment notice suppressed by current policy.",
+                            item["id"],
+                        )
+                        continue
                     platform = self.context.get_platform_inst(target["platform_id"])
                     if (
                         platform is None
@@ -1458,7 +1491,6 @@ class CatLottery(Star):
                     if target["bot_id"] not in client._wsr_api_clients:
                         raise ConnectionError("Bot offline")
                     subtitle = f"{item['title']} · {item['id']}"
-                    kind = message["kind"]
                     portrait = None
                     if kind == "question":
                         entry = await self.store.entry(
@@ -1527,7 +1559,7 @@ class CatLottery(Star):
                         ) + [
                             (
                                 "开奖进度",
-                                f"已揭晓 {len(item.get('tier_draws', [])) or len(prize_tiers(item))}/{len(prize_tiers(item))} 个奖项\n有效报名 {item['eligible_count']} 人 · 已中奖 {len(winners)} 人\n每个 QQ 号最多中奖一次，已中奖者不再参与剩余奖项。"
+                                f"已揭晓 {len(item.get('tier_draws', [])) or len(prize_tiers(item))}/{len(prize_tiers(item))} 个奖项\n有效报名 {item['eligible_count']} 人 · 已中奖 {len(winners)} 人"
                                 + (
                                     "\n无人符合开奖资格，本次无人中奖。"
                                     if not winners and kind == "result"
@@ -1536,7 +1568,7 @@ class CatLottery(Star):
                             ),
                             (
                                 "开奖记录",
-                                f"{date_text(item['drawn_at'] if kind == 'result' else item['tier_draws'][-1]['drawn_at'])}（北京时间）\n名单摘要：{item['pool_hash'][:24]}\n已开奖的结果不会再次抽取。"
+                                f"{date_text(item['drawn_at'] if kind == 'result' else item['tier_draws'][-1]['drawn_at'])}（北京时间）"
                                 + (
                                     f"\n剩余奖项开奖：{date_text(item['draw_at'])}"
                                     if kind == "tier_result"
@@ -1546,16 +1578,16 @@ class CatLottery(Star):
                         ]
                     elif kind in {"cancelled", "closed"}:
                         title = (
-                            "本次抽奖已取消"
-                            if kind == "cancelled"
-                            else "报名已截止，等待好运揭晓"
+                            "本次抽奖已取消" if kind == "cancelled" else item["title"]
                         )
+                        if kind == "closed":
+                            subtitle = f"活动 {item['id']}"
                         sections = [
                             (
                                 "活动状态",
                                 "本次活动已取消，不再接受报名或开奖。"
                                 if kind == "cancelled"
-                                else f"停止报名与资料填写，已成功参与的报名仍有效。后审活动请在开奖前完成资格审核。\n自动开奖：{date_text(item['draw_at'])}（北京时间）",
+                                else f"已停止报名，已报名的用户可等待管理员审核完成后开奖，祝大家好运连连~\n自动开奖：{date_text(item['draw_at'])}（北京时间）",
                             )
                         ]
                     else:
@@ -1569,22 +1601,6 @@ class CatLottery(Star):
                                 self.store.directory / "artwork" / item["cover"],
                             ),
                         )
-                    live = await self.store.participation_state(item["id"])
-                    if (
-                        target["channel"] == "group"
-                        and not live["item"]["group_success_notify"]
-                        and (
-                            kind == "success"
-                            or kind == "review"
-                            and message["entry"].get("review_status") == "approved"
-                        )
-                    ):
-                        await self.store.delivery_done(row["id"])
-                        self.logger.debug(
-                            "Lottery %s group success notice suppressed by current policy.",
-                            item["id"],
-                        )
-                        continue
                     pngs = (
                         []
                         if kind == "participation_guide"
@@ -1609,6 +1625,7 @@ class CatLottery(Star):
                             else "抽奖公告",
                             **({"avatar_path": portrait} if portrait else {}),
                             participation_counts=live,
+                            **({"bold_title": True} if kind == "closed" else {}),
                         )
                     )
                     parameters = {
@@ -1626,7 +1643,7 @@ class CatLottery(Star):
                     if kind == "participation_guide":
                         guide = f"【喵喵抽奖】{item['title']}\n✅ 参与抽奖请发送：/抽奖 参与 {item['id']}"
                         guide += (
-                            f"\n✨ 报名后我会私聊发送题目，请按题回答，共 {len(item['questions'])} 题\n未收到题目时，先添加机器人为好友，私聊发送 /抽奖 继续\n"
+                            f"\n✨ 报名后我会私聊发送题目，请按题回答，共 {len(item['questions'])} 题\n未收到题目时，先添加我为好友，私聊发送 /抽奖 继续\n"
                             + (
                                 "完成全部题目后获得资格"
                                 if item.get("require_correct", True)
@@ -2056,7 +2073,8 @@ class CatLottery(Star):
         """List lotteries allowed for the actual QQ event's platform and group.
 
         Use only when the sender asks what lotteries are available. This is
-        read-only and never enrolls anyone. Private messages may only inspect
+        read-only, returns at most 20 recent activities, and never enrolls anyone.
+        Private messages may only inspect
         activities associated with this robot. Returned IDs are the only IDs to
         use in subsequent tools; never invent an activity ID or infer identity
         from a nickname, quoted message, mention, or conversation/session ID.
@@ -2093,9 +2111,13 @@ class CatLottery(Star):
                             "close_at",
                             "draw_at",
                             "complete_count",
+                            "review_pending_count",
+                            "group_success_notify",
+                            "group_pending_notify",
+                            "announcement_schedule",
                         )
                     }
-                    for x in allowed
+                    for x in allowed[:20]
                 ],
                 ensure_ascii=False,
             )
@@ -2115,14 +2137,47 @@ class CatLottery(Star):
             lottery_id (string): Exact eight-character activity ID, not a group number or title.
 
         Returns:
-            Whether the rule card was sent, or the validation error.
+            Public rules, ordered awards, current notification settings, and a
+            card_sent flag; quiz references and submitted answers are never returned.
         """
         try:
             identity = self.identity(event)
             item = await self.store.get(lottery_id)
             self.check_target(item, identity)
             await self.show_item(event, item)
-            return "抽奖详情图片已发送。"
+            return json.dumps(
+                {
+                    **{
+                        key: item[key]
+                        for key in (
+                            "id",
+                            "title",
+                            "status",
+                            "close_at",
+                            "draw_at",
+                            "require_correct",
+                            "group_success_notify",
+                            "group_pending_notify",
+                            "announcement_schedule",
+                        )
+                    },
+                    "awards": [
+                        {
+                            **tier,
+                            "award_number": index + 1,
+                            "drawn": item["status"] == "drawn"
+                            or any(
+                                record["tier_index"] == index
+                                for record in item.get("tier_draws", [])
+                            ),
+                        }
+                        for index, tier in enumerate(prize_tiers(item))
+                    ],
+                    "question_count": len(item["questions"]),
+                    "card_sent": True,
+                },
+                ensure_ascii=False,
+            )
         except ValueError as exc:
             await self.card(event, "无法查看该抽奖", [("操作提示", str(exc))])
             return str(exc)
@@ -2244,13 +2299,13 @@ class CatLottery(Star):
             identity = self.identity(event)
             if identity["group_id"]:
                 raise ValueError(
-                    "请私聊报名机器人直接回答题目；未收到题目时发送 /抽奖 继续"
+                    "请私聊报名时联系的我直接回答题目；未收到题目时发送 /抽奖 继续"
                 )
             item = await self.store.get(lottery_id)
             self.check_target(item, identity)
             entry = await self.store.entry(lottery_id, identity["user_id"])
             if entry and entry["platform_id"] != identity["platform_id"]:
-                raise ValueError("请私聊报名时使用的平台机器人。")
+                raise ValueError("请通过报名时使用的平台私聊我。")
             if (
                 await self.store.private_session(
                     identity["bot_id"], identity["user_id"]
@@ -2285,9 +2340,11 @@ class CatLottery(Star):
         dates. No arbitrary group/platform/user arguments are allowed: the
         trusted current group and robot are used. This tool creates ONE single
         prize only. For tiered awards, per-award counts, prize images, covers,
-        early drawing of one award, multiple groups, different platforms,
+        multiple groups, different platforms,
         or private questions, direct the operator to this plugin's
-        management Page. This creates and announces immediately. For viewing
+        management Page. Use catlottery_manage with draw_tier for an existing
+        award's early draw and catlottery_notifications to change reminders.
+        This creates and announces immediately. For viewing
         an existing lottery use catlottery_info instead. Server validates admin
         permission, enabled AioCqhttp platform, live robot/group, and future dates.
 
@@ -2347,17 +2404,25 @@ class CatLottery(Star):
     @filter.llm_tool(name="catlottery_manage")
     @tool_boundary
     async def tool_manage(
-        self, event: AstrMessageEvent, lottery_id: str, action: str, confirmed: bool
+        self,
+        event: AstrMessageEvent,
+        lottery_id: str,
+        action: str,
+        confirmed: bool,
+        award_number: int = 0,
     ) -> str:
         """Operate one existing lottery as an authorized operator, with explicit intent.
 
         action must be exactly publish (send public announcement), close (stop
         registration AND private answers now, keep scheduled draw), draw (close
         registration AND draw ALL REMAINING awards immediately, preserving
-        earlier award results and irreversibly freezing winners), or cancel
+        earlier award results and irreversibly freezing winners), draw_tier
+        (draw ONLY the specified remaining award early, keeping other awards
+        on their existing schedule), or cancel
         (end the activity without drawing, rejected if ANY award was drawn).
-        Drawing a single selected award early is available only in the WebUI;
-        never map such a request to draw, which finishes the entire activity.
+        For a selected award obtain its ONE-BASED award_number from
+        catlottery_info; never infer its position from "一等奖" or its name.
+        Never map such a request to draw, which finishes the entire activity.
         Never use draw for a request
         to check draw time, view existing winners, or wait for the schedule.
         Never use cancel for a participant's own withdrawal. confirmed may be
@@ -2372,8 +2437,9 @@ class CatLottery(Star):
 
         Args:
             lottery_id (string): Exact existing lottery ID selected by the operator.
-            action (string): One of publish, close, draw, cancel; no other values.
+            action (string): Exactly publish, close, draw, draw_tier, or cancel.
             confirmed (boolean): True only for the operator's explicit request for this exact action and lottery.
+            award_number (number): ONE-BASED number from catlottery_info, required for draw_tier; use 0 for every other action. Never pass a zero-based index or guess.
 
         Returns:
             Actual persisted state and whether group notifications are queued.
@@ -2389,10 +2455,24 @@ class CatLottery(Star):
                 "publish",
                 "close",
                 "draw",
+                "draw_tier",
                 "cancel",
             }:
-                raise ValueError("操作仅支持 publish、close、draw、cancel。")
-            item = await self.store.action(lottery_id, action)
+                raise ValueError("操作仅支持 publish、close、draw、draw_tier、cancel")
+            if (
+                isinstance(award_number, bool)
+                or not isinstance(award_number, int)
+                or action == "draw_tier"
+                and not 1 <= award_number <= len(prize_tiers(item))
+                or action != "draw_tier"
+                and award_number != 0
+            ):
+                raise ValueError("单个奖项开奖请使用详情中的奖项序号，其余操作序号为 0")
+            item = await self.store.action(
+                lottery_id,
+                action,
+                tier_index=award_number - 1 if action == "draw_tier" else None,
+            )
             self.logger.info("Lottery %s action=%s via LLM tool.", lottery_id, action)
             self.wake.set()
             await self.card(
@@ -2405,6 +2485,9 @@ class CatLottery(Star):
                             "publish": "发布群公告",
                             "close": "截止报名",
                             "draw": "立即开奖",
+                            "draw_tier": f"提前揭晓{prize_tiers(item)[award_number - 1]['name']}"
+                            if action == "draw_tier"
+                            else "",
                             "cancel": "取消抽奖",
                         }[action],
                     ),
@@ -2422,4 +2505,112 @@ class CatLottery(Star):
             )
         except ValueError as exc:
             await self.card(event, "操作未执行", [("操作提示", str(exc))])
+            return str(exc)
+
+    @filter.llm_tool(name="catlottery_notifications")
+    @tool_boundary
+    async def tool_notifications(
+        self,
+        event: AstrMessageEvent,
+        lottery_id: str,
+        setting: str,
+        value: str,
+        start_at: str = "",
+        interval_minutes: int = 60,
+        confirmed: bool = False,
+    ) -> str:
+        """Change ONE notification setting of an existing lottery as an authorized operator.
+
+        Call ONLY for an explicit operator request for this exact setting and
+        lottery. Read current rules with catlottery_info when ambiguous; ask for
+        missing times or intervals instead of inventing them. This never creates
+        a lottery, enrolls anyone, changes questions or prizes, or draws winners.
+        setting=group_success controls ONLY group participation-success receipts;
+        setting=group_pending controls ONLY group submitted/pending-review receipts.
+        Their private receipts always remain enabled. value must be on or off.
+        setting=announcement controls GROUP recruitment announcements (image
+        plus a separate text message), with value=off, once, or repeat. This
+        never schedules repeated private review receipts or result messages.
+        once/repeat require an explicitly provided future start_at before the
+        registration cutoff. repeat additionally requires the operator's interval.
+        Notifications stop at cutoff, cancellation, or final drawing; missed
+        cycles do not pile up. off only disables automatic announcements, so
+        manual publish remains available. Existing queued automatic notices are
+        revoked when the schedule changes. All other settings are preserved.
+
+        Args:
+            lottery_id (string): Exact existing lottery ID selected by the operator.
+            setting (string): Exactly group_success, group_pending, or announcement; changes only one setting.
+            value (string): on/off for group_success/group_pending; off/once/repeat for announcement.
+            start_at (string): Explicit future ISO 8601 or YYYY-MM-DD HH:MM time for once/repeat, default UTC+8; empty for other changes.
+            interval_minutes (number): Integer 1–10080 explicitly requested for repeat; ignored for other changes, where 60 may be supplied.
+            confirmed (boolean): True only for the sender's explicit request to change this exact lottery setting; false performs no change.
+
+        Returns:
+            Saved notification policies or a rejection, without private answers.
+        """
+        try:
+            identity = self.identity(event)
+            await self.check_manager(identity)
+            item = await self.store.get(lottery_id)
+            self.check_target(item, identity)
+            if confirmed is not True:
+                raise ValueError("需要管理员明确指定抽奖和通知设置")
+            if not isinstance(setting, str) or setting not in {
+                "group_success",
+                "group_pending",
+                "announcement",
+            }:
+                raise ValueError("请选择群聊成功通知、群聊待审核通知或群公告计划")
+            if not isinstance(value, str) or value not in (
+                {"off", "once", "repeat"}
+                if setting == "announcement"
+                else {"on", "off"}
+            ):
+                raise ValueError("通知设置值无效")
+            if setting == "announcement":
+                item["announcement_schedule"] = {
+                    "mode": value,
+                    "start_at": start_at,
+                    "interval_minutes": interval_minutes,
+                }
+            else:
+                item[f"{setting}_notify"] = value == "on"
+            saved = await self.store.save(item, identity["user_id"], lottery_id)
+            self.logger.info(
+                "Lottery %s notification setting=%s value=%s via LLM tool.",
+                lottery_id,
+                setting,
+                value,
+            )
+            self.wake.set()
+            labels = {
+                "group_success": "群聊参与成功通知",
+                "group_pending": "群聊待审核通知",
+                "announcement": "群公告计划",
+            }
+            values = {
+                "on": "已开启",
+                "off": "已关闭",
+                "once": "定时一次",
+                "repeat": "循环发送",
+            }
+            await self.card(
+                event,
+                "通知设置已保存",
+                [("本次设置", f"{labels[setting]} · {values[value]}")],
+                f"{saved['title']} · {lottery_id}",
+            )
+            return json.dumps(
+                {
+                    "id": lottery_id,
+                    "group_success_notify": saved["group_success_notify"],
+                    "group_pending_notify": saved["group_pending_notify"],
+                    "announcement_schedule": saved["announcement_schedule"],
+                    "announcement_next_at": saved.get("announcement_next_at"),
+                },
+                ensure_ascii=False,
+            )
+        except ValueError as exc:
+            await self.card(event, "通知设置未修改", [("操作提示", str(exc))])
             return str(exc)

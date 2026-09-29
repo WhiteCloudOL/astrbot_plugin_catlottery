@@ -143,11 +143,15 @@ class Stepper extends HTMLElement {
     this.value = Number(this.getAttribute("value") || 1);
     this.min = Number(this.getAttribute("min") || 1);
     this.max = Number(this.getAttribute("max") || 100);
-    this.innerHTML = `<div class="stepper"><button type="button" aria-label="减少" data-step="-1">−</button><input type="text" inputmode="numeric" aria-label="${escapeHTML(this.getAttribute("label") || "数值")}" value="${this.value}" maxlength="3"/><button type="button" aria-label="增加" data-step="1">+</button></div>`;
+    this.innerHTML = `<div class="stepper"><button type="button" aria-label="减少" data-step="-1">−</button><input type="text" inputmode="numeric" aria-label="${escapeHTML(this.getAttribute("label") || "数值")}" value="${this.value}" maxlength="${String(this.max).length}"/><button type="button" aria-label="增加" data-step="1">+</button></div>`;
     if (this.hasAttribute("disabled")) this.querySelectorAll("button,input").forEach(element => element.disabled = true);
     this.addEventListener("click", event => {
       const step = event.target.closest("[data-step]");
       if (step) { this.value = Math.min(this.max, Math.max(this.min, this.value + Number(step.dataset.step))); this.querySelector("input").value = this.value; this.dispatchEvent(new Event("change", { bubbles: true })); }
+    });
+    this.querySelector("input").addEventListener("input", event => {
+      this.value = Math.min(this.max, Math.max(this.min, Number(event.target.value) || this.min));
+      this.dispatchEvent(new Event("change", { bubbles: true }));
     });
     this.querySelector("input").addEventListener("change", event => {
       event.stopPropagation();

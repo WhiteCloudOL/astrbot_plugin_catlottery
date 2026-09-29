@@ -1,7 +1,7 @@
 name: astrbot_plugin_catlottery
 display_name: 喵喵抽奖
-desc: QQ 群聊抽奖，粉色猫咪管理工作台，支持分级奖品与图片、独立封面、分奖项提前开奖、私聊资料与资格审核。
-version: v1.3.0
+desc: QQ 群聊抽奖，粉色猫咪管理工作台，支持分级奖品与图片、独立封面、分奖项提前开奖、私聊资格审核与定时循环通知。
+version: v1.4.0
 author: 清蒸云鸭
 repo: https://github.com/WhiteCloudOL/astrbot_plugin_catlottery
 support_platforms:

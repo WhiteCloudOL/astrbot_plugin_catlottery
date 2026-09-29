@@ -99,9 +99,229 @@ async def test_muted_review_success_preserves_pending_notices_and_live_counts(
 
 
 @pytest.mark.parametrize("value", [None, "false", 0, 1, [], {}])
-def test_success_notice_switch_requires_boolean(rules, value):
+@pytest.mark.parametrize("key", ["group_success_notify", "group_pending_notify"])
+def test_success_notice_switch_requires_boolean(rules, value, key):
     with pytest.raises(ValueError, match="通知开关"):
-        validate_lottery({**rules, "group_success_notify": value})
+        validate_lottery({**rules, key: value})
+
+
+async def test_pending_notice_switch_mutes_only_group_pending_and_survives_restart(
+    store,
+    rules,
+    sender,
+):
+    rules.update(require_correct=False, questions=[{"kind": "text", "prompt": "资料"}])
+    item = await store.save(rules, "admin")
+    other = await store.save(rules, "admin")
+    for activity in (item, other):
+        await store.enroll(activity["id"], sender)
+        await store.answer(
+            activity["id"],
+            {**sender, "group_id": ""},
+            {"kind": "text", "value": "saved"},
+            0,
+        )
+    await store.save({**rules, "group_pending_notify": False}, "admin", item["id"])
+    await store.close()
+    await store.open()
+    assert (await store.get(item["id"]))["group_pending_notify"] is False
+    messages = [json.loads(row["body"]) for row in await store.deliveries()]
+    assert [
+        m["target"]["channel"] for m in messages if m["item"]["id"] == item["id"]
+    ] == ["private"]
+    assert {
+        m["target"]["channel"] for m in messages if m["item"]["id"] == other["id"]
+    } == {"group", "private"}
+    await store.review(
+        item["id"],
+        {
+            "action": "mark",
+            "user_id": sender["user_id"],
+            "question_index": 0,
+            "correct": True,
+        },
+        "admin",
+    )
+    messages = [json.loads(row["body"]) for row in await store.deliveries()]
+    assert {
+        m["target"]["channel"]
+        for m in messages
+        if m["item"]["id"] == item["id"] and m["kind"] == "review"
+    } == {"group", "private"}
+    await store.review(
+        item["id"],
+        {
+            "action": "mark",
+            "user_id": sender["user_id"],
+            "question_index": 0,
+            "correct": None,
+        },
+        "admin",
+    )
+    messages = [json.loads(row["body"]) for row in await store.deliveries()]
+    assert [
+        m["target"]["channel"]
+        for m in messages
+        if m["item"]["id"] == item["id"]
+        and m.get("entry", {}).get("review_status") == "pending"
+    ] == ["private"]
+
+
+@pytest.mark.parametrize(
+    "schedule",
+    [
+        None,
+        [],
+        {"mode": True},
+        {"mode": "daily"},
+        {"mode": "once"},
+        {"mode": "repeat", "start_at": "bad"},
+    ],
+)
+def test_announcement_schedule_rejects_invalid_shapes_and_dates(rules, schedule):
+    with pytest.raises(ValueError):
+        validate_lottery({**rules, "announcement_schedule": schedule})
+
+
+@pytest.mark.parametrize("interval", [True, 0, -1, 1.5, "60", 10081])
+def test_announcement_repeat_interval_is_a_bounded_integer(rules, interval):
+    with pytest.raises(ValueError, match="间隔"):
+        validate_lottery(
+            {
+                **rules,
+                "announcement_schedule": {
+                    "mode": "repeat",
+                    "start_at": time.time() + 60,
+                    "interval_minutes": interval,
+                },
+            }
+        )
+
+
+async def test_announcement_once_is_atomic_and_persistent(store, rules):
+    start = time.time() + 60
+    item = await store.save(
+        {**rules, "announcement_schedule": {"mode": "once", "start_at": start}}, "admin"
+    )
+    assert await store.schedule_announcements(now=start - 1) == []
+    outcomes = await asyncio.gather(
+        store.schedule_announcements(now=start), store.schedule_announcements(now=start)
+    )
+    assert outcomes.count([item["id"]]) == 1
+    async with store.db.execute(
+        "SELECT body FROM outbox WHERE lottery_id=?", (item["id"],)
+    ) as cursor:
+        messages = [json.loads(row[0]) for row in await cursor.fetchall()]
+    assert len(messages) == 2 * len(rules["targets"])
+    assert all(message["scheduled"] for message in messages)
+    assert {message["kind"] for message in messages} == {
+        "announcement",
+        "participation_guide",
+    }
+    await store.close()
+    await store.open()
+    assert await store.schedule_announcements(now=start + 10) == []
+    saved = await store.get(item["id"])
+    assert saved["announcement_next_at"] is None
+    assert saved["announcement_last_at"] == start
+
+
+async def test_repeat_skips_missed_ticks_and_deduplicates_per_group(store, rules):
+    start = time.time() + 60
+    item = await store.save(
+        {
+            **rules,
+            "announcement_schedule": {
+                "mode": "repeat",
+                "start_at": start,
+                "interval_minutes": 1,
+            },
+        },
+        "admin",
+    )
+    assert await store.schedule_announcements(now=start + 185) == [item["id"]]
+    assert (await store.get(item["id"]))["announcement_next_at"] == start + 240
+    assert await store.schedule_announcements(now=start + 240) == []
+    for _ in range(2):
+        for row in await store.deliveries():
+            message = json.loads(row["body"])
+            if message["target"]["platform_id"] == "napcat":
+                await store.delivery_done(row["id"])
+    assert await store.schedule_announcements(now=start + 300) == [item["id"]]
+    async with store.db.execute(
+        "SELECT body FROM outbox WHERE delivered_at IS NULL"
+    ) as cursor:
+        pending = [json.loads(row[0]) for row in await cursor.fetchall()]
+    assert len(pending) == 4
+    assert (await store.get(item["id"]))["announcement_next_at"] == start + 360
+    assert await store.schedule_announcements(now=rules["close_at"]) == []
+    assert (await store.get(item["id"]))["announcement_next_at"] is None
+
+
+async def test_changing_schedule_revokes_only_automatic_jobs_and_rejects_backdating(
+    store, rules, monkeypatch
+):
+    start = time.time() + 60
+    plan = {"mode": "repeat", "start_at": start, "interval_minutes": 1}
+    item = await store.save({**rules, "announcement_schedule": plan}, "admin")
+    await store.schedule_announcements(now=start)
+    monkeypatch.setattr(time, "time", lambda: start + 10)
+    edited = await store.save(
+        {**rules, "title": "更新标题", "announcement_schedule": plan},
+        "admin",
+        item["id"],
+    )
+    assert edited["announcement_next_at"] == start + 60
+    assert edited["announcement_last_at"] == start
+    with pytest.raises(ValueError, match="晚于当前时间"):
+        await store.save(
+            {**rules, "announcement_schedule": {**plan, "start_at": start - 1}},
+            "admin",
+            item["id"],
+        )
+    await store.action(item["id"], "publish")
+    await store.save(
+        {**rules, "announcement_schedule": {"mode": "off"}}, "admin", item["id"]
+    )
+    async with store.db.execute(
+        "SELECT body FROM outbox WHERE delivered_at IS NULL"
+    ) as cursor:
+        pending = [json.loads(row[0]) for row in await cursor.fetchall()]
+    assert len(pending) == 2 * len(rules["targets"])
+    assert all(not message.get("scheduled") for message in pending)
+
+
+@pytest.mark.parametrize("action", ["close", "cancel", "draw"])
+async def test_ending_activity_revokes_recruitment_plan(store, rules, action):
+    start = time.time() + 60
+    item = await store.save(
+        {
+            **rules,
+            "announcement_schedule": {
+                "mode": "repeat",
+                "start_at": start,
+                "interval_minutes": 1,
+            },
+        },
+        "admin",
+    )
+    await store.schedule_announcements(now=start)
+    await store.action(item["id"], action)
+    assert (await store.get(item["id"]))["announcement_next_at"] is None
+    assert await store.schedule_announcements(now=start + 120) == []
+    messages = [json.loads(row["body"]) for row in await store.deliveries()]
+    assert len(messages) == len(rules["targets"])
+    assert all(not message.get("scheduled") for message in messages)
+
+
+async def test_announcement_schedule_cutoff_and_past_start_are_rejected(store, rules):
+    for start in (time.time() - 1, rules["close_at"], rules["draw_at"]):
+        with pytest.raises(ValueError):
+            await store.save(
+                {**rules, "announcement_schedule": {"mode": "once", "start_at": start}},
+                "admin",
+            )
+    assert await store.snapshot() == []
 
 
 @pytest.mark.parametrize(

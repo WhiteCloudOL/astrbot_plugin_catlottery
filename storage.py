@@ -172,16 +172,41 @@ def validate_lottery(payload: dict, *, now: float | None = None) -> dict:
     if not isinstance(require_correct, bool):
         raise ValueError("答题模式开关必须为启用或关闭。")
     result["require_correct"] = require_correct
-    notify = payload.get("group_success_notify", True)
-    if not isinstance(notify, bool):
-        raise ValueError("群聊参与成功通知开关必须为启用或关闭")
-    result["group_success_notify"] = notify
+    for key, label in (
+        ("group_success_notify", "群聊参与成功"),
+        ("group_pending_notify", "群聊待审核"),
+    ):
+        notify = payload.get(key, True)
+        if not isinstance(notify, bool):
+            raise ValueError(f"{label}通知开关必须为启用或关闭")
+        result[key] = notify
     result["close_at"] = timestamp(payload.get("close_at"))
     result["draw_at"] = timestamp(payload.get("draw_at"))
     if result["close_at"] <= now:
         raise ValueError("报名截止时间必须晚于当前时间。")
     if result["draw_at"] < result["close_at"]:
         raise ValueError("开奖时间不能早于报名截止时间。")
+    schedule = payload.get("announcement_schedule", {"mode": "off"})
+    if not isinstance(schedule, dict):
+        raise ValueError("群公告通知计划必须为对象")
+    mode = schedule.get("mode", "off")
+    if not isinstance(mode, str) or mode not in {"off", "once", "repeat"}:
+        raise ValueError("群公告通知仅支持关闭、定时一次或循环发送")
+    start_at = None if mode == "off" else timestamp(schedule.get("start_at"))
+    if start_at is not None and start_at >= result["close_at"]:
+        raise ValueError("首次群公告通知必须早于报名截止时间")
+    interval = schedule.get("interval_minutes", 60) if mode == "repeat" else 0
+    if mode == "repeat" and (
+        isinstance(interval, bool)
+        or not isinstance(interval, int)
+        or not 1 <= interval <= 10080
+    ):
+        raise ValueError("循环通知间隔必须为 1–10080 分钟的整数")
+    result["announcement_schedule"] = {
+        "mode": mode,
+        "start_at": start_at,
+        "interval_minutes": interval,
+    }
     targets = payload.get("targets")
     if not isinstance(targets, list) or not 1 <= len(targets) <= 50:
         raise ValueError("请至少添加一个允许的平台和群，最多 50 个群。")
@@ -198,7 +223,7 @@ def validate_lottery(payload: dict, *, now: float | None = None) -> dict:
         if not re.fullmatch(r"[1-9]\d{4,19}", bot_id) or not re.fullmatch(
             r"[1-9]\d{4,19}", group_id
         ):
-            raise ValueError("机器人 QQ 号或群号无效。")
+            raise ValueError("QQ 账号或群号无效。")
         identity = (platform_id, bot_id, group_id)
         if identity in unique:
             continue
@@ -374,6 +399,11 @@ class Store:
             ) = counts.get(item["id"], (0, 0, 0, 0, 0))
             item["require_correct"] = item.get("require_correct", True)
             item.setdefault("group_success_notify", True)
+            item.setdefault("group_pending_notify", True)
+            item.setdefault(
+                "announcement_schedule",
+                {"mode": "off", "start_at": None, "interval_minutes": 0},
+            )
             item["pending_deliveries"] = pending.get(item["id"], 0)
             item["phase"] = (
                 "closed"
@@ -412,6 +442,12 @@ class Store:
         item.setdefault("cover", "")
         item.setdefault("tier_draws", [])
         item.setdefault("group_success_notify", True)
+        item.setdefault("group_pending_notify", True)
+        item.setdefault("require_correct", True)
+        item.setdefault(
+            "announcement_schedule",
+            {"mode": "off", "start_at": None, "interval_minutes": 0},
+        )
         return item
 
     async def participation_state(self, lottery_id: str, user_id: str = "") -> dict:
@@ -455,6 +491,11 @@ class Store:
         item.setdefault("cover", "")
         item.setdefault("tier_draws", [])
         item.setdefault("group_success_notify", True)
+        item.setdefault("group_pending_notify", True)
+        item.setdefault(
+            "announcement_schedule",
+            {"mode": "off", "start_at": None, "interval_minutes": 0},
+        )
         return {"item": item, "entry": entry, "approved": approved, "pending": pending}
 
     async def settings(self, payload: dict | None = None) -> dict:
@@ -562,6 +603,11 @@ class Store:
                     raise ValueError(
                         "已有报名或奖项开奖后，平台、群、问题、答题模式、奖项顺序、奖品图片和中奖人数不能修改。可修改封面、说明和未来时间。"
                     )
+                previous_schedule = item.get(
+                    "announcement_schedule",
+                    {"mode": "off", "start_at": None, "interval_minutes": 0},
+                )
+                schedule_changed = rules["announcement_schedule"] != previous_schedule
                 item.update(rules)
             else:
                 for _ in range(5):
@@ -586,6 +632,13 @@ class Store:
                     "drawn_at": None,
                     "pool_hash": None,
                 }
+                schedule_changed = True
+            schedule = rules["announcement_schedule"]
+            if schedule_changed:
+                if schedule["mode"] != "off" and schedule["start_at"] <= time.time():
+                    raise ValueError("首次群公告通知时间必须晚于当前时间")
+                item["announcement_next_at"] = schedule["start_at"]
+                item["announcement_last_at"] = None
             await self.db.execute("BEGIN IMMEDIATE")
             try:
                 await self.db.execute(
@@ -600,6 +653,20 @@ class Store:
                         "AND json_extract(body,'$.target.channel')='group' AND "
                         "(json_extract(body,'$.kind')='success' OR "
                         "(json_extract(body,'$.kind')='review' AND json_extract(body,'$.entry.review_status')='approved'))",
+                        (lottery_id,),
+                    )
+                if not rules["group_pending_notify"]:
+                    await self.db.execute(
+                        "DELETE FROM outbox WHERE lottery_id=? AND delivered_at IS NULL "
+                        "AND json_extract(body,'$.target.channel')='group' AND "
+                        "(json_extract(body,'$.kind')='submitted' OR "
+                        "(json_extract(body,'$.kind')='review' AND json_extract(body,'$.entry.review_status')='pending'))",
+                        (lottery_id,),
+                    )
+                if schedule_changed:
+                    await self.db.execute(
+                        "DELETE FROM outbox WHERE lottery_id=? AND delivered_at IS NULL "
+                        "AND json_extract(body,'$.scheduled')=1",
                         (lottery_id,),
                     )
                 await self.db.commit()
@@ -877,7 +944,7 @@ class Store:
                         for k in ("bot_id", "platform_id", "user_id")
                     )
                 ):
-                    raise ValueError("请用报名时的 QQ 号私聊同一个机器人填写。")
+                    raise ValueError("请用报名时的 QQ 号，私聊报名时联系的我填写。")
                 if item["status"] != "open" or time.time() >= item["close_at"]:
                     raise ValueError("报名截止，未完成的资料不会进入开奖名单。")
                 async with self.db.execute(
@@ -1247,13 +1314,21 @@ class Store:
                     missing_ok=True
                 )
 
-    async def queue(self, item: dict, kind: str, *, entry: dict | None = None) -> None:
+    async def queue(
+        self,
+        item: dict,
+        kind: str,
+        *,
+        entry: dict | None = None,
+        scheduled: bool = False,
+    ) -> None:
         """Enqueue delivery inside an existing lock and transaction.
 
         Args:
             item: Activity snapshot, frozen for this message.
             kind: Announcement, result, cancellation, or enrollment success.
             entry: The completed user's trusted routing data for success.
+            scheduled: Mark automatic reminders so changes can revoke unsent jobs.
         """
         targets = item["targets"]
         if entry is not None:
@@ -1261,12 +1336,23 @@ class Store:
                 {**entry, "channel": "group", "recipient": entry["group_id"]},
                 {**entry, "channel": "private", "recipient": entry["user_id"]},
             ]
-            if kind == "question" or (
-                not item.get("group_success_notify", True)
-                and (
-                    kind == "success"
-                    or kind == "review"
-                    and entry.get("review_status") == "approved"
+            if (
+                kind == "question"
+                or (
+                    not item.get("group_success_notify", True)
+                    and (
+                        kind == "success"
+                        or kind == "review"
+                        and entry.get("review_status") == "approved"
+                    )
+                )
+                or (
+                    not item.get("group_pending_notify", True)
+                    and (
+                        kind == "submitted"
+                        or kind == "review"
+                        and entry.get("review_status") == "pending"
+                    )
                 )
             ):
                 targets = targets[1:]
@@ -1283,6 +1369,8 @@ class Store:
             }
             if entry is not None:
                 message["entry"] = {k: v for k, v in entry.items() if k != "answers"}
+            if scheduled:
+                message["scheduled"] = True
             # Correct answers and private forms never enter delivery records.
             message["item"]["questions"] = [
                 {k: v for k, v in q.items() if k != "answers"}
@@ -1307,6 +1395,80 @@ class Store:
                         json.dumps(guide, ensure_ascii=False),
                     ),
                 )
+
+    async def schedule_announcements(self, *, now: float | None = None) -> list[str]:
+        """Atomically queue due group announcements without replaying missed cycles.
+
+        Args:
+            now: Optional Unix clock for scheduling and deterministic tests.
+
+        Returns:
+            Activity IDs whose announcement images and separate text were queued.
+
+        Raises:
+            sqlite3.Error: The transaction cannot be persisted.
+        """
+        now = time.time() if now is None else now
+        queued = []
+        async with self.lock:
+            await self.db.execute("BEGIN IMMEDIATE")
+            try:
+                async with self.db.execute(
+                    "SELECT body FROM lotteries WHERE json_extract(body,'$.status')='open' "
+                    "AND json_extract(body,'$.announcement_next_at')<=?",
+                    (now,),
+                ) as cursor:
+                    items = [json.loads(row[0]) for row in await cursor.fetchall()]
+                for item in items:
+                    schedule = item["announcement_schedule"]
+                    next_at = None
+                    if now < item["close_at"] and schedule["mode"] != "off":
+                        async with self.db.execute(
+                            "SELECT json_extract(body,'$.target.platform_id'), "
+                            "json_extract(body,'$.target.bot_id'), json_extract(body,'$.target.recipient') "
+                            "FROM outbox WHERE lottery_id=? AND delivered_at IS NULL "
+                            "AND json_extract(body,'$.kind') IN ('announcement','participation_guide')",
+                            (item["id"],),
+                        ) as cursor:
+                            waiting = {tuple(row) for row in await cursor.fetchall()}
+                        targets = [
+                            target
+                            for target in item["targets"]
+                            if (
+                                target["platform_id"],
+                                target["bot_id"],
+                                target["group_id"],
+                            )
+                            not in waiting
+                        ]
+                        if targets:
+                            await self.queue(
+                                {**item, "targets": targets},
+                                "announcement",
+                                scheduled=True,
+                            )
+                            item["announcement_last_at"] = now
+                            queued.append(item["id"])
+                        if schedule["mode"] == "repeat":
+                            # Advance from the configured start, never replaying missed ticks.
+                            interval = schedule["interval_minutes"] * 60
+                            next_at = (
+                                schedule["start_at"]
+                                + (int((now - schedule["start_at"]) // interval) + 1)
+                                * interval
+                            )
+                            if next_at >= item["close_at"]:
+                                next_at = None
+                    item["announcement_next_at"] = next_at
+                    await self.db.execute(
+                        "UPDATE lotteries SET body=? WHERE id=?",
+                        (json.dumps(item, ensure_ascii=False), item["id"]),
+                    )
+                await self.db.commit()
+            except BaseException:
+                await self.db.rollback()
+                raise
+        return queued
 
     async def action(
         self,
@@ -1456,6 +1618,12 @@ class Store:
                 else:
                     raise ValueError("操作类型无效。")
                 if action in {"draw", "cancel", "close"} or item["status"] == "drawn":
+                    item["announcement_next_at"] = None
+                    await self.db.execute(
+                        "DELETE FROM outbox WHERE lottery_id=? AND delivered_at IS NULL "
+                        "AND json_extract(body,'$.scheduled')=1",
+                        (lottery_id,),
+                    )
                     await self.db.execute(
                         "DELETE FROM sessions WHERE lottery_id=?", (lottery_id,)
                     )

@@ -206,6 +206,55 @@ test("group success notices remain editable after enrollment and survive polling
   assert.equal(document.querySelectorAll('select,input[type="checkbox"],input[type="radio"]').length,0);
 });
 
+test("pending notices and recurring announcements use reusable controls and preserve saved choices", async t => {
+  const {document,window,calls,polling} = await setup(t, {lotteries:[reviewActivity()],entries:participants(3),hash:"#detail/a1234567"});
+  document.querySelector('[data-action="activity-edit"]').click(); await flush();
+  const pending = document.querySelector('meow-switch[name="group_pending_notify"]');
+  assert.equal(pending.value,true);
+  assert.equal(pending.querySelector("button").disabled,false);
+  pending.querySelector("button").click();
+  const mode = document.querySelector('meow-choice[name="announcement_mode"]');
+  assert.equal(document.querySelector(".schedule-fields").hidden,true);
+  mode.querySelector(".choice-trigger").click();
+  mode.querySelector('[data-value="repeat"]').click();
+  assert.equal(document.querySelector(".schedule-fields").hidden,false);
+  assert.equal(document.querySelector(".schedule-interval").hidden,false);
+  const interval = document.querySelector('meow-stepper[name="announcement_interval_minutes"] input');
+  assert.equal(interval.maxLength,5);
+  interval.value = "10080"; interval.dispatchEvent(new window.Event("input",{bubbles:true}));
+  polling[0](); await flush();
+  assert.equal(document.querySelector('meow-switch[name="group_pending_notify"]').value,false);
+  document.querySelector('[data-action="save-lottery"]').click(); await flush();
+  const saved = calls.find(call => call.endpoint === "lotteries").payload;
+  assert.equal(saved.group_pending_notify,false);
+  assert.equal(saved.group_success_notify,true);
+  assert.equal(saved.announcement_schedule.mode,"repeat");
+  assert.equal(saved.announcement_schedule.interval_minutes,10080);
+  assert.match(saved.announcement_schedule.start_at,/\+08:00$/);
+  assert.match(document.querySelector(".activity-facts").textContent,/群聊待审核通知已关闭/);
+  assert.match(document.querySelector(".activity-facts").textContent,/群公告计划循环发送/);
+  assert.equal(document.querySelectorAll('select,input[type="checkbox"],input[type="radio"],input[type="number"],input[type="date"],input[type="datetime-local"]').length,0);
+});
+
+test("editing a running schedule preserves its original seconds and once mode hides only the interval", async t => {
+  const item = reviewActivity();
+  item.announcement_schedule = {mode:"repeat",start_at:Date.now()/1000 - 1807,interval_minutes:15};
+  item.announcement_next_at = Date.now()/1000 + 600;
+  const {document,calls} = await setup(t, {lotteries:[item],hash:"#detail/a1234567"});
+  assert.match(document.querySelector(".activity-facts").textContent,/下次公告/);
+  document.querySelector('[data-action="activity-edit"]').click(); await flush();
+  document.querySelector('[name="title"]').value = "新的标题";
+  document.querySelector('[data-action="save-lottery"]').click(); await flush();
+  assert.equal(calls.find(call => call.endpoint === "lotteries").payload.announcement_schedule.start_at,item.announcement_schedule.start_at);
+  document.querySelector('[data-action="activity-edit"]').click(); await flush();
+  const mode = document.querySelector('meow-choice[name="announcement_mode"]');
+  mode.querySelector(".choice-trigger").click(); mode.querySelector('[data-value="once"]').click();
+  assert.equal(document.querySelector(".schedule-fields").hidden,false);
+  assert.equal(document.querySelector(".schedule-interval").hidden,true);
+  mode.querySelector(".choice-trigger").click(); mode.querySelector('[data-value="off"]').click();
+  assert.equal(document.querySelector(".schedule-fields").hidden,true);
+});
+
 test("large participant lists are paginated, searchable, filtered and bulk review only changes selected QQ IDs", async t => {
   const ui = await setup(t, {lotteries:[reviewActivity()],entries:participants(),hash:"#detail/a1234567"});
   const {document,window,calls,forms} = ui;
