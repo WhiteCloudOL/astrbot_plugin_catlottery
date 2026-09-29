@@ -42,7 +42,7 @@ TOOL_NAMES = (
 HELP = [
     (
         "群聊 · 参加与查看",
-        "/抽奖 列表 · 找到想参加的活动\n/抽奖 详情 编号 · 查看奖品与规则\n/抽奖 参与 编号 · 为自己报名\n/抽奖 状态 编号 · 查看自己的进度\n/抽奖 退出 编号 · 截止前退出报名",
+        "/抽奖 列表 · 找到想参加的活动\n/抽奖 详情 编号 · 查看奖品与规则\n/抽奖 参与 编号 · 为自己报名\n/抽奖 状态 编号 · 查看状态与估算中奖率\n/抽奖 退出 编号 · 截止前退出报名",
     ),
     (
         "私聊 · 补充报名资料",
@@ -495,6 +495,7 @@ class CatLottery(Star):
         subtitle: str = "",
         badge: str = "喵喵抽奖",
         cover: str = "",
+        participation_counts: dict | None = None,
     ) -> None:
         """Reply with the same Pillow renderer used by scheduled group notices.
 
@@ -505,13 +506,25 @@ class CatLottery(Star):
             subtitle: Activity context.
             badge: Card category.
             cover: Optional internal filename for a lottery's independent cover.
+            participation_counts: Live successful and pending totals for an activity.
         """
         if cover:
             sections = [
                 ("活动封面", "", self.store.directory / "artwork" / cover),
                 *sections,
             ]
-        pngs = await asyncio.to_thread(render_pages, title, subtitle, sections, badge)
+        pngs = await asyncio.to_thread(
+            render_pages,
+            title,
+            subtitle,
+            sections,
+            badge,
+            **(
+                {"participation_counts": participation_counts}
+                if participation_counts is not None
+                else {}
+            ),
+        )
         await event.send(MessageChain([Image.fromBytes(png) for png in pngs]))
 
     async def platform_inventory(self) -> list[dict]:
@@ -660,7 +673,130 @@ class CatLottery(Star):
             f"编号 {item['id']}  ·  {state}",
             "抽奖详情",
             cover=item.get("cover", ""),
+            participation_counts=await self.store.participation_state(item["id"]),
         )
+
+    async def show_status(self, event: AstrMessageEvent, lottery_id: str) -> dict:
+        """Show the actual sender's qualification, result, and conditional live odds.
+
+        Args:
+            event: Trusted QQ event; mentions and quoted users are never used.
+            lottery_id: Exact activity selected by the sender.
+
+        Returns:
+            Sender-only status and aggregate estimates for command and tool callers.
+
+        Raises:
+            ValueError: The current platform or group is outside the activity scope.
+        """
+        identity = self.identity(event)
+        live = await self.store.participation_state(lottery_id, identity["user_id"])
+        item, entry = live["item"], live["entry"]
+        self.check_target(item, identity)
+        eligible = bool(
+            entry
+            and entry["status"] == "complete"
+            and entry.get("review_status", "approved") == "approved"
+        )
+        winner = next(
+            (
+                value
+                for value in item["winners"]
+                if value["user_id"] == identity["user_id"]
+            ),
+            None,
+        )
+        drawn_tiers = {value["tier_index"] for value in item["tier_draws"]}
+        slots = (
+            sum(
+                tier["count"]
+                for index, tier in enumerate(item["prize_tiers"])
+                if index not in drawn_tiers
+            )
+            if item["status"] == "open"
+            else 0
+        )
+        candidates = max(
+            0, live["approved"] - len({value["user_id"] for value in item["winners"]})
+        )
+        probability = min(1.0, slots / candidates) if slots and candidates else None
+        if winner:
+            tier = item["prize_tiers"][winner.get("tier_index", 0)]
+            outcome = f"你已获得 {tier['name']}\n{tier['prize']}\n本场最多中奖一次，已不再参与剩余奖项"
+        elif item["status"] == "drawn":
+            outcome = "本场已开奖，你未中奖；最终名单已保存"
+        elif item["status"] == "cancelled":
+            outcome = "活动已取消，不再开奖"
+        else:
+            outcome = f"剩余 {slots} 个名额 · 当前 {candidates} 位成功参与者尚未中奖\n"
+            outcome += (
+                f"{'你当前' if eligible else '当前候选池'}估算中奖率 {probability:.2%}"
+                if probability is not None
+                else "当前暂无可计算的中奖率"
+            )
+            outcome += "\n" + (
+                "你已具备开奖资格"
+                if eligible
+                else "你尚未获得开奖资格，成功参与后才进入候选名单"
+            )
+            outcome += "\n估算针对剩余奖项至少中奖一次，随报名、审核和提前开奖变化，最终以实际开奖名单为准"
+        status = {
+            "status": entry["status"] if entry else "not_joined",
+            "review_status": entry.get(
+                "review_status",
+                "approved" if entry["status"] == "complete" else "incomplete",
+            )
+            if entry
+            else None,
+            "eligible": eligible,
+            "answered": len(entry["answers"]) if entry else 0,
+            "questions": len(item["questions"]),
+            "user_id": identity["user_id"],
+            "approved_count": live["approved"],
+            "pending_review_count": live["pending"],
+            "remaining_slots": slots,
+            "remaining_candidates": candidates,
+            "pool_win_probability": probability,
+            "user_win_probability": probability if eligible and not winner else None,
+            "has_won": winner is not None,
+            "lottery_status": item["status"],
+        }
+        await self.card(
+            event,
+            entry_text(entry, len(item["questions"])),
+            [
+                (
+                    "身份与报名",
+                    f"QQ {identity['user_id']} · {identity['nickname']}\n"
+                    + (
+                        f"已填写 {status['answered']}/{status['questions']} 题"
+                        if item["questions"]
+                        else "本场无需填写资料"
+                    ),
+                ),
+                ("中奖状态与估算", outcome),
+                (
+                    "活动时间 · 北京时间",
+                    f"报名截止 {date_text(item['close_at'])}\n自动开奖 {date_text(item['draw_at'])}",
+                ),
+                (
+                    "自己查询",
+                    f"/抽奖 状态 {lottery_id}"
+                    + (
+                        "\n私聊恢复回答：/抽奖 继续"
+                        if entry
+                        and entry["status"] == "pending"
+                        and item["status"] == "open"
+                        and time.time() < item["close_at"]
+                        else ""
+                    ),
+                ),
+            ],
+            f"{item['title']} · {lottery_id}",
+            "参与状态",
+            participation_counts=live,
+        )
+        return status
 
     async def show_question(
         self, event: AstrMessageEvent, item: dict, entry: dict
@@ -679,6 +815,7 @@ class CatLottery(Star):
             question_sections(item, entry, index),
             f"{item['title']}  ·  {item['id']}  ·  QQ {entry['user_id']}",
             "私聊填写",
+            participation_counts=await self.store.participation_state(item["id"]),
         )
 
     async def join(self, event: AstrMessageEvent, lottery_id: str) -> str:
@@ -724,9 +861,16 @@ class CatLottery(Star):
                         ("自动开奖", date_text(item["draw_at"]) + "（北京时间）"),
                     ],
                     f"{item['title']} · {lottery_id}",
+                    participation_counts=await self.store.participation_state(
+                        lottery_id
+                    ),
                 )
             return (
-                "报名成功；群聊与私聊图片通知已加入发送队列。"
+                (
+                    "报名成功；群聊与私聊图片通知已加入发送队列。"
+                    if item.get("group_success_notify", True)
+                    else "报名成功；私聊图片通知已加入发送队列，本场已关闭群聊成功通知。"
+                )
                 if created
                 else f"{entry_text(entry, len(item['questions']))}，未重复计数；只有参与成功者进入开奖名单。"
             )
@@ -772,6 +916,7 @@ class CatLottery(Star):
                 ("资料截止", date_text(item["close_at"]) + "（北京时间）"),
             ],
             f"{item['title']} · {lottery_id}",
+            participation_counts=await self.store.participation_state(lottery_id),
         )
         return "已预留报名，用户需按图片引导私聊填写；尚未完成报名。"
 
@@ -1017,24 +1162,7 @@ class CatLottery(Star):
                 elif command == "参与":
                     await self.join(event, lottery_id)
                 elif command == "状态":
-                    entry = await self.store.entry(lottery_id, identity["user_id"])
-                    status = entry_text(entry, len(item["questions"]))
-                    await self.card(
-                        event,
-                        status,
-                        [
-                            (
-                                "身份与报名",
-                                f"QQ {identity['user_id']} · {identity['nickname']}",
-                            ),
-                            (
-                                "继续操作",
-                                f"群聊报名：/抽奖 参与 {lottery_id}\n私聊恢复：/抽奖 继续",
-                            ),
-                            ("报名截止", date_text(item["close_at"]) + "（北京时间）"),
-                        ],
-                        f"{item['title']} · {lottery_id}",
-                    )
+                    await self.show_status(event, lottery_id)
                 elif command == "退出":
                     await self.store.withdraw(lottery_id, identity)
                     await self.card(
@@ -1441,11 +1569,30 @@ class CatLottery(Star):
                                 self.store.directory / "artwork" / item["cover"],
                             ),
                         )
+                    live = await self.store.participation_state(item["id"])
+                    if (
+                        target["channel"] == "group"
+                        and not live["item"]["group_success_notify"]
+                        and (
+                            kind == "success"
+                            or kind == "review"
+                            and message["entry"].get("review_status") == "approved"
+                        )
+                    ):
+                        await self.store.delivery_done(row["id"])
+                        self.logger.debug(
+                            "Lottery %s group success notice suppressed by current policy.",
+                            item["id"],
+                        )
+                        continue
                     pngs = (
                         []
                         if kind == "participation_guide"
                         else await asyncio.to_thread(
-                            render_announcement, item, self.store.directory / "artwork"
+                            render_announcement,
+                            item,
+                            self.store.directory / "artwork",
+                            participation_counts=live,
                         )
                         if kind == "announcement"
                         else await asyncio.to_thread(
@@ -1461,6 +1608,7 @@ class CatLottery(Star):
                             if kind in {"result", "tier_result"}
                             else "抽奖公告",
                             **({"avatar_path": portrait} if portrait else {}),
+                            participation_counts=live,
                         )
                     )
                     parameters = {
@@ -1488,6 +1636,7 @@ class CatLottery(Star):
                             else "\n无需填写资料，群内报名即可参与"
                         )
                         guide += f"\n报名截止：{date_text(item['close_at'])}（北京时间）\n活动详情：/抽奖 详情 {item['id']}"
+                        guide += f"\n成功参与 {live['approved']} 人 · 待审核 {live['pending']} 人"
                         parameters["message"] = [
                             {"type": "text", "data": {"text": guide}}
                         ]
@@ -1992,7 +2141,8 @@ class CatLottery(Star):
         private-form instructions. In instant-check mode, all questions must be
         completed; in review mode, completed submissions must also be approved.
         Never claim eligibility while review is pending or rejected. With no
-        questions success images are queued for group AND DM.
+        questions a private success image is queued; a group success image is
+        also queued only when enabled for this activity.
 
         Args:
             lottery_id (string): Exact ID selected by the sender, from catlottery_list or a real announcement.
@@ -2011,8 +2161,9 @@ class CatLottery(Star):
     async def tool_status(self, event: AstrMessageEvent, lottery_id: str) -> str:
         """Read only the actual QQ sender's registration status for one lottery.
 
-        Use for a sender asking whether their own enrollment succeeded. Works
-        in allowed groups or the associated robot's DM, never creates a slot,
+        Use when the sender asks about their own enrollment, result, or current
+        estimated chance of winning. Works in allowed groups or the associated
+        robot's DM, never creates a slot,
         never reads another person's answers. Submission completion is separate
         from eligibility: pending or rejected review is NOT successful participation.
         No user, nickname, or conversation ID parameter is accepted.
@@ -2021,42 +2172,15 @@ class CatLottery(Star):
             lottery_id (string): Exact activity ID selected by the actual sender.
 
         Returns:
-            Sender's own enrollment status and remaining question count.
+            Sender-only qualification, result, live counts, and conditional odds.
+            Probabilities are fractions from 0 to 1, not percentages. The pool
+            estimate assumes the current approved nonwinning candidates and
+            remaining awards. Never describe it as a guarantee or a final chance;
+            pending, rejected, unregistered, and already winning users have no
+            user estimate. No entries or private answers of other users are returned.
         """
         try:
-            identity = self.identity(event)
-            item = await self.store.get(lottery_id)
-            self.check_target(item, identity)
-            entry = await self.store.entry(lottery_id, identity["user_id"])
-            status = {
-                "status": entry["status"] if entry else "not_joined",
-                "review_status": entry.get(
-                    "review_status",
-                    "approved" if entry["status"] == "complete" else "incomplete",
-                )
-                if entry
-                else None,
-                "eligible": bool(
-                    entry
-                    and entry["status"] == "complete"
-                    and entry.get("review_status", "approved") == "approved"
-                ),
-                "answered": len(entry["answers"]) if entry else 0,
-                "questions": len(item["questions"]),
-                "user_id": identity["user_id"],
-            }
-            await self.card(
-                event,
-                "你的报名进度",
-                [
-                    (
-                        "报名状态",
-                        entry_text(entry, len(item["questions"])),
-                    ),
-                    ("身份", f"QQ {identity['user_id']}"),
-                ],
-                f"{item['title']} · {lottery_id}",
-            )
+            status = await self.show_status(event, lottery_id)
             return json.dumps(status, ensure_ascii=False)
         except ValueError as exc:
             return json.dumps({"error": str(exc)}, ensure_ascii=False)

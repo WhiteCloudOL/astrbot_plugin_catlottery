@@ -5,7 +5,7 @@ from __future__ import annotations
 from io import BytesIO
 from pathlib import Path
 
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw, ImageFont, ImageOps
 
 CardSection = tuple[str, str] | tuple[str, str, Path]
 
@@ -41,12 +41,15 @@ def wrap(text: str, font: ImageFont.FreeTypeFont, width: int) -> list[str]:
     return lines or [""]
 
 
-def render_announcement(item: dict, directory: Path) -> list[bytes]:
+def render_announcement(
+    item: dict, directory: Path, *, participation_counts: dict | None = None
+) -> list[bytes]:
     """Render landscape announcements with bounded award tiles and clear participation.
 
     Args:
         item: Public lottery snapshot, including cover and ordered awards.
         directory: Plugin-owned sanitized artwork directory.
+        participation_counts: Live approved and pending totals at delivery time.
 
     Returns:
         Landscape PNG pages, containing up to three awards per page. Long
@@ -102,6 +105,14 @@ def render_announcement(item: dict, directory: Path) -> list[bytes]:
         draw.rounded_rectangle((24, 22, 1256, 224), radius=30, fill="#ffdde7")
         draw.rounded_rectangle((48, 42, 170, 77), radius=17, fill="white")
         draw.text((65, 49), "抽奖公告", font=small_font, fill="#c83c6b", anchor="lt")
+        if participation_counts is not None:
+            draw.text(
+                (194, 49),
+                f"成功参与 {participation_counts['approved']} 人  ·  待审核 {participation_counts['pending']} 人",
+                font=small_font,
+                fill="#923750",
+                anchor="lt",
+            )
         draw_lines(item["title"], (50, 94), title_font, 932, 2, "#923750", 54)
         draw.text(
             (51, 193),
@@ -251,6 +262,7 @@ def render(
     badge: str = "喵喵抽奖",
     *,
     avatar_path: Path | None = None,
+    participation_counts: dict | None = None,
 ) -> bytes:
     """Render a complete cat-themed PNG with dynamically sized text blocks.
 
@@ -260,6 +272,7 @@ def render(
         sections: Labels and text, optionally followed by a sanitized artwork path.
         badge: Short category printed above the title.
         avatar_path: Optional cached QQ avatar for enrollment receipts.
+        participation_counts: Optional live enrollment totals in the card header.
 
     Returns:
         PNG bytes suitable for AstrBot Image.fromBytes and OneBot base64.
@@ -307,6 +320,14 @@ def render(
         fill="#ffffff",
     )
     draw.text((59, 38), badge, font=small_font, fill="#c13e68", anchor="lt")
+    if participation_counts is not None:
+        draw.text(
+            (96 + int(small_font.getlength(badge)), 38),
+            f"成功参与 {participation_counts['approved']} 人 · 待审核 {participation_counts['pending']} 人",
+            font=small_font,
+            fill="#923750",
+            anchor="lt",
+        )
     y = 91
     for line in title_lines:
         draw.text((46, y), line, font=title_font, fill="#923750", anchor="lt")
@@ -314,13 +335,31 @@ def render(
     for line in subtitle_lines:
         draw.text((48, y + 14), line, font=small_font, fill="#956070", anchor="lt")
         y += 29
-    # Use the generated brand mark consistently in the Page and message cards.
+    # Participant avatars fill the rounded frame; the brand mark keeps its padding.
     draw.rounded_rectangle((672, 40, 824, 192), radius=24, fill="#ffffff")
-    with Image.open(
-        avatar_path if avatar_path and avatar_path.is_file() else LOGO_PATH
-    ) as logo:
-        logo.thumbnail((138, 138), Image.Resampling.LANCZOS)
-        canvas.paste(logo.convert("RGB"), (679, 47))
+    has_avatar = bool(avatar_path and avatar_path.is_file())
+    with Image.open(avatar_path if has_avatar else LOGO_PATH) as logo:
+        with logo.convert("RGB") as picture:
+            if has_avatar:
+                with (
+                    ImageOps.fit(
+                        picture, (152, 152), Image.Resampling.LANCZOS
+                    ) as fitted,
+                    Image.new("L", (152, 152), 0) as mask,
+                ):
+                    ImageDraw.Draw(mask).rounded_rectangle(
+                        (0, 0, 151, 151), radius=24, fill=255
+                    )
+                    canvas.paste(fitted, (672, 40), mask)
+            else:
+                picture.thumbnail((138, 138), Image.Resampling.LANCZOS)
+                canvas.paste(
+                    picture,
+                    (
+                        672 + (152 - picture.width) // 2,
+                        40 + (152 - picture.height) // 2,
+                    ),
+                )
     y = header_height + 10
     for labels, lines, picture, block_height in blocks:
         draw.rounded_rectangle(
@@ -384,6 +423,7 @@ def render_pages(
     badge: str = "喵喵抽奖",
     *,
     avatar_path: Path | None = None,
+    participation_counts: dict | None = None,
 ) -> list[bytes]:
     """Paginate complete content so large winner lists remain readable in QQ.
 
@@ -393,6 +433,7 @@ def render_pages(
         sections: Complete labeled content, including long participant lists.
         badge: Category shown on every page.
         avatar_path: Optional cached participant avatar for every receipt page.
+        participation_counts: Live enrollment totals repeated on every page.
 
     Returns:
         Ordered PNG pages with a bounded height and no dropped text.
@@ -466,6 +507,7 @@ def render_pages(
             content,
             badge,
             avatar_path=avatar_path,
+            participation_counts=participation_counts,
         )
         for index, content in enumerate(pages)
     ]

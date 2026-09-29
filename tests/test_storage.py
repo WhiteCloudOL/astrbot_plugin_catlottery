@@ -20,6 +20,90 @@ def tier_rules(rules):
     return rules
 
 
+async def test_success_notice_switch_is_per_activity_and_clears_only_unsent_group_success(
+    store, rules, sender
+):
+    first = await store.save(rules, "admin")
+    second = await store.save({**rules, "title": "另一场"}, "admin")
+    await store.enroll(first["id"], sender)
+    await store.enroll(second["id"], sender)
+    await store.save({**rules, "group_success_notify": False}, "admin", first["id"])
+    await store.close()
+    await store.open()
+    assert (await store.get(first["id"]))["group_success_notify"] is False
+    assert (await store.get(second["id"]))["group_success_notify"] is True
+    messages = [json.loads(row["body"]) for row in await store.deliveries()]
+    assert [
+        message["target"]["channel"]
+        for message in messages
+        if message["item"]["id"] == first["id"]
+    ] == ["private"]
+    assert {
+        message["target"]["channel"]
+        for message in messages
+        if message["item"]["id"] == second["id"]
+    } == {"group", "private"}
+    await store.enroll(first["id"], {**sender, "user_id": "5555555"})
+    live = await store.participation_state(first["id"], sender["user_id"])
+    assert (live["approved"], live["pending"], live["entry"]["user_id"]) == (
+        2,
+        0,
+        sender["user_id"],
+    )
+
+
+async def test_muted_review_success_preserves_pending_notices_and_live_counts(
+    store, rules, sender
+):
+    rules.update(
+        group_success_notify=False,
+        require_correct=False,
+        questions=[{"kind": "text", "prompt": "资料"}],
+    )
+    item = await store.save(rules, "admin")
+    for index in range(4):
+        identity = {**sender, "user_id": str(4444444 + index)}
+        await store.enroll(item["id"], identity)
+        if index < 3:
+            await store.answer(
+                item["id"],
+                {**identity, "group_id": ""},
+                {"kind": "text", "value": f"private-{index}"},
+                0,
+            )
+    assert (await store.participation_state(item["id"]))["pending"] == 3
+    assert {
+        json.loads(row["body"])["target"]["channel"] for row in await store.deliveries()
+    } == {"group", "private"}
+    for index, correct in ((0, True), (1, False)):
+        await store.review(
+            item["id"],
+            {
+                "action": "mark",
+                "user_id": str(4444444 + index),
+                "question_index": 0,
+                "correct": correct,
+            },
+            "web:admin",
+        )
+    live = await store.participation_state(item["id"])
+    assert live["entry"] is None and (live["approved"], live["pending"]) == (1, 1)
+    messages = [json.loads(row["body"]) for row in await store.deliveries()]
+    approved = [
+        message
+        for message in messages
+        if message.get("entry", {}).get("user_id") == sender["user_id"]
+    ]
+    assert len(approved) == 1 and approved[0]["target"]["channel"] == "private"
+    assert all("private-" not in json.dumps(message) for message in messages)
+
+
+@pytest.mark.parametrize("value", [None, "false", 0, 1, [], {}])
+def test_success_notice_switch_requires_boolean(rules, value):
+    with pytest.raises(ValueError, match="通知开关"):
+        validate_lottery({**rules, "group_success_notify": value})
+
+
 @pytest.mark.parametrize(
     "tiers",
     [

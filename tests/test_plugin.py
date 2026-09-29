@@ -282,7 +282,7 @@ async def test_deferred_review_keeps_wrong_mixed_answer_and_truthful_status(
     assert status["eligible"] is True and status["review_status"] == "approved"
     captured = []
 
-    def capture(title, subtitle, sections, badge):
+    def capture(title, subtitle, sections, badge, **kwargs):
         captured.append((title, sections))
         return [b"image"]
 
@@ -312,7 +312,7 @@ async def test_empty_eligible_pool_announces_saved_result_to_each_group(
     assert drawn["eligible_count"] == 0 and drawn["winners"] == []
     captured = []
 
-    def capture(title, subtitle, sections, badge):
+    def capture(title, subtitle, sections, badge, **kwargs):
         if badge == "开奖通知":
             captured.append(sections)
         return [b"image"]
@@ -453,7 +453,9 @@ async def test_duplicate_pending_from_other_bot_still_guides_original_bot(
     await plugin.join(event(plugin), item["id"])
     captured = []
 
-    async def capture(current_event, title, sections, subtitle="", badge=""):
+    async def capture(current_event, title, sections, subtitle="", badge="", **kwargs):
+        counts = kwargs["participation_counts"]
+        assert (counts["approved"], counts["pending"]) == (0, 0)
         captured.append(sections)
 
     monkeypatch.setattr(plugin, "card", capture)
@@ -676,11 +678,12 @@ async def test_group_join_starts_private_question_and_navigation_needs_no_activi
     item = await plugin.store.save(rules, "admin")
     cards = []
 
-    async def card(destination, title, sections, *args):
-        cards.append((title, sections))
+    async def card(destination, title, sections, *args, **kwargs):
+        cards.append((title, sections, kwargs.get("participation_counts")))
 
     monkeypatch.setattr(plugin, "card", card)
     await plugin.join(event(plugin), item["id"])
+    assert (cards[0][2]["approved"], cards[0][2]["pending"]) == (0, 0)
     assert await plugin.store.private_session("1234567", "4444444") == item["id"]
     deliveries = await plugin.store.deliveries()
     assert (
@@ -688,7 +691,8 @@ async def test_group_join_starts_private_question_and_navigation_needs_no_activi
         and json.loads(deliveries[0]["body"])["target"]["channel"] == "private"
     )
     monkeypatch.setattr(
-        "astrbot_plugin_catlottery.main.render_pages", lambda *args: [b"image"]
+        "astrbot_plugin_catlottery.main.render_pages",
+        lambda *args, **kwargs: [b"image"],
     )
     await plugin.send_deliveries()
     client = plugin.context.get_platform_inst("napcat").client
@@ -716,7 +720,8 @@ async def test_announcement_text_is_a_separate_onebot_send_and_retry_does_not_re
     item = await plugin.store.save(rules, "admin")
     await plugin.store.action(item["id"], "publish")
     monkeypatch.setattr(
-        "astrbot_plugin_catlottery.main.render_announcement", lambda *args: [b"image"]
+        "astrbot_plugin_catlottery.main.render_announcement",
+        lambda *args, **kwargs: [b"image"],
     )
     await plugin.send_deliveries()
     for platform in plugin.context.platform_manager.platform_insts:
@@ -745,6 +750,145 @@ async def test_announcement_text_is_a_separate_onebot_send_and_retry_does_not_re
     text = client.calls[-1][1]["message"][0]["data"]["text"]
     assert f"/抽奖 参与 {item['id']}" in text
     assert client.calls[-1][1]["group_id"] == 2222222
+
+
+async def test_notifications_use_live_counts_and_muted_success_still_reaches_private(
+    plugin, rules, monkeypatch
+):
+    item = await plugin.store.save({**rules, "group_success_notify": False}, "admin")
+    for user in ("4444444", "5555555"):
+        await plugin.store.enroll(item["id"], plugin.identity(event(plugin, user=user)))
+    await plugin.store.action(item["id"], "publish")
+    captured = []
+
+    def capture(*args, **kwargs):
+        counts = kwargs["participation_counts"]
+        captured.append((counts["approved"], counts["pending"]))
+        return [b"image"]
+
+    monkeypatch.setattr("astrbot_plugin_catlottery.main.render_pages", capture)
+    monkeypatch.setattr("astrbot_plugin_catlottery.main.render_announcement", capture)
+    await plugin.send_deliveries()
+    assert captured == [(2, 0)] * 4
+    calls = plugin.context.get_platform_inst("napcat").client.calls
+    assert [action for action, _ in calls] == [
+        "send_private_msg",
+        "send_private_msg",
+        "send_group_msg",
+    ]
+    await plugin.store.enroll(
+        item["id"], plugin.identity(event(plugin, user="6666666"))
+    )
+    await plugin.send_deliveries()
+    text = next(
+        parameters["message"][0]["data"]["text"]
+        for _, parameters in calls
+        if parameters["message"][0]["type"] == "text"
+    )
+    assert "成功参与 3 人 · 待审核 0 人" in text
+    assert captured[-1] == (3, 0)
+
+
+async def test_self_status_reports_conditional_odds_without_enrolling_or_exposing_others(
+    plugin, rules, monkeypatch
+):
+    rules["prize_tiers"] = [
+        {"name": "一等奖", "prize": "玩偶", "count": 1},
+        {"name": "二等奖", "prize": "贴纸", "count": 1},
+    ]
+    item = await plugin.store.save(rules, "admin")
+    cards = []
+
+    async def card(*args, **kwargs):
+        cards.append(args[2])
+
+    monkeypatch.setattr(plugin, "card", card)
+    empty = json.loads(await plugin.tool_status(event(plugin), item["id"]))
+    assert empty["pool_win_probability"] is None and empty["status"] == "not_joined"
+    assert not (await plugin.store.snapshot())[0]["entry_count"]
+    for user in ("4444444", "5555555", "6666666", "7777777"):
+        await plugin.store.enroll(item["id"], plugin.identity(event(plugin, user=user)))
+    current = json.loads(await plugin.tool_status(event(plugin), item["id"]))
+    assert current["user_id"] == "4444444" and current["user_win_probability"] == 0.5
+    assert (current["remaining_slots"], current["remaining_candidates"]) == (2, 4)
+    assert "50.00%" in str(cards[-1]) and "5555555" not in str(cards[-1])
+    drawn = await plugin.store.action(item["id"], "draw_tier", tier_index=0)
+    winner = drawn["winners"][0]["user_id"]
+    losing_user = next(
+        user for user in ("4444444", "5555555", "6666666", "7777777") if user != winner
+    )
+    winner_state = json.loads(
+        await plugin.tool_status(event(plugin, user=winner), item["id"])
+    )
+    assert winner_state["has_won"] and winner_state["user_win_probability"] is None
+    assert "你已获得 一等奖" in str(cards[-1])
+    remaining = json.loads(
+        await plugin.tool_status(event(plugin, user=losing_user), item["id"])
+    )
+    assert remaining["user_win_probability"] == pytest.approx(1 / 3)
+    outsider = json.loads(
+        await plugin.tool_status(event(plugin, user="8888888"), item["id"])
+    )
+    assert outsider["user_win_probability"] is None and outsider[
+        "pool_win_probability"
+    ] == pytest.approx(1 / 3)
+    assert "尚未获得开奖资格" in str(cards[-1])
+    await plugin.lottery_command(event(plugin, text=f"/抽奖 状态 {item['id']}"))
+    assert "中奖率" in str(cards[-1]) or "你已获得" in str(cards[-1])
+    await plugin.store.action(item["id"], "draw")
+    settled = json.loads(
+        await plugin.tool_status(event(plugin, user=losing_user), item["id"])
+    )
+    assert settled["remaining_slots"] == 0 and settled["user_win_probability"] is None
+
+
+async def test_pending_self_status_does_not_claim_personal_winning_odds(
+    plugin, rules, monkeypatch
+):
+    rules.update(
+        require_correct=False, questions=[{"kind": "text", "prompt": "私聊资料"}]
+    )
+    item = await plugin.store.save(rules, "admin")
+    await plugin.store.enroll(item["id"], plugin.identity(event(plugin)))
+    await plugin.store.answer(
+        item["id"],
+        plugin.identity(event(plugin, group="")),
+        {"kind": "text", "value": "PRIVATE-ANSWER"},
+        0,
+    )
+    monkeypatch.setattr(plugin, "card", AsyncMock())
+    status = json.loads(await plugin.tool_status(event(plugin), item["id"]))
+    assert not status["eligible"] and status["pending_review_count"] == 1
+    assert status[
+        "user_win_probability"
+    ] is None and "PRIVATE-ANSWER" not in json.dumps(status)
+    await plugin.store.review(
+        item["id"],
+        {"action": "bulk", "user_ids": ["4444444"], "correct": False},
+        "9999999",
+    )
+    rejected = json.loads(await plugin.tool_status(event(plugin), item["id"]))
+    assert rejected["review_status"] == "rejected"
+    assert rejected["user_win_probability"] is None
+    assert rejected["pending_review_count"] == 0
+
+
+async def test_self_status_caps_odds_and_cancellation_removes_estimates(
+    plugin, rules, monkeypatch
+):
+    item = await plugin.store.save({**rules, "winner_count": 5}, "admin")
+    await plugin.store.enroll(item["id"], plugin.identity(event(plugin)))
+    monkeypatch.setattr(plugin, "card", AsyncMock())
+    current = json.loads(await plugin.tool_status(event(plugin), item["id"]))
+    assert current["remaining_slots"] == 5
+    assert current["user_win_probability"] == 1
+    assert "100.00%" in str(plugin.card.await_args)
+    await plugin.store.action(item["id"], "cancel")
+    cancelled = json.loads(await plugin.tool_status(event(plugin), item["id"]))
+    assert cancelled["lottery_status"] == "cancelled"
+    assert cancelled["user_win_probability"] is None
+    assert cancelled["pool_win_probability"] is None
+    assert "活动已取消" in str(plugin.card.await_args)
 
 
 async def test_web_malformed_shapes_and_irreversible_confirmation(plugin, rules):
@@ -944,7 +1088,7 @@ async def test_web_early_award_requires_confirmation_and_notifies_every_target(
             assert (await plugin.web_action(item["id"])).status_code == status
     captured = []
 
-    def capture(title, subtitle, sections, badge):
+    def capture(title, subtitle, sections, badge, **kwargs):
         if badge == "开奖通知":
             captured.append(sections)
         return [b"image"]

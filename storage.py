@@ -172,6 +172,10 @@ def validate_lottery(payload: dict, *, now: float | None = None) -> dict:
     if not isinstance(require_correct, bool):
         raise ValueError("答题模式开关必须为启用或关闭。")
     result["require_correct"] = require_correct
+    notify = payload.get("group_success_notify", True)
+    if not isinstance(notify, bool):
+        raise ValueError("群聊参与成功通知开关必须为启用或关闭")
+    result["group_success_notify"] = notify
     result["close_at"] = timestamp(payload.get("close_at"))
     result["draw_at"] = timestamp(payload.get("draw_at"))
     if result["close_at"] <= now:
@@ -369,6 +373,7 @@ class Store:
                 item["rejected_count"],
             ) = counts.get(item["id"], (0, 0, 0, 0, 0))
             item["require_correct"] = item.get("require_correct", True)
+            item.setdefault("group_success_notify", True)
             item["pending_deliveries"] = pending.get(item["id"], 0)
             item["phase"] = (
                 "closed"
@@ -406,7 +411,51 @@ class Store:
         item["prize_tiers"] = prize_tiers(item)
         item.setdefault("cover", "")
         item.setdefault("tier_draws", [])
+        item.setdefault("group_success_notify", True)
         return item
+
+    async def participation_state(self, lottery_id: str, user_id: str = "") -> dict:
+        """Read current counts, notification policy, and only the requested sender's entry.
+
+        Args:
+            lottery_id: Exact activity identifier.
+            user_id: Trusted event sender, or empty when only aggregate counts are needed.
+
+        Returns:
+            Current rules, approved and pending totals, and the sender's own entry.
+
+        Raises:
+            ValueError: The activity does not exist.
+        """
+        async with self.lock:
+            async with self.db.execute(
+                "SELECT body FROM lotteries WHERE id=?", (lottery_id,)
+            ) as cursor:
+                row = await cursor.fetchone()
+            if row is None:
+                raise ValueError("找不到该抽奖，请发送 /抽奖 列表 查看编号")
+            item = json.loads(row[0])
+            async with self.db.execute(
+                "SELECT coalesce(sum(json_extract(body,'$.status')='complete' AND "
+                "coalesce(json_extract(body,'$.review_status'),'approved')='approved'),0), "
+                "coalesce(sum(json_extract(body,'$.status')='complete' AND "
+                "json_extract(body,'$.review_status')='pending'),0) FROM entries WHERE lottery_id=?",
+                (lottery_id,),
+            ) as cursor:
+                approved, pending = await cursor.fetchone()
+            entry = None
+            if user_id:
+                async with self.db.execute(
+                    "SELECT body FROM entries WHERE lottery_id=? AND user_id=?",
+                    (lottery_id, user_id),
+                ) as cursor:
+                    row = await cursor.fetchone()
+                entry = json.loads(row[0]) if row else None
+        item["prize_tiers"] = prize_tiers(item)
+        item.setdefault("cover", "")
+        item.setdefault("tier_draws", [])
+        item.setdefault("group_success_notify", True)
+        return {"item": item, "entry": entry, "approved": approved, "pending": pending}
 
     async def settings(self, payload: dict | None = None) -> dict:
         """Read or replace the WebUI-managed operators and tool switch.
@@ -537,12 +586,26 @@ class Store:
                     "drawn_at": None,
                     "pool_hash": None,
                 }
-            await self.db.execute(
-                "INSERT INTO lotteries VALUES (?, ?) ON CONFLICT(id) DO UPDATE SET body=excluded.body"
-                if editing
-                else "INSERT INTO lotteries VALUES (?, ?)",
-                (lottery_id, json.dumps(item, ensure_ascii=False)),
-            )
+            await self.db.execute("BEGIN IMMEDIATE")
+            try:
+                await self.db.execute(
+                    "INSERT INTO lotteries VALUES (?, ?) ON CONFLICT(id) DO UPDATE SET body=excluded.body"
+                    if editing
+                    else "INSERT INTO lotteries VALUES (?, ?)",
+                    (lottery_id, json.dumps(item, ensure_ascii=False)),
+                )
+                if not rules["group_success_notify"]:
+                    await self.db.execute(
+                        "DELETE FROM outbox WHERE lottery_id=? AND delivered_at IS NULL "
+                        "AND json_extract(body,'$.target.channel')='group' AND "
+                        "(json_extract(body,'$.kind')='success' OR "
+                        "(json_extract(body,'$.kind')='review' AND json_extract(body,'$.entry.review_status')='approved'))",
+                        (lottery_id,),
+                    )
+                await self.db.commit()
+            except BaseException:
+                await self.db.rollback()
+                raise
         return item
 
     async def entry(self, lottery_id: str, user_id: str) -> dict | None:
@@ -1198,7 +1261,14 @@ class Store:
                 {**entry, "channel": "group", "recipient": entry["group_id"]},
                 {**entry, "channel": "private", "recipient": entry["user_id"]},
             ]
-            if kind == "question":
+            if kind == "question" or (
+                not item.get("group_success_notify", True)
+                and (
+                    kind == "success"
+                    or kind == "review"
+                    and entry.get("review_status") == "approved"
+                )
+            ):
                 targets = targets[1:]
         for target in targets:
             message = {

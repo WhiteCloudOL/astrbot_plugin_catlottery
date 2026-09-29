@@ -109,6 +109,10 @@ test("settings and guide are independent pages and unsaved settings survive poll
 test("per-award counts and independent images are saved together with the cover", async t => {
   const { document, window, calls, rejectUploads } = await setup(t);
   document.querySelector('[data-action="create"]').click();
+  const successNotice = document.querySelector('meow-switch[name="group_success_notify"]');
+  assert.equal(successNotice.value, true);
+  successNotice.querySelector("button").click();
+  assert.equal(successNotice.value, false);
   document.querySelector('[name="title"]').value = "三份好运";
   for (let index = 0; index < 2; index++) document.querySelector('[data-action="add-tier"]').click();
   const cards = [...document.querySelectorAll("[data-tier]")];
@@ -133,6 +137,7 @@ test("per-award counts and independent images are saved together with the cover"
   assert.equal(new Set([saved.cover, ...saved.prize_tiers.map(tier => tier.image)]).size, 4);
   assert.equal(saved.winner_count, undefined);
   assert.equal(saved.prize, undefined);
+  assert.equal(saved.group_success_notify, false);
   assert.ok(document.querySelector(".detail-cover img.loaded"));
   assert.equal(document.querySelectorAll(".award-picture img.loaded").length, 3);
   assert.equal(document.querySelectorAll('select,input[type="checkbox"],input[type="radio"],input[type="number"],input[type="date"],input[type="datetime-local"]').length, 0);
@@ -182,6 +187,23 @@ test("detail and edit use independent pages, Back protects edits and polling pre
   assert.ok(document.querySelector(".activity-page"));
   document.querySelector('[data-action="activity-back"]').click(); await flush();
   assert.equal(window.location.hash,"#home");
+});
+
+test("group success notices remain editable after enrollment and survive polling and saving", async t => {
+  const {document,calls,polling} = await setup(t, {lotteries:[reviewActivity()],entries:participants(3),hash:"#detail/a1234567"});
+  assert.match(document.querySelector(".activity-facts").textContent,/群聊成功通知已开启/);
+  document.querySelector('[data-action="activity-edit"]').click(); await flush();
+  assert.ok(document.querySelector('meow-switch[name="require_correct"] button').disabled);
+  const successNotice = document.querySelector('meow-switch[name="group_success_notify"]');
+  assert.equal(successNotice.value,true);
+  assert.equal(successNotice.querySelector("button").disabled,false);
+  successNotice.querySelector("button").click();
+  polling[0](); await flush();
+  assert.equal(document.querySelector('meow-switch[name="group_success_notify"]').value,false);
+  document.querySelector('[data-action="save-lottery"]').click(); await flush();
+  assert.equal(calls.find(call => call.endpoint === "lotteries").payload.group_success_notify,false);
+  assert.match(document.querySelector(".activity-facts").textContent,/群聊成功通知已关闭/);
+  assert.equal(document.querySelectorAll('select,input[type="checkbox"],input[type="radio"]').length,0);
 });
 
 test("large participant lists are paginated, searchable, filtered and bulk review only changes selected QQ IDs", async t => {

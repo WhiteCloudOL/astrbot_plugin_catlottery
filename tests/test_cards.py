@@ -2,6 +2,7 @@
 
 from io import BytesIO
 
+import pytest
 from astrbot_plugin_catlottery.cards import (
     FONT_PATH,
     render,
@@ -64,9 +65,10 @@ def test_chinese_help_and_long_titles_render_without_browser():
         assert image.height > 800
 
 
-def test_enrollment_receipt_uses_the_selected_qq_avatar(tmp_path):
+@pytest.mark.parametrize("size", [(160, 160), (100, 100), (200, 100), (100, 200)])
+def test_enrollment_receipt_uses_the_selected_qq_avatar(tmp_path, size):
     path = tmp_path / "4444444.jpg"
-    with Image.new("RGB", (160, 160), "#247abd") as avatar:
+    with Image.new("RGB", size, "#247abd") as avatar:
         avatar.save(path)
     pages = render_pages(
         "参与成功", "QQ 4444444", [("报名确认", "报名已保存")], avatar_path=path
@@ -74,6 +76,10 @@ def test_enrollment_receipt_uses_the_selected_qq_avatar(tmp_path):
     with Image.open(BytesIO(pages[0])) as image:
         color = image.getpixel((740, 115))
         assert color[2] > 150 and color[0] < 70
+        for position in [(680, 116), (815, 116), (748, 46), (748, 184)]:
+            color = image.getpixel(position)
+            assert color[2] > 150 and color[0] < 70
+        assert image.getpixel((673, 41)) != image.getpixel((748, 46))
 
 
 def test_large_winner_list_is_paginated_into_readable_images():
