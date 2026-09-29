@@ -19,6 +19,13 @@ jobs:
       - run: ruff format --check .
       - run: ruff check .
       - run: python -m compileall -q main.py storage.py cards.py
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - run: npm install --prefix "$RUNNER_TEMP/catlottery-ui-tests" --no-audit --no-fund jsdom@26.1.0
+      - run: node --experimental-vm-modules --test tests/test_webui.cjs
+        env:
+          NODE_PATH: ${{ runner.temp }}/catlottery-ui-tests/node_modules
 
   persistence-and-cards:
     strategy:

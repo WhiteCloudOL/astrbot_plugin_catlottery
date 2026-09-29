@@ -2,11 +2,258 @@
 
 import asyncio
 import json
+import os
 import time
 from copy import deepcopy
 
 import pytest
 from astrbot_plugin_catlottery.storage import Store, timestamp, validate_lottery
+
+
+@pytest.fixture
+def tier_rules(rules):
+    rules["prize_tiers"] = [
+        {"name": "一等奖", "prize": "猫猫玩偶", "count": 1},
+        {"name": "二等奖", "prize": "猫猫杯垫", "count": 2},
+        {"name": "三等奖", "prize": "猫猫贴纸", "count": 3},
+    ]
+    return rules
+
+
+@pytest.mark.parametrize(
+    "tiers",
+    [
+        None,
+        [],
+        {},
+        [None],
+        [{"name": "", "prize": "礼物", "count": 1}],
+        [{"name": "a" * 31, "prize": "礼物", "count": 1}],
+        [{"name": "一等奖", "prize": "", "count": 1}],
+        [{"name": "一等奖", "prize": "礼物", "count": True}],
+        [{"name": "一等奖", "prize": "礼物", "count": 1.5}],
+        [{"name": "一等奖", "prize": "礼物", "count": 0}],
+        [{"name": "一等奖", "prize": "礼物", "count": 101}],
+        [{"name": "奖", "prize": "礼物", "count": 1}] * 2,
+        [{"name": f"奖{index}", "prize": "礼物", "count": 1} for index in range(11)],
+        [
+            {"name": "一等奖", "prize": "礼物", "count": 51},
+            {"name": "二等奖", "prize": "礼物", "count": 50},
+        ],
+        [{"name": "一等奖", "prize": "礼物", "count": 1, "image": "../private.jpg"}],
+    ],
+)
+def test_award_validation_rejects_malformed_or_excessive_tiers(rules, tiers):
+    rules["prize_tiers"] = tiers
+    with pytest.raises(ValueError):
+        validate_lottery(rules)
+
+
+async def test_tier_counts_assignment_and_highest_first_shortage(
+    store, tier_rules, sender
+):
+    item = await store.save(tier_rules, "admin")
+    assert item["winner_count"] == 6
+    assert "一等奖" in item["prize"] and "三等奖" in item["prize"]
+    for index in range(4):
+        await store.enroll(item["id"], {**sender, "user_id": str(4444444 + index)})
+    drawn = await store.action(item["id"], "draw")
+    assert len({winner["user_id"] for winner in drawn["winners"]}) == 4
+    assert [record["winner_count"] for record in drawn["tier_draws"]] == [1, 2, 1]
+    assert [record["eligible_count"] for record in drawn["tier_draws"]] == [4, 3, 1]
+    assert [winner["tier_name"] for winner in drawn["winners"]] == [
+        "一等奖",
+        "二等奖",
+        "二等奖",
+        "三等奖",
+    ]
+    assert all(
+        winner["prize"] == drawn["prize_tiers"][winner["tier_index"]]["prize"]
+        for winner in drawn["winners"]
+    )
+
+
+async def test_early_award_draw_is_atomic_and_remaining_draw_resumes_after_restart(
+    store, tier_rules, sender, monkeypatch
+):
+    item = await store.save(tier_rules, "admin")
+    await store.enroll(item["id"], sender)
+    results = await asyncio.gather(
+        store.action(item["id"], "draw_tier", tier_index=1),
+        store.action(item["id"], "draw_tier", tier_index=1),
+        return_exceptions=True,
+    )
+    assert sum(isinstance(result, ValueError) for result in results) == 1
+    partial = await store.get(item["id"])
+    assert partial["status"] == "open" and partial["drawn_at"] is None
+    assert (
+        partial["close_at"] == item["close_at"]
+        and partial["draw_at"] == item["draw_at"]
+    )
+    assert partial["tier_draws"][0]["winner_count"] == 1
+    assert partial["winners"][0]["tier_name"] == "二等奖"
+    with pytest.raises(ValueError, match="中奖"):
+        await store.withdraw(item["id"], sender)
+    with pytest.raises(ValueError, match="不能取消"):
+        await store.action(item["id"], "cancel")
+    for index in range(1, 6):
+        await store.enroll(item["id"], {**sender, "user_id": str(4444444 + index)})
+    await store.close()
+    await store.open()
+    monkeypatch.setattr(
+        "astrbot_plugin_catlottery.storage.time.time", lambda: item["draw_at"]
+    )
+    with pytest.raises(ValueError, match="自动开奖"):
+        await store.action(item["id"], "draw_tier", tier_index=0)
+    final = await store.action(item["id"], "draw", due_only=True)
+    assert final["status"] == "drawn"
+    assert final["tier_draws"][0] == partial["tier_draws"][0]
+    assert partial["winners"][0] in final["winners"]
+    assert (
+        len(final["winners"])
+        == len({winner["user_id"] for winner in final["winners"]})
+        == 5
+    )
+    assert sum(winner["tier_index"] == 1 for winner in final["winners"]) == 1
+    notices = [json.loads(row["body"]) for row in await store.deliveries()]
+    assert len([notice for notice in notices if notice["kind"] == "tier_result"]) == 2
+    assert all(
+        notice["item"]["winners"] == partial["winners"]
+        for notice in notices
+        if notice["kind"] == "tier_result"
+    )
+    assert len([notice for notice in notices if notice["kind"] == "result"]) == 2
+
+
+async def test_empty_early_draw_freezes_only_one_award_and_rules(
+    store, tier_rules, sender
+):
+    item = await store.save(tier_rules, "admin")
+    early = await store.action(item["id"], "draw_tier", tier_index=0)
+    assert early["winners"] == [] and early["tier_draws"][0]["eligible_count"] == 0
+    await store.save({**tier_rules, "description": "可编辑说明"}, "admin", item["id"])
+    with pytest.raises(ValueError, match="奖项"):
+        await store.save(
+            {**tier_rules, "prize_tiers": list(reversed(tier_rules["prize_tiers"]))},
+            "admin",
+            item["id"],
+        )
+    await store.enroll(item["id"], sender)
+    final = await store.action(item["id"], "draw")
+    assert final["winners"][0]["tier_index"] == 1
+    assert final["tier_draws"][0]["winner_count"] == 0
+    with pytest.raises(ValueError):
+        await store.action(item["id"], "draw_tier", tier_index=0)
+
+
+@pytest.mark.parametrize("index", [None, -1, 3, True, 1.5, "0", {}])
+async def test_early_award_rejects_invalid_indexes_without_notifications(
+    store, tier_rules, index
+):
+    item = await store.save(tier_rules, "admin")
+    with pytest.raises(ValueError, match="奖项"):
+        await store.action(item["id"], "draw_tier", tier_index=index)
+    assert (await store.get(item["id"]))["tier_draws"] == []
+    assert await store.deliveries() == []
+
+
+async def test_early_winners_review_marks_are_immutable(store, tier_rules, sender):
+    tier_rules.update(
+        require_correct=False, questions=[{"kind": "text", "prompt": "资料"}]
+    )
+    item = await store.save(tier_rules, "admin")
+    await store.enroll(item["id"], sender)
+    await store.answer(
+        item["id"], {**sender, "group_id": ""}, {"kind": "text", "value": "资料"}, 0
+    )
+    await store.review(
+        item["id"],
+        {
+            "action": "mark",
+            "user_id": sender["user_id"],
+            "question_index": 0,
+            "correct": True,
+        },
+        "operator",
+    )
+    await store.action(item["id"], "draw_tier", tier_index=0)
+    with pytest.raises(ValueError, match="锁定"):
+        await store.review(
+            item["id"],
+            {
+                "action": "mark",
+                "user_id": sender["user_id"],
+                "question_index": 0,
+                "correct": False,
+            },
+            "operator",
+        )
+    assert (await store.review(item["id"], {"action": "match"}, "operator"))[
+        "marked_answers"
+    ] == 0
+    assert (await store.entry(item["id"], sender["user_id"]))[
+        "review_status"
+    ] == "approved"
+
+
+async def test_legacy_awards_upgrade_without_rewriting_existing_results(
+    store, rules, sender
+):
+    item = await store.save(rules, "admin")
+    legacy = {
+        key: value
+        for key, value in item.items()
+        if key not in {"prize_tiers", "cover", "tier_draws"}
+    }
+    await store.db.execute(
+        "UPDATE lotteries SET body=? WHERE id=?", (json.dumps(legacy), item["id"])
+    )
+    await store.enroll(item["id"], sender)
+    await store.save({**rules, "description": "保留旧活动"}, "admin", item["id"])
+    assert (await store.get(item["id"]))["prize_tiers"][0]["name"] == "幸运奖"
+    legacy.update(
+        status="drawn",
+        winners=[{"user_id": sender["user_id"], "nickname": sender["nickname"]}],
+    )
+    await store.db.execute(
+        "UPDATE lotteries SET body=? WHERE id=?", (json.dumps(legacy), item["id"])
+    )
+    assert (await store.get(item["id"]))["winners"] == legacy["winners"]
+
+
+async def test_artwork_reference_validation_cover_edits_and_shared_cleanup(
+    store, tier_rules, sender
+):
+    cover = "a" * 32 + ".jpg"
+    prize = "b" * 32 + ".jpg"
+    unused = "c" * 32 + ".jpg"
+    tier_rules["cover"] = cover
+    tier_rules["prize_tiers"][0]["image"] = prize
+    with pytest.raises(ValueError, match="不存在"):
+        await store.save(tier_rules, "admin")
+    for filename in (cover, prize, unused):
+        path = store.directory / "artwork" / filename
+        path.write_bytes(b"image")
+        os.utime(path, (time.time() - 172800, time.time() - 172800))
+    item = await store.save(tier_rules, "admin")
+    await store.action(item["id"], "publish")
+    await store.enroll(item["id"], sender)
+    await store.save({**tier_rules, "cover": ""}, "admin", item["id"])
+    assert await store.cleanup_artwork() == 1
+    assert (store.directory / "artwork" / cover).is_file()
+    with pytest.raises(ValueError, match="奖项"):
+        altered = deepcopy(tier_rules)
+        altered["prize_tiers"][0]["image"] = cover
+        await store.save(altered, "admin", item["id"])
+    other = await store.save(tier_rules, "admin")
+    await store.action(item["id"], "cancel")
+    await store.delete(item["id"])
+    assert (store.directory / "artwork" / cover).is_file()
+    assert (store.directory / "artwork" / prize).is_file()
+    await store.action(other["id"], "cancel")
+    await store.delete(other["id"])
+    assert not (store.directory / "artwork" / cover).exists()
+    assert not (store.directory / "artwork" / prize).exists()
 
 
 async def test_settings_switch_preserves_legacy_settings_and_survives_restart(store):
@@ -263,7 +510,13 @@ async def test_atomic_draw_excludes_pending_and_cannot_reroll(store, rules, send
     saved = await store.get(item["id"])
     assert saved["eligible_count"] == 1
     assert saved["winners"] == [
-        {"user_id": sender["user_id"], "nickname": sender["nickname"]}
+        {
+            "user_id": sender["user_id"],
+            "nickname": sender["nickname"],
+            "tier_index": 0,
+            "tier_name": "幸运奖",
+            "prize": rules["prize"],
+        }
     ]
     notices = [
         json.loads(row["body"])

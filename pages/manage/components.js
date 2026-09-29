@@ -19,6 +19,7 @@ export const icons = {
   paw: '<ellipse cx="12" cy="16" rx="6" ry="4"/><ellipse cx="5" cy="8" rx="2" ry="3"/><ellipse cx="11" cy="5" rx="2" ry="3"/><ellipse cx="17" cy="6" rx="2" ry="3"/><ellipse cx="21" cy="11" rx="2" ry="3"/>',
   trash: '<path d="M3 6h18M9 6V3h6v3M5 6l1 15h12l1-15M10 10v7m4-7v7"/>',
   file: '<path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8l-6-6ZM14 2v6h6M8 13h8m-8 4h6"/>',
+  image: '<rect x="3" y="3" width="18" height="18" rx="4"/><circle cx="8" cy="8" r="2"/><path d="m3 17 5-5 4 4 4-6 5 7"/>',
 };
 export const icon = name => `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${icons[name] || icons.gift}</svg>`;
 
@@ -121,6 +122,74 @@ class Stepper extends HTMLElement {
 }
 customElements.define("meow-stepper", Stepper);
 
+const artworkCache = new Map();
+
+class Artwork extends HTMLElement {
+  connectedCallback() {
+    if (this._ready) return;
+    this._ready = true;
+    this.value = this.getAttribute("value") || "";
+    this.busy = false;
+    this.preview = "";
+    this.render();
+    if (this.value) this.loadPreview();
+    this.addEventListener("click", event => {
+      if (event.target.closest("[data-upload]")) this.querySelector('input[type="file"]').click();
+      if (event.target.closest("[data-clear-image]")) { this.value = ""; this.preview = ""; this.render(); this.dispatchEvent(new Event("change", { bubbles: true })); }
+    });
+    this.addEventListener("change", event => {
+      if (event.target.matches('input[type="file"]')) { event.stopPropagation(); if (event.target.files[0]) this.upload(event.target.files[0]); }
+    });
+    this.addEventListener("dragover", event => { event.preventDefault(); if (!this.hasAttribute("disabled") && !this.busy) this.classList.add("dragging"); });
+    this.addEventListener("dragleave", () => this.classList.remove("dragging"));
+    this.addEventListener("drop", event => {
+      event.preventDefault(); this.classList.remove("dragging");
+      if (!this.hasAttribute("disabled") && !this.busy && event.dataTransfer.files.length === 1) this.upload(event.dataTransfer.files[0]);
+      else if (event.dataTransfer.files.length > 1) toast("每个位置只能上传一张图片", "error");
+    });
+  }
+  async loadPreview() {
+    const filename = this.value;
+    try {
+      if (!artworkCache.has(filename)) artworkCache.set(filename, window.AstrBotPluginPage.apiGet(`artwork/${filename}`));
+      const data = await artworkCache.get(filename);
+      if (this.value === filename) { this.preview = data.preview; this.render(); }
+    } catch { artworkCache.delete(filename); if (this.value === filename) { this.preview = ""; this.failed = true; this.render(); } }
+  }
+  async upload(file) {
+    if (this.busy || this.hasAttribute("disabled")) return;
+    if (!file.size || file.size > 8 * 1024 * 1024) { toast("请选择不超过 8 MB 的图片", "error"); return; }
+    if (file.type && !["image/png", "image/jpeg", "image/webp", "image/gif"].includes(file.type)) { toast("图片支持 JPG、PNG、WebP 和 GIF", "error"); return; }
+    this.busy = true; this.failed = false; this.render();
+    this.dispatchEvent(new Event("upload-state", { bubbles: true }));
+    try {
+      const result = await window.AstrBotPluginPage.upload("artwork", file);
+      this.value = result.image;
+      this.dispatchEvent(new Event("change", { bubbles: true }));
+      await this.loadPreview();
+    } catch (error) { toast((error.message || "上传失败，请重试").replace(/[。.]$/, ""), "error"); }
+    finally { this.busy = false; this.render(); this.dispatchEvent(new Event("upload-state", { bubbles: true })); }
+  }
+  render() {
+    const disabled = this.busy || this.hasAttribute("disabled");
+    const label = this.getAttribute("label") || "图片";
+    this.innerHTML = `<div class="artwork-picker ${this.getAttribute("variant") === "cover" ? "cover-picker" : ""}"><div class="artwork-preview">${this.preview ? `<img src="${escapeHTML(this.preview)}" alt="${escapeHTML(label)}"/>` : `<span>${icon("image")}<small>${this.busy ? "正在上传…" : this.failed ? "预览暂不可用" : this.value ? "正在读取图片…" : "未设置图片"}</small></span>`}</div><div class="artwork-actions"><strong>${escapeHTML(label)}</strong><p>${this.hasAttribute("disabled") ? "报名后奖品图片已锁定" : "点击上传或将图片拖到这里"}</p>${button(this.value ? "更换图片" : "上传图片", { style: "tonal", glyph: "image", attrs: `data-upload ${disabled ? "disabled" : ""}` })}${this.value && !this.hasAttribute("disabled") ? button("移除", { style: "text", attrs: `data-clear-image ${disabled ? "disabled" : ""}` }) : ""}<small>JPG / PNG / WebP / GIF · 最大 8 MB</small></div><input type="file" accept="image/jpeg,image/png,image/webp,image/gif" hidden aria-label="${escapeHTML(label)}" ${disabled ? "disabled" : ""}/></div>`;
+  }
+}
+customElements.define("meow-upload", Artwork);
+export const artwork = (name, value = "", label = "图片", { disabled = false, cover = false } = {}) => `<meow-upload name="${escapeHTML(name)}" value="${escapeHTML(value)}" label="${escapeHTML(label)}" variant="${cover ? "cover" : "prize"}" ${disabled ? "disabled" : ""}></meow-upload>`;
+
+export async function loadArtwork(container) {
+  for (const image of container.querySelectorAll("img[data-artwork]")) {
+    const filename = image.dataset.artwork;
+    try {
+      if (!artworkCache.has(filename)) artworkCache.set(filename, window.AstrBotPluginPage.apiGet(`artwork/${filename}`));
+      const data = await artworkCache.get(filename);
+      if (image.isConnected) { image.src = data.preview; image.classList.add("loaded"); }
+    } catch { artworkCache.delete(filename); image.replaceWith(Object.assign(document.createElement("span"), { className: "artwork-unavailable", textContent: "图片暂不可用" })); }
+  }
+}
+
 export const chinaDate = seconds => new Date(seconds * 1000 + 8 * 3600000).toISOString().slice(0, 16).replace("T", " ");
 export const fullDate = seconds => chinaDate(seconds).slice(5);
 
@@ -205,7 +274,7 @@ export function toast(message, type = "ok") {
   const root = document.getElementById("toast-root");
   const element = document.createElement("div");
   element.className = `toast toast-${type}`;
-  element.innerHTML = `${icon(type === "ok" ? "check" : "paw")}<span>${escapeHTML(message)}</span>`;
+  element.innerHTML = `${icon(type === "ok" ? "check" : "paw")}<span>${escapeHTML(String(message || "").replace(/[。.]+\s*$/, ""))}</span>`;
   root.append(element);
   setTimeout(() => element.remove(), type === "error" ? 8000 : 4000);
 }

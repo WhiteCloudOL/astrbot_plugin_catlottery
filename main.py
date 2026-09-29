@@ -11,6 +11,7 @@ import secrets
 import sqlite3
 import time
 from functools import wraps
+from io import BytesIO
 from pathlib import Path
 
 from aiocqhttp.exceptions import Error as OneBotError
@@ -21,10 +22,10 @@ from astrbot.api.web import error_response, file_response, json_response, reques
 from astrbot.core.platform.message_type import MessageType
 from astrbot.core.utils.astrbot_path import get_astrbot_plugin_data_path
 from PIL import Image as PillowImage
-from PIL import UnidentifiedImageError
+from PIL import ImageOps, UnidentifiedImageError
 
-from .cards import FONT_PATH, LOGO_PATH, render_pages
-from .storage import Store, date_text, validate_lottery
+from .cards import FONT_PATH, LOGO_PATH, CardSection, render_pages
+from .storage import Store, date_text, prize_tiers, validate_lottery
 
 PLUGIN_NAME = "astrbot_plugin_catlottery"
 TOOL_NAMES = (
@@ -40,19 +41,19 @@ TOOL_NAMES = (
 HELP = [
     (
         "群聊 · 参加与查看",
-        "/抽奖 列表\n/抽奖 详情 编号\n/抽奖 参与 编号\n/抽奖 状态 编号\n/抽奖 退出 编号",
+        "/抽奖 列表 · 找到想参加的活动\n/抽奖 详情 编号 · 查看奖品与规则\n/抽奖 参与 编号 · 为自己报名\n/抽奖 状态 编号 · 查看自己的进度\n/抽奖 退出 编号 · 截止前退出报名",
     ),
     (
         "私聊 · 补充报名资料",
-        "/抽奖 填写 编号\n最多 20 项问题，按卡片逐题发送文本、图片或图文消息。\n/抽奖 待办 · 查看待填写记录\n/抽奖 取消填写 · 暂停当前表单\n/抽奖 回答 内容 · 提交当前题，可带图片，保留空格与换行",
+        "/抽奖 填写 编号 · 开始或继续下一题\n/抽奖 待办 · 查看待填写记录\n/抽奖 取消填写 · 暂停填写，保留资料\n/抽奖 回答 内容 · 提交当前题\n最多 20 题，按题目发送文字、图片或图文消息\n文字保留空格与换行，不会拆成多个答案",
     ),
     (
         "管理员 · 管理抽奖",
-        "/抽奖 创建 标题 | 奖品 | 人数 | 截止时间 | 开奖时间\n/抽奖 发布 编号\n/抽奖 截止 编号 确认\n/抽奖 开奖 编号 确认\n/抽奖 取消 编号 确认",
+        "/抽奖 创建 · 快速创建无资料活动\n参数：标题 | 奖品 | 人数 | 截止 | 开奖\n多奖项、封面与奖品图片请在管理页设置\n/抽奖 发布 编号 · 向所有配置群发布\n/抽奖 截止 编号 确认 · 停止报名与填写\n/抽奖 开奖 编号 确认 · 抽出全部剩余奖项\n/抽奖 取消 编号 确认 · 取消尚未开奖的活动",
     ),
     (
         "时间与管理页面",
-        "时间示例：2026-10-01 20:00，默认北京时间。\n在 AstrBot 插件详情打开「喵喵抽奖 · 管理工作台」，设置每场的平台、群、问题与答题模式。\n支持当场答对或提交后审核；只有成功参与者进入开奖名单。\n仅群聊可发起报名，私聊仅补充已有报名资料。",
+        "时间示例：2026-10-01 20:00 · 北京时间 UTC+8\nAstrBot 插件详情 → 喵喵抽奖 · 管理工作台\n设置每场的封面、奖项、图片、群与私聊问题\n支持当场答对或提交后审核，只抽取成功参与者\n管理员可提前抽出单个奖项，每个 QQ 最多中奖一次\n仅群聊发起报名，私聊补充已有报名资料",
     ),
 ]
 NETWORK_ERRORS = (
@@ -62,6 +63,50 @@ NETWORK_ERRORS = (
     ConnectionError,
     OSError,
 )
+
+
+def prize_sections(
+    item: dict, directory: Path, *, results: bool = False
+) -> list[CardSection]:
+    """Build the same award and image blocks for rules, announcements, and results.
+
+    Args:
+        item: Current or legacy lottery snapshot.
+        directory: Plugin-owned artwork directory.
+        results: Include immutable winner assignments and unfilled award counts.
+
+    Returns:
+        Public sections without private submissions or quiz references.
+    """
+    sections = []
+    drawn = {record["tier_index"] for record in item.get("tier_draws", [])}
+    for index, tier in enumerate(prize_tiers(item)):
+        text = f"{tier['prize']}\n名额 {tier['count']} 位"
+        if results:
+            winners = [
+                winner
+                for winner in item["winners"]
+                if winner.get("tier_index", 0) == index
+            ]
+            if index in drawn or item["status"] == "drawn":
+                text += "\n" + (
+                    "\n".join(
+                        f"{winner['nickname']} · QQ {winner['user_id']}"
+                        for winner in winners
+                    )
+                    or "暂无符合资格的中奖者"
+                )
+                if len(winners) < tier["count"]:
+                    text += (
+                        f"\n本奖项空缺 {tier['count'] - len(winners)} 位，结果已保存"
+                    )
+            else:
+                text += "\n尚未开奖，仍按原定时间揭晓"
+        section = (tier["name"], text)
+        if tier.get("image"):
+            section += (directory / tier["image"],)
+        sections.append(section)
+    return sections
 
 
 def entry_text(entry: dict | None, question_count: int) -> str:
@@ -219,6 +264,18 @@ class CatLottery(Star):
                 ["GET"],
                 "Download a private form image",
             ),
+            (
+                "artwork",
+                self.web_upload_artwork,
+                ["POST"],
+                "Upload an award image or lottery cover",
+            ),
+            (
+                "artwork/<filename>",
+                self.web_artwork,
+                ["GET"],
+                "Preview an award image or lottery cover",
+            ),
         ):
             self.context.register_web_api(
                 f"/{PLUGIN_NAME}/{route}", handler, methods, description
@@ -363,9 +420,10 @@ class CatLottery(Star):
         self,
         event: AstrMessageEvent,
         title: str,
-        sections: list[tuple[str, str]],
+        sections: list[CardSection],
         subtitle: str = "",
         badge: str = "喵喵抽奖",
+        cover: str = "",
     ) -> None:
         """Reply with the same Pillow renderer used by scheduled group notices.
 
@@ -375,7 +433,13 @@ class CatLottery(Star):
             sections: Card sections.
             subtitle: Activity context.
             badge: Card category.
+            cover: Optional internal filename for a lottery's independent cover.
         """
+        if cover:
+            sections = [
+                ("活动封面", "", self.store.directory / "artwork" / cover),
+                *sections,
+            ]
         pngs = await asyncio.to_thread(render_pages, title, subtitle, sections, badge)
         await event.send(MessageChain([Image.fromBytes(png) for png in pngs]))
 
@@ -488,10 +552,14 @@ class CatLottery(Star):
             "drawn": "已开奖",
             "cancelled": "已取消",
         }[item["status"]]
-        sections = [
+        sections = prize_sections(
+            item,
+            self.store.directory / "artwork",
+            results=bool(item.get("tier_draws")) or item["status"] == "drawn",
+        ) + [
             (
-                "奖品与名额",
-                f"{item['prize']}\n抽取 {item['winner_count']} 位，每个 QQ 号只有一次机会。",
+                "抽奖规则",
+                f"合计 {item['winner_count']} 个名额，每个 QQ 号最多中奖一次；人数不足时按奖项顺序分配。",
             ),
             (
                 "时间 · 北京时间",
@@ -514,18 +582,13 @@ class CatLottery(Star):
         ]
         if item["description"]:
             sections.append(("活动说明", item["description"]))
-        if item["status"] == "drawn":
-            sections.append(
-                (
-                    "中奖名单",
-                    "\n".join(
-                        f"{w['nickname']} · QQ {w['user_id']}" for w in item["winners"]
-                    )
-                    or "无人符合开奖资格，本次无人中奖。",
-                )
-            )
         await self.card(
-            event, item["title"], sections, f"编号 {item['id']}  ·  {state}", "抽奖详情"
+            event,
+            item["title"],
+            sections,
+            f"编号 {item['id']}  ·  {state}",
+            "抽奖详情",
+            cover=item.get("cover", ""),
         )
 
     async def show_question(
@@ -1112,6 +1175,7 @@ class CatLottery(Star):
 
     async def scheduler(self) -> None:
         """Finalize due draws independently of slow or failing QQ delivery attempts."""
+        next_cleanup = 0.0
         while True:
             try:
                 for item in await self.store.snapshot():
@@ -1125,6 +1189,13 @@ class CatLottery(Star):
                         except ValueError:
                             # Another command can finalize the same draw first.
                             continue
+                if time.time() >= next_cleanup:
+                    removed = await self.store.cleanup_artwork()
+                    if removed:
+                        self.logger.info(
+                            "Removed %d unbound lottery artwork uploads.", removed
+                        )
+                    next_cleanup = time.time() + 3600
             except Exception:
                 # Keep unexpected faults from killing the persistent scheduler.
                 self.logger.exception(
@@ -1185,25 +1256,33 @@ class CatLottery(Star):
                                 f"{item['prize']}\n开奖 {date_text(item['draw_at'])}（北京时间）",
                             ),
                         ]
-                    elif kind == "result":
-                        title = "开奖啦！看看谁接住了好运"
+                    elif kind in {"result", "tier_result"}:
+                        title = (
+                            "开奖啦！看看谁接住了好运"
+                            if kind == "result"
+                            else "一份好运，提前揭晓啦"
+                        )
                         winners = item["winners"]
-                        sections = [
+                        sections = prize_sections(
+                            item, self.store.directory / "artwork", results=True
+                        ) + [
                             (
-                                "中奖名单",
-                                "\n".join(
-                                    f"{n + 1}. {w['nickname']} · QQ {w['user_id']}"
-                                    for n, w in enumerate(winners)
-                                )
-                                or "无人符合开奖资格，本次无人中奖。",
-                            ),
-                            (
-                                "本次奖品",
-                                f"{item['prize']}\n有效报名 {item['eligible_count']} 人 · 中奖 {len(winners)} 人",
+                                "开奖进度",
+                                f"已揭晓 {len(item.get('tier_draws', [])) or len(prize_tiers(item))}/{len(prize_tiers(item))} 个奖项\n有效报名 {item['eligible_count']} 人 · 已中奖 {len(winners)} 人\n每个 QQ 号最多中奖一次，已中奖者不再参与剩余奖项。"
+                                + (
+                                    "\n无人符合开奖资格，本次无人中奖。"
+                                    if not winners and kind == "result"
+                                    else ""
+                                ),
                             ),
                             (
                                 "开奖记录",
-                                f"{date_text(item['drawn_at'])}（北京时间）\n名单摘要：{item['pool_hash'][:24]}\n中奖名单已保存，发送重试不会重新抽取。",
+                                f"{date_text(item['drawn_at'] if kind == 'result' else item['tier_draws'][-1]['drawn_at'])}（北京时间）\n名单摘要：{item['pool_hash'][:24]}\n已开奖的结果不会再次抽取。"
+                                + (
+                                    f"\n剩余奖项开奖：{date_text(item['draw_at'])}"
+                                    if kind == "tier_result"
+                                    else ""
+                                ),
                             ),
                         ]
                     elif kind in {"cancelled", "closed"}:
@@ -1222,10 +1301,14 @@ class CatLottery(Star):
                         ]
                     else:
                         title = item["title"]
-                        sections = [
+                        sections = prize_sections(
+                            item,
+                            self.store.directory / "artwork",
+                            results=bool(item.get("tier_draws")),
+                        ) + [
                             (
-                                "奖品与名额",
-                                f"{item['prize']} · 抽取 {item['winner_count']} 位",
+                                "抽奖规则",
+                                f"共 {item['winner_count']} 个名额，每个 QQ 号最多中奖一次；人数不足时按奖项顺序分配。",
                             ),
                             (
                                 "来参加吧",
@@ -1248,6 +1331,17 @@ class CatLottery(Star):
                         ]
                         if item["description"]:
                             sections.append(("活动说明", item["description"]))
+                    if kind in {"result", "tier_result", "announcement"} and item.get(
+                        "cover"
+                    ):
+                        sections.insert(
+                            0,
+                            (
+                                "活动封面",
+                                "",
+                                self.store.directory / "artwork" / item["cover"],
+                            ),
+                        )
                     pngs = await asyncio.to_thread(
                         render_pages,
                         title,
@@ -1256,7 +1350,7 @@ class CatLottery(Star):
                         "报名确认"
                         if kind in {"success", "submitted", "review"}
                         else "开奖通知"
-                        if kind == "result"
+                        if kind in {"result", "tier_result"}
                         else "抽奖公告",
                     )
                     parameters = {
@@ -1387,7 +1481,7 @@ class CatLottery(Star):
             if not isinstance(action, str):
                 raise ValueError("请选择有效操作。")
             if (
-                action in {"draw", "cancel", "close", "delete"}
+                action in {"draw", "draw_tier", "cancel", "close", "delete"}
                 and payload.get("confirmed") is not True
             ):
                 raise ValueError("请确认本次操作。")
@@ -1409,8 +1503,15 @@ class CatLottery(Star):
                     "Lottery %s pending notices requeued via WebUI.", lottery_id
                 )
                 return json_response({"queued": True})
-            item = await self.store.action(lottery_id, action)
-            self.logger.info("Lottery %s action=%s via WebUI.", lottery_id, action)
+            item = await self.store.action(
+                lottery_id, action, tier_index=payload.get("tier_index")
+            )
+            self.logger.info(
+                "Lottery %s action=%s; tier=%s via WebUI.",
+                lottery_id,
+                action,
+                payload.get("tier_index"),
+            )
             self.wake.set()
             return json_response(item)
         except ValueError as exc:
@@ -1442,6 +1543,94 @@ class CatLottery(Star):
             return json_response(result)
         except ValueError as exc:
             return error_response(str(exc))
+
+    @web_boundary
+    async def web_upload_artwork(self):
+        """Validate and sanitize one uploaded award image or lottery cover.
+
+        Returns:
+            Generated image reference, or a readable file validation error.
+        """
+        try:
+            files = await request.files()
+            uploaded = files.get("file")
+            if uploaded is None or len(files.getlist("file")) != 1:
+                raise ValueError("请上传一张奖品图片或活动封面")
+            data = await uploaded.read(8 * 1024 * 1024 + 1)
+            if not data or len(data) > 8 * 1024 * 1024:
+                raise ValueError("图片不能为空，且不能超过 8 MB")
+            with await asyncio.to_thread(PillowImage.open, BytesIO(data)) as original:
+                if original.format not in {"JPEG", "PNG", "WEBP", "GIF"}:
+                    raise ValueError("图片支持 JPG、PNG、WebP、GIF，GIF 保存第一帧")
+                if original.width * original.height > 24_000_000:
+                    raise ValueError("图片不能超过 2400 万像素，请缩小后上传")
+                await asyncio.to_thread(original.load)
+                with await asyncio.to_thread(
+                    ImageOps.exif_transpose, original
+                ) as oriented:
+                    with await asyncio.to_thread(oriented.convert, "RGBA") as rgba:
+                        picture = PillowImage.new("RGB", rgba.size, "white")
+                        with picture:
+                            await asyncio.to_thread(picture.paste, rgba, (0, 0), rgba)
+                            await asyncio.to_thread(
+                                picture.thumbnail,
+                                (1600, 1600),
+                                PillowImage.Resampling.LANCZOS,
+                            )
+                            filename = f"{secrets.token_hex(16)}.jpg"
+                            path = self.store.directory / "artwork" / filename
+                            try:
+                                await asyncio.to_thread(
+                                    picture.save, path, "JPEG", quality=90
+                                )
+                            except OSError as exc:
+                                path.unlink(missing_ok=True)
+                                raise RuntimeError(
+                                    "Could not persist lottery artwork."
+                                ) from exc
+                            except BaseException:
+                                path.unlink(missing_ok=True)
+                                raise
+            self.logger.info(
+                "Lottery artwork uploaded and sanitized; bytes=%d.", len(data)
+            )
+            return json_response({"image": filename})
+        except (UnidentifiedImageError, PillowImage.DecompressionBombError, OSError):
+            self.logger.warning("Invalid or unreadable lottery artwork rejected.")
+            return error_response(
+                "图片无法读取，请换用有效的 JPG、PNG、WebP 或 GIF 文件"
+            )
+        except ValueError as exc:
+            self.logger.debug("Lottery artwork validation rejected.")
+            return error_response(str(exc))
+
+    @web_boundary
+    async def web_artwork(self, filename: str):
+        """Preview public lottery artwork through the authenticated Pages JSON bridge.
+
+        Args:
+            filename: Internally generated artwork reference, never a user path or URL.
+
+        Returns:
+            A bounded JPEG preview data URL, or a safe not-found response.
+        """
+        if not re.fullmatch(r"[a-f0-9]{32}\.jpg", filename):
+            return error_response("图片不存在", status_code=404)
+        path = self.store.directory / "artwork" / filename
+        if not path.is_file():
+            return error_response("图片不存在或已清理，请重新上传", status_code=404)
+        with await asyncio.to_thread(PillowImage.open, path) as picture:
+            await asyncio.to_thread(
+                picture.thumbnail, (720, 480), PillowImage.Resampling.LANCZOS
+            )
+            output = BytesIO()
+            await asyncio.to_thread(picture.save, output, "JPEG", quality=88)
+        return json_response(
+            {
+                "preview": "data:image/jpeg;base64,"
+                + base64.b64encode(output.getvalue()).decode("ascii")
+            }
+        )
 
     @web_boundary
     async def web_image(self, filename: str):
@@ -1503,6 +1692,7 @@ class CatLottery(Star):
                             "id",
                             "title",
                             "prize",
+                            "prize_tiers",
                             "phase",
                             "close_at",
                             "draw_at",
@@ -1711,8 +1901,10 @@ class CatLottery(Star):
         lottery and provides title, prize, winner count, registration cutoff,
         and draw time. Ask about any missing values; never invent prizes or
         dates. No arbitrary group/platform/user arguments are allowed: the
-        trusted current group and robot are used. For multiple groups, different
-        platforms, or private questions, direct the operator to this plugin's
+        trusted current group and robot are used. This tool creates ONE single
+        prize only. For tiered awards, per-award counts, prize images, covers,
+        early drawing of one award, multiple groups, different platforms,
+        or private questions, direct the operator to this plugin's
         management Page. This creates and announces immediately. For viewing
         an existing lottery use catlottery_info instead. Server validates admin
         permission, enabled AioCqhttp platform, live robot/group, and future dates.
@@ -1779,8 +1971,12 @@ class CatLottery(Star):
 
         action must be exactly publish (send public announcement), close (stop
         registration AND private answers now, keep scheduled draw), draw (close
-        registration AND draw immediately, irreversibly freeze winners), or
-        cancel (end the activity without drawing). Never use draw for a request
+        registration AND draw ALL REMAINING awards immediately, preserving
+        earlier award results and irreversibly freezing winners), or cancel
+        (end the activity without drawing, rejected if ANY award was drawn).
+        Drawing a single selected award early is available only in the WebUI;
+        never map such a request to draw, which finishes the entire activity.
+        Never use draw for a request
         to check draw time, view existing winners, or wait for the schedule.
         Never use cancel for a participant's own withdrawal. confirmed may be
         true ONLY when the actual sender has explicitly requested the exact

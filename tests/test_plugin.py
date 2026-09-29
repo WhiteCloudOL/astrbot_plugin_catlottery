@@ -1,9 +1,11 @@
 """Verify real AstrBot event identity, OneBot routing, permissions, and recovery."""
 
 import asyncio
+import base64
 import json
 import sqlite3
 import time
+from io import BytesIO
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
@@ -547,21 +549,32 @@ async def test_due_draw_recovery_not_blocked_by_slow_delivery(plugin, rules):
             await task
 
 
-def web_request(payload=None, username="operator"):
+def web_request(payload=None, username="operator", *, uploaded=None):
     """Bind real framework request objects without running a public HTTP server.
 
     Args:
         payload: JSON request body, including malformed shapes under test.
         username: Dashboard identity or None for an unauthenticated caller.
+        uploaded: Optional real multipart file bytes for image endpoint tests.
 
     Returns:
         Context manager exposing the real plugin request proxy.
     """
 
+    body = json.dumps(payload).encode()
+    headers = []
+    if uploaded is not None:
+        body = (
+            b'--catlottery-test\r\nContent-Disposition: form-data; name="file"; filename="cover.png"\r\nContent-Type: image/png\r\n\r\n'
+            + uploaded
+            + b"\r\n--catlottery-test--\r\n"
+        )
+        headers = [(b"content-type", b"multipart/form-data; boundary=catlottery-test")]
+
     async def receive():
         return {
             "type": "http.request",
-            "body": json.dumps(payload).encode(),
+            "body": body,
             "more_body": False,
         }
 
@@ -569,7 +582,7 @@ def web_request(payload=None, username="operator"):
         "type": "http",
         "method": "POST",
         "path": "/test",
-        "headers": [],
+        "headers": headers,
         "query_string": b"",
         "server": ("localhost", 6185),
         "scheme": "http",
@@ -682,12 +695,132 @@ async def test_lifecycle_registers_only_owned_routes_and_stops_tasks(plugin, tmp
     instance = CatLottery(context)
     instance.store = Store(tmp_path / "lifecycle")
     await instance.initialize()
-    assert len(context.registered_web_apis) == 9
+    assert len(context.registered_web_apis) == 11
     tasks = (instance.worker, instance.sender)
     await instance.terminate()
     assert all(task.done() for task in tasks)
     assert instance.store.db is None
     assert len(context.registered_web_apis) == 1
+
+
+async def test_artwork_upload_sanitizes_and_previews_via_authenticated_bridge(
+    plugin, rules
+):
+    output = BytesIO()
+    source = PillowImage.new("RGBA", (1800, 900), (240, 120, 160, 180))
+    exif = PillowImage.Exif()
+    exif[274] = 6
+    exif[315] = "Private source metadata"
+    source.save(output, "PNG", exif=exif)
+    with web_request(uploaded=output.getvalue(), username=None):
+        assert (await plugin.web_upload_artwork()).status_code == 403
+    with web_request(uploaded=output.getvalue()):
+        uploaded = await plugin.web_upload_artwork()
+    assert uploaded.status_code == 200
+    filename = json.loads(uploaded.body)["image"]
+    path = plugin.store.directory / "artwork" / filename
+    with PillowImage.open(path) as image:
+        assert image.format == "JPEG" and image.size == (800, 1600)
+        assert not image.getexif()
+    with web_request(username=None):
+        assert (await plugin.web_artwork(filename)).status_code == 403
+    with web_request():
+        preview = await plugin.web_artwork(filename)
+    assert preview.status_code == 200
+    with PillowImage.open(
+        BytesIO(base64.b64decode(json.loads(preview.body)["preview"].split(",")[1]))
+    ) as image:
+        assert image.width <= 720 and image.height <= 480
+    rules["cover"] = filename
+    rules["prize_tiers"] = [
+        {"name": "一等奖", "prize": "猫猫", "count": 1, "image": filename}
+    ]
+    with web_request(rules):
+        response = await plugin.web_save()
+    assert response.status_code == 200
+    item = json.loads(response.body)
+    assert item["cover"] == item["prize_tiers"][0]["image"] == filename
+    await plugin.show_item(event(plugin), item)
+    await plugin.store.action(item["id"], "publish")
+    await plugin.send_deliveries()
+
+
+@pytest.mark.parametrize(
+    "data",
+    [b"not an image", b"", b"x" * (8 * 1024 * 1024 + 1)],
+    ids=["invalid", "empty", "oversized"],
+)
+async def test_artwork_upload_rejects_bad_files_without_persistent_garbage(
+    plugin, data
+):
+    with web_request(uploaded=data):
+        assert (await plugin.web_upload_artwork()).status_code == 400
+    assert not list((plugin.store.directory / "artwork").iterdir())
+    for filename in ("../uploads/private.jpg", "missing", "a" * 32 + ".jpg"):
+        with web_request():
+            assert (await plugin.web_artwork(filename)).status_code == 404
+
+
+async def test_artwork_storage_failure_is_retryable_and_cleans_partial_file(
+    plugin, monkeypatch
+):
+    output = BytesIO()
+    PillowImage.new("RGB", (32, 32), "pink").save(output, "PNG")
+
+    def fail_save(picture, path, *args, **kwargs):
+        path.write_bytes(b"partial image")
+        raise OSError("Disk is full")
+
+    monkeypatch.setattr(PillowImage.Image, "save", fail_save)
+    error_log = Mock()
+    monkeypatch.setattr(plugin.logger, "exception", error_log)
+    with web_request(uploaded=output.getvalue()):
+        response = await plugin.web_upload_artwork()
+    assert response.status_code == 503
+    assert not list((plugin.store.directory / "artwork").iterdir())
+    assert "Disk is full" not in response.body.decode()
+    error_log.assert_called_once()
+    assert "web_upload_artwork" in str(error_log.call_args)
+
+
+async def test_web_early_award_requires_confirmation_and_notifies_every_target(
+    plugin, rules, monkeypatch
+):
+    rules["prize_tiers"] = [
+        {"name": "一等奖", "prize": "玩偶", "count": 1},
+        {"name": "二等奖", "prize": "杯垫", "count": 2},
+    ]
+    item = await plugin.store.save(rules, "admin")
+    await plugin.store.enroll(item["id"], plugin.identity(event(plugin)))
+    for username, confirmed, status in (
+        (None, True, 403),
+        ("operator", False, 400),
+        ("operator", True, 200),
+    ):
+        with web_request(
+            {"action": "draw_tier", "tier_index": 0, "confirmed": confirmed},
+            username=username,
+        ):
+            assert (await plugin.web_action(item["id"])).status_code == status
+    captured = []
+
+    def capture(title, subtitle, sections, badge):
+        if badge == "开奖通知":
+            captured.append(sections)
+        return [b"image"]
+
+    monkeypatch.setattr("astrbot_plugin_catlottery.main.render_pages", capture)
+    await plugin.send_deliveries()
+    assert len(captured) == 2
+    assert all(
+        "一等奖" in str(section)
+        and "实际发送者" in str(section)
+        and "尚未开奖" in str(section)
+        for section in captured
+    )
+    with web_request({"action": "draw_tier", "tier_index": 0, "confirmed": True}):
+        assert (await plugin.web_action(item["id"])).status_code == 400
+    assert (await plugin.store.get(item["id"]))["status"] == "open"
 
 
 def test_real_page_service_rewrites_authenticated_assets_and_modules():

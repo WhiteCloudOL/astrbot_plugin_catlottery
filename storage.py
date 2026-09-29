@@ -62,6 +62,28 @@ def date_text(value: float) -> str:
     return datetime.fromtimestamp(value, CHINA_TZ).strftime("%Y-%m-%d %H:%M:%S")
 
 
+def prize_tiers(item: dict) -> list[dict]:
+    """Read ordered awards while preserving the rules of legacy single-prize activities.
+
+    Args:
+        item: Current or legacy persisted lottery rules.
+
+    Returns:
+        Independent award rules, ordered from highest to lowest priority.
+    """
+    return copy.deepcopy(
+        item.get("prize_tiers")
+        or [
+            {
+                "name": "幸运奖",
+                "prize": item["prize"],
+                "count": item["winner_count"],
+                "image": "",
+            }
+        ]
+    )
+
+
 def validate_lottery(payload: dict, *, now: float | None = None) -> dict:
     """Validate the complete user-facing lottery contract at every write boundary.
 
@@ -81,19 +103,70 @@ def validate_lottery(payload: dict, *, now: float | None = None) -> dict:
     result: dict[str, Any] = {}
     for key, label, limit in (
         ("title", "标题", 80),
-        ("prize", "奖品", 300),
         ("description", "说明", 1500),
     ):
         value = payload.get(key, "")
         if not isinstance(value, str) or len(value.strip()) > limit:
             raise ValueError(f"{label}必须为不超过 {limit} 字的文本。")
         result[key] = " ".join(value.split()) if key == "title" else value.strip()
-    if not result["title"] or not result["prize"]:
-        raise ValueError("请填写标题和奖品。")
-    count = payload.get("winner_count", 1)
-    if isinstance(count, bool) or not isinstance(count, int) or not 1 <= count <= 100:
-        raise ValueError("中奖人数必须为 1–100 的整数。")
-    result["winner_count"] = count
+    if not result["title"]:
+        raise ValueError("请填写抽奖标题。")
+    tiers = payload.get("prize_tiers")
+    if "prize_tiers" not in payload:
+        tiers = [
+            {
+                "name": "幸运奖",
+                "prize": payload.get("prize", ""),
+                "count": payload.get("winner_count", 1),
+            }
+        ]
+    if not isinstance(tiers, list) or not 1 <= len(tiers) <= 10:
+        raise ValueError("奖项需要为列表，请设置 1–10 个奖项。")
+    result["prize_tiers"] = []
+    names = set()
+    for tier in tiers:
+        if not isinstance(tier, dict):
+            raise ValueError("每个奖项必须包含名称、奖品和名额。")
+        name, prize, count = tier.get("name"), tier.get("prize"), tier.get("count")
+        if not isinstance(name, str) or not 1 <= len(name.strip()) <= 30:
+            raise ValueError("奖项名称必须为 1–30 字，例如一等奖。")
+        name = " ".join(name.split())
+        if name in names:
+            raise ValueError("奖项名称不能重复。")
+        names.add(name)
+        if not isinstance(prize, str) or not 1 <= len(prize.strip()) <= 300:
+            raise ValueError("每个奖项的奖品必须为 1–300 字。")
+        if (
+            isinstance(count, bool)
+            or not isinstance(count, int)
+            or not 1 <= count <= 100
+        ):
+            raise ValueError("各奖项中奖人数必须为 1–100 的整数。")
+        image = tier.get("image", "")
+        if not isinstance(image, str) or (
+            image and not re.fullmatch(r"[a-f0-9]{32}\.jpg", image)
+        ):
+            raise ValueError("奖品图片无效，请通过管理页上传。")
+        result["prize_tiers"].append(
+            {"name": name, "prize": prize.strip(), "count": count, "image": image}
+        )
+    result["winner_count"] = sum(tier["count"] for tier in result["prize_tiers"])
+    if result["winner_count"] > 100:
+        raise ValueError("全部奖项的中奖人数合计不能超过 100。")
+    result["prize"] = (
+        result["prize_tiers"][0]["prize"]
+        if len(tiers) == 1
+        else "；".join(
+            f"{tier['name']}：{tier['prize']} × {tier['count']}"
+            for tier in result["prize_tiers"]
+        )
+    )
+    cover = payload.get("cover", "")
+    if not isinstance(cover, str) or (
+        cover and not re.fullmatch(r"[a-f0-9]{32}\.jpg", cover)
+    ):
+        raise ValueError("活动封面无效，请通过管理页上传。")
+    result["cover"] = cover
     require_correct = payload.get("require_correct", True)
     if not isinstance(require_correct, bool):
         raise ValueError("答题模式开关必须为启用或关闭。")
@@ -216,6 +289,7 @@ class Store:
         """Initialize runtime storage without placing user data in plugin source."""
         self.directory.mkdir(parents=True, exist_ok=True)
         (self.directory / "uploads").mkdir(exist_ok=True)
+        (self.directory / "artwork").mkdir(exist_ok=True)
         self.db = await aiosqlite.connect(
             self.directory / "lotteries.sqlite3", isolation_level=None
         )
@@ -277,6 +351,9 @@ class Store:
             ) as cursor:
                 pending = dict(await cursor.fetchall())
         for item in items:
+            item["prize_tiers"] = prize_tiers(item)
+            item.setdefault("cover", "")
+            item.setdefault("tier_draws", [])
             (
                 item["entry_count"],
                 item["complete_count"],
@@ -318,7 +395,11 @@ class Store:
                 row = await cursor.fetchone()
         if row is None:
             raise ValueError("找不到该抽奖，请发送 /抽奖 列表 查看编号。")
-        return json.loads(row[0])
+        item = json.loads(row[0])
+        item["prize_tiers"] = prize_tiers(item)
+        item.setdefault("cover", "")
+        item.setdefault("tier_draws", [])
+        return item
 
     async def settings(self, payload: dict | None = None) -> dict:
         """Read or replace the WebUI-managed operators and tool switch.
@@ -379,6 +460,12 @@ class Store:
         """
         async with self.lock:
             rules = validate_lottery(payload)
+            for filename in [
+                rules["cover"],
+                *(tier["image"] for tier in rules["prize_tiers"]),
+            ]:
+                if filename and not (self.directory / "artwork" / filename).is_file():
+                    raise ValueError("封面或奖品图片不存在，请重新上传后保存。")
             editing = bool(lottery_id)
             if lottery_id:
                 async with self.db.execute(
@@ -394,18 +481,19 @@ class Store:
                     "SELECT count(*) FROM entries WHERE lottery_id=?", (lottery_id,)
                 ) as cursor:
                     count = (await cursor.fetchone())[0]
-                if count and any(
-                    rules[k] != item.get(k, True)
-                    for k in (
-                        "targets",
-                        "questions",
-                        "prize",
-                        "winner_count",
-                        "require_correct",
+                if (count or item.get("tier_draws")) and (
+                    rules["prize_tiers"] != prize_tiers(item)
+                    or any(
+                        rules[k] != item.get(k, True)
+                        for k in (
+                            "targets",
+                            "questions",
+                            "require_correct",
+                        )
                     )
                 ):
                     raise ValueError(
-                        "已有报名后，平台、群、问题、答题模式、奖品和中奖人数不能修改。可修改说明和未来时间。"
+                        "已有报名或奖项开奖后，平台、群、问题、答题模式、奖项顺序、奖品图片和中奖人数不能修改。可修改封面、说明和未来时间。"
                     )
                 item.update(rules)
             else:
@@ -427,6 +515,7 @@ class Store:
                     "created_at": time.time(),
                     "creator_id": creator_id,
                     "winners": [],
+                    "tier_draws": [],
                     "drawn_at": None,
                     "pool_hash": None,
                 }
@@ -764,6 +853,11 @@ class Store:
                 item = json.loads(row[0])
                 if item["status"] != "open" or time.time() >= item["draw_at"]:
                     raise ValueError("开奖时间已到或活动已结束，审核资格已锁定。")
+                winner_ids = {winner["user_id"] for winner in item["winners"]}
+                if action == "mark" and user_id in winner_ids:
+                    raise ValueError(
+                        "该报名已获得提前开奖的奖项，资格与答案标记已锁定。"
+                    )
                 if item.get("require_correct", True):
                     raise ValueError("本场采用当场答对模式，无需后续审核。")
                 async with self.db.execute(
@@ -780,7 +874,7 @@ class Store:
                         raise ValueError("题目序号无效。")
                 changed = marked = approved = 0
                 for entry in entries:
-                    if entry["status"] != "complete":
+                    if entry["status"] != "complete" or entry["user_id"] in winner_ids:
                         continue
                     previous = entry.get("review_status", "approved")
                     for question_index, answer in enumerate(entry["answers"]):
@@ -871,6 +965,10 @@ class Store:
             item = json.loads(row[0])
             if item["status"] != "open" or time.time() >= item["close_at"]:
                 raise ValueError("报名已截止，不能退出。")
+            if any(
+                winner["user_id"] == identity["user_id"] for winner in item["winners"]
+            ):
+                raise ValueError("你已提前中奖，不能退出或重复报名。")
             if not identity.get("group_id") or not any(
                 all(t[k] == identity[k] for k in ("platform_id", "bot_id", "group_id"))
                 for t in item["targets"]
@@ -950,14 +1048,20 @@ class Store:
             )
 
     async def action(
-        self, lottery_id: str, action: str, *, due_only: bool = False
+        self,
+        lottery_id: str,
+        action: str,
+        *,
+        due_only: bool = False,
+        tier_index: int | None = None,
     ) -> dict:
         """Finalize winners once and persist announcements before attempting network IO.
 
         Args:
             lottery_id: Activity identifier.
-            action: publish, close, draw, or cancel.
+            action: publish, close, draw, draw_tier, or cancel.
             due_only: Require scheduled draw time to have arrived.
+            tier_index: Zero-based award index, required only for draw_tier.
 
         Returns:
             Saved activity including immutable winners and eligible pool digest.
@@ -977,9 +1081,32 @@ class Store:
                 item = json.loads(row[0])
                 if item["status"] != "open":
                     raise ValueError("该抽奖已经结束，不能重复开奖或操作。")
-                if action == "draw":
+                if action in {"draw", "draw_tier"}:
                     if due_only and time.time() < item["draw_at"]:
                         raise ValueError("尚未到开奖时间。")
+                    tiers = prize_tiers(item)
+                    tier_draws = item.setdefault("tier_draws", [])
+                    already_drawn = {record["tier_index"] for record in tier_draws}
+                    if action == "draw_tier":
+                        if (
+                            isinstance(tier_index, bool)
+                            or not isinstance(tier_index, int)
+                            or not 0 <= tier_index < len(tiers)
+                        ):
+                            raise ValueError("请选择本场抽奖的有效奖项。")
+                        if tier_index in already_drawn:
+                            raise ValueError("该奖项已经开奖，不能再次抽取。")
+                        if time.time() >= item["draw_at"]:
+                            raise ValueError(
+                                "已到自动开奖时间，请等待全部剩余奖项开奖。"
+                            )
+                        indexes = [tier_index]
+                    else:
+                        indexes = [
+                            index
+                            for index in range(len(tiers))
+                            if index not in already_drawn
+                        ]
                     async with self.db.execute(
                         "SELECT body FROM entries WHERE lottery_id=? ORDER BY user_id",
                         (lottery_id,),
@@ -994,19 +1121,60 @@ class Store:
                     item["pool_hash"] = hashlib.sha256(
                         "\n".join(e["user_id"] for e in pool).encode()
                     ).hexdigest()
-                    selected = secrets.SystemRandom().sample(
-                        pool, min(item["winner_count"], len(pool))
-                    )
-                    item["winners"] = [
-                        {"user_id": e["user_id"], "nickname": e["nickname"]}
-                        for e in selected
+                    winner_ids = {winner["user_id"] for winner in item["winners"]}
+                    available = [
+                        entry for entry in pool if entry["user_id"] not in winner_ids
                     ]
+                    draw_time = time.time()
+                    for index in indexes:
+                        tier = tiers[index]
+                        selected = secrets.SystemRandom().sample(
+                            available, min(tier["count"], len(available))
+                        )
+                        tier_draws.append(
+                            {
+                                "tier_index": index,
+                                "drawn_at": draw_time,
+                                "eligible_count": len(available),
+                                "winner_count": len(selected),
+                                "pool_hash": hashlib.sha256(
+                                    "\n".join(
+                                        entry["user_id"] for entry in available
+                                    ).encode()
+                                ).hexdigest(),
+                            }
+                        )
+                        item["winners"].extend(
+                            {
+                                "user_id": entry["user_id"],
+                                "nickname": entry["nickname"],
+                                "tier_index": index,
+                                "tier_name": tier["name"],
+                                "prize": tier["prize"],
+                            }
+                            for entry in selected
+                        )
+                        winner_ids.update(entry["user_id"] for entry in selected)
+                        available = [
+                            entry
+                            for entry in available
+                            if entry["user_id"] not in winner_ids
+                        ]
+                    item["winners"].sort(key=lambda winner: winner["tier_index"])
+                    item["prize_tiers"] = tiers
                     item["eligible_count"] = len(pool)
-                    item["status"] = "drawn"
-                    item["drawn_at"] = time.time()
-                    item["close_at"] = min(item["close_at"], item["drawn_at"])
-                    await self.queue(item, "result")
+                    if len(tier_draws) == len(tiers):
+                        item["status"] = "drawn"
+                        item["drawn_at"] = draw_time
+                        item["close_at"] = min(item["close_at"], draw_time)
+                        await self.queue(item, "result")
+                    else:
+                        await self.queue(item, "tier_result")
                 elif action == "cancel":
+                    if item.get("tier_draws"):
+                        raise ValueError(
+                            "已有奖项开奖，不能取消活动。可截止报名或抽取剩余奖项。"
+                        )
                     item["status"] = "cancelled"
                     await self.db.execute(
                         "DELETE FROM outbox WHERE lottery_id=? AND delivered_at IS NULL",
@@ -1026,7 +1194,7 @@ class Store:
                     await self.queue(item, "announcement")
                 else:
                     raise ValueError("操作类型无效。")
-                if action in {"draw", "cancel", "close"}:
+                if action in {"draw", "cancel", "close"} or item["status"] == "drawn":
                     await self.db.execute(
                         "DELETE FROM sessions WHERE lottery_id=?", (lottery_id,)
                     )
@@ -1129,11 +1297,29 @@ class Store:
                 row = await cursor.fetchone()
             if not row or json.loads(row[0])["status"] == "open":
                 raise ValueError("请先取消或开奖，再删除记录。")
+            item = json.loads(row[0])
+            artwork = {
+                item.get("cover", ""),
+                *(tier.get("image", "") for tier in prize_tiers(item)),
+            } - {""}
             async with self.db.execute(
                 "SELECT body FROM entries WHERE lottery_id=?", (lottery_id,)
             ) as cursor:
                 entries = [json.loads(row[0]) for row in await cursor.fetchall()]
             await self.db.execute("DELETE FROM lotteries WHERE id=?", (lottery_id,))
+            async with self.db.execute(
+                "SELECT body FROM lotteries UNION ALL SELECT json_extract(body, '$.item') FROM outbox"
+            ) as cursor:
+                for row in await cursor.fetchall():
+                    other = json.loads(row[0])
+                    artwork.discard(other.get("cover", ""))
+                    artwork.difference_update(
+                        tier.get("image", "") for tier in prize_tiers(other)
+                    )
+            for filename in artwork:
+                (self.directory / "artwork" / Path(filename).name).unlink(
+                    missing_ok=True
+                )
         for entry in entries:
             for answer in entry["answers"]:
                 filename = (
@@ -1145,3 +1331,30 @@ class Store:
                     (self.directory / "uploads" / Path(filename).name).unlink(
                         missing_ok=True
                     )
+
+    async def cleanup_artwork(self) -> int:
+        """Remove unbound uploads after one day, retaining current and queued artwork.
+
+        Returns:
+            Number of stale, unreferenced files removed.
+        """
+        async with self.lock:
+            references = set()
+            async with self.db.execute(
+                "SELECT body FROM lotteries UNION ALL SELECT json_extract(body, '$.item') FROM outbox"
+            ) as cursor:
+                for row in await cursor.fetchall():
+                    item = json.loads(row[0])
+                    references.add(item.get("cover", ""))
+                    references.update(
+                        tier.get("image", "") for tier in prize_tiers(item)
+                    )
+            removed = 0
+            for path in (self.directory / "artwork").glob("*.jpg"):
+                if (
+                    path.name not in references
+                    and path.stat().st_mtime < time.time() - 86400
+                ):
+                    path.unlink(missing_ok=True)
+                    removed += 1
+            return removed
