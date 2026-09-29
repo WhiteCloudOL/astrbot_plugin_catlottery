@@ -126,6 +126,7 @@ class AvatarCache:
                 return path
         except (
             aiohttp.ClientError,
+            asyncio.TimeoutError,
             TimeoutError,
             OSError,
             ValueError,

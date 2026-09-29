@@ -126,6 +126,23 @@ async def test_clear_invalidates_inflight_writes_and_cleanup_enforces_ttl_and_ca
     await cache.close()
 
 
+async def test_avatar_timeout_uses_fallback_and_cooldown_on_supported_python_versions(
+    tmp_path,
+):
+    cache = AvatarCache(tmp_path, Mock())
+    cache.session = SimpleNamespace(
+        closed=False,
+        get=Mock(side_effect=asyncio.TimeoutError()),
+        close=AsyncMock(),
+    )
+    assert await cache.get("4444444") is None
+    assert await cache.get("4444444") is None
+    assert cache.session.get.call_count == 1
+    assert not cache.pending
+    cache.logger.warning.assert_called_once()
+    await cache.close()
+
+
 @pytest.mark.parametrize(
     "user", ["../4444444", "https://example.com", "00000", "4444", None]
 )
