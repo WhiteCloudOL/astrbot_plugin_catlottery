@@ -26,6 +26,41 @@ export const icon = name => `<svg viewBox="0 0 24 24" fill="none" stroke="curren
 export const button = (label, { action = "", style = "tonal", glyph = "", attrs = "" } = {}) => `<button class="btn btn-${style}" data-action="${escapeHTML(action)}" ${attrs}>${glyph ? icon(glyph) : ""}<span>${escapeHTML(label)}</span></button>`;
 export const field = (label, name, value = "", { hint = "", placeholder = "", multiline = false, maxlength = 1000, disabled = false } = {}) => `<label class="field"><span class="field-label">${escapeHTML(label)}</span>${multiline ? `<textarea name="${name}" rows="3" maxlength="${maxlength}" ${disabled ? "disabled" : ""} placeholder="${escapeHTML(placeholder)}">${escapeHTML(value)}</textarea>` : `<input name="${name}" type="text" value="${escapeHTML(value)}" maxlength="${maxlength}" ${disabled ? "disabled" : ""} placeholder="${escapeHTML(placeholder)}" autocomplete="off" />`}${hint ? `<span class="field-hint">${escapeHTML(hint)}</span>` : ""}</label>`;
 
+const avatarCache = new Map();
+class Avatar extends HTMLElement {
+  connectedCallback() {
+    if (this._ready) return;
+    this._ready = true;
+    const name = this.getAttribute("nickname") || "QQ";
+    this.innerHTML = `<span class="avatar-fallback">${escapeHTML([...name.trim()][0] || "猫")}</span>`;
+    this.setAttribute("aria-label", `${name}的头像`);
+    const user = this.getAttribute("user-id");
+    if (!/^[1-9]\d{4,19}$/.test(user || "")) return;
+    const now = Date.now() / 1000;
+    for (const [key, entry] of avatarCache) if (entry.expires <= now) avatarCache.delete(key);
+    if (!avatarCache.has(user)) {
+      if (avatarCache.size >= 128) avatarCache.delete(avatarCache.keys().next().value);
+      const entry = { expires: now + 60, request: window.AstrBotPluginPage.apiGet(`avatars/${user}`) };
+      avatarCache.set(user, entry);
+      entry.request.then(data => { entry.expires = data.expires_at || now + 60; }).catch(() => avatarCache.delete(user));
+    }
+    avatarCache.get(user).request.then(data => {
+      if (this.isConnected && /^data:image\/jpeg;base64,/.test(data.preview || "")) {
+        this.innerHTML = `<img src="${escapeHTML(data.preview)}" alt="" loading="lazy"/>`;
+        this.querySelector("img").addEventListener("error", () => { this.innerHTML = `<span class="avatar-fallback">${escapeHTML([...name.trim()][0] || "猫")}</span>`; }, { once: true });
+      }
+    }).catch(() => {});
+  }
+}
+customElements.define("meow-avatar", Avatar);
+export const avatar = (user, name = "") => `<meow-avatar user-id="${escapeHTML(user)}" nickname="${escapeHTML(name)}"></meow-avatar>`;
+export const clearAvatarCache = () => avatarCache.clear();
+
+export function pagination(page, total, size, action = "page") {
+  const pages = Math.max(1, Math.ceil(total / size));
+  return `<div class="pagination"><span>共 ${total} 份 · 第 ${page} / ${pages} 页</span><div>${button("上一页", { action, style: "text", attrs: `data-page="${page - 1}" ${page <= 1 ? "disabled" : ""}` })}${button("下一页", { action, style: "tonal", attrs: `data-page="${page + 1}" ${page >= pages ? "disabled" : ""}` })}</div></div>`;
+}
+
 class Choice extends HTMLElement {
   connectedCallback() {
     if (this._ready) return;
@@ -115,8 +150,10 @@ class Stepper extends HTMLElement {
       if (step) { this.value = Math.min(this.max, Math.max(this.min, this.value + Number(step.dataset.step))); this.querySelector("input").value = this.value; this.dispatchEvent(new Event("change", { bubbles: true })); }
     });
     this.querySelector("input").addEventListener("change", event => {
+      event.stopPropagation();
       this.value = Math.min(this.max, Math.max(this.min, Number(event.target.value) || this.min));
       event.target.value = this.value;
+      this.dispatchEvent(new Event("change", { bubbles: true }));
     });
   }
 }
@@ -245,7 +282,13 @@ class Calendar extends HTMLElement {
 customElements.define("meow-calendar", Calendar);
 
 let modalSequence = 0;
-export function modal(title, subtitle, body, footer, { wide = false, onClose } = {}) {
+export function pageForm(title, subtitle, body, footer) {
+  const holder = document.querySelector(".activity-outlet");
+  holder.innerHTML = `<article class="editor-page"><div class="page-breadcrumb">${button("返回上一页", {action:"form-back",style:"text",glyph:"arrow"})}<span>活动设置</span></div><header class="activity-header"><div><span class="guide-category">准备这份惊喜</span><h2>${escapeHTML(title)}</h2><p>${escapeHTML(subtitle)}</p></div></header><div class="page-panel editor-page-body">${body}</div><footer class="editor-page-footer">${footer}</footer></article>`;
+  return { holder, close: () => holder.replaceChildren() };
+}
+
+export function modal(title, subtitle, body, footer, { wide = false, onClose, canClose = () => true } = {}) {
   const root = document.getElementById("overlay-root");
   const previous = document.activeElement;
   const holder = document.createElement("div");
@@ -254,7 +297,7 @@ export function modal(title, subtitle, body, footer, { wide = false, onClose } =
   holder.innerHTML = `<section class="modal ${wide ? "modal-wide" : ""}" role="dialog" aria-modal="true" aria-labelledby="${titleId}"><header class="modal-header"><div><p class="eyebrow">喵喵抽奖 / 管理工作台</p><h2 id="${titleId}" class="text-h3 pa-4 pb-0 pl-6">${escapeHTML(title)}</h2><p>${escapeHTML(subtitle)}</p></div><button class="icon-btn modal-close" aria-label="关闭">${icon("close")}</button></header><div class="modal-body">${body}</div>${footer ? `<footer class="modal-footer">${footer}</footer>` : ""}</section>`;
   root.append(holder);
   document.body.classList.add("has-modal");
-  const close = () => { holder.remove(); if (!root.children.length) document.body.classList.remove("has-modal"); previous?.focus(); onClose?.(); };
+  const close = () => { if (!canClose()) return; holder.remove(); if (!root.children.length) document.body.classList.remove("has-modal"); if (previous?.isConnected) previous.focus(); onClose?.(); };
   holder.querySelector(".modal-close").addEventListener("click", close);
   holder.addEventListener("click", event => { if (event.target === holder || event.target.closest('[data-action="dismiss"]')) close(); });
   holder.addEventListener("keydown", event => {

@@ -24,7 +24,8 @@ from astrbot.core.utils.astrbot_path import get_astrbot_plugin_data_path
 from PIL import Image as PillowImage
 from PIL import ImageOps, UnidentifiedImageError
 
-from .cards import FONT_PATH, LOGO_PATH, CardSection, render_pages
+from .avatars import AvatarCache
+from .cards import FONT_PATH, LOGO_PATH, CardSection, render_announcement, render_pages
 from .storage import Store, date_text, prize_tiers, validate_lottery
 
 PLUGIN_NAME = "astrbot_plugin_catlottery"
@@ -45,7 +46,7 @@ HELP = [
     ),
     (
         "私聊 · 补充报名资料",
-        "/抽奖 填写 编号 · 开始或继续下一题\n/抽奖 待办 · 查看待填写记录\n/抽奖 取消填写 · 暂停填写，保留资料\n/抽奖 回答 内容 · 提交当前题\n最多 20 题，按题目发送文字、图片或图文消息\n文字保留空格与换行，不会拆成多个答案",
+        "群聊报名后，机器人私聊发题，直接回答即可\n/抽奖 上一题 · 返回已回答的上一题\n/抽奖 下一题 · 前往已回答题的下一题\n/抽奖 取消回答 · 暂停并保留资料\n/抽奖 继续 · 恢复回答\n/抽奖 待办 · 查看并切换多场待办\n/抽奖 回答 内容 · 可附图片，保留空格与换行",
     ),
     (
         "管理员 · 管理抽奖",
@@ -63,6 +64,55 @@ NETWORK_ERRORS = (
     ConnectionError,
     OSError,
 )
+
+
+def question_sections(item: dict, entry: dict, index: int) -> list[CardSection]:
+    """Compose a private question with only available navigation commands.
+
+    Args:
+        item: Activity rules with public question prompts.
+        entry: Sender's reservation and saved progress.
+        index: Current zero-based question cursor.
+
+    Returns:
+        Question, input instructions, navigation, and deadline blocks.
+    """
+    question = item["questions"][index]
+    prompt = question["prompt"]
+    if question["options"]:
+        prompt += "\n" + "\n".join(
+            f"{chr(65 + n)} · {option}" for n, option in enumerate(question["options"])
+        )
+    instruction = {
+        "image": "发送一张图片（不超过 8 MB），可附带文字",
+        "mixed": "在同一条消息中发送 1–1000 字文字和一张图片（不超过 8 MB），两者都必填",
+        "text": "发送 1–1000 字文本，可在同一条消息中附带一张图片",
+        "quiz": "发送文本答案（1–1000 字），可附带一张图片",
+    }[question["kind"]]
+    if question["options"]:
+        instruction = "发送选项字母、数字序号或完整选项文本"
+    if item.get("require_correct", True) and question["kind"] == "quiz":
+        instruction += "\n答题当场核对，答错需重答当前题"
+    elif not item.get("require_correct", True):
+        instruction += "\n回答后直接进入下一题，提交全部资料后等待管理员审核"
+    instruction += "\n保留空格与换行；以斜杠开头的文本用 /抽奖 回答 内容 提交"
+    navigation = []
+    if index > 0:
+        navigation.append("/抽奖 上一题")
+    if index < len(entry.get("answers", [])) and index + 1 < len(item["questions"]):
+        navigation.append("/抽奖 下一题")
+    navigation.append("/抽奖 取消回答")
+    if index < len(entry.get("answers", [])):
+        instruction += "\n这题已有回答，重新发送会替换原答案"
+    return [
+        ("当前问题", prompt),
+        ("如何回答", instruction),
+        ("题目操作", "   ·   ".join(navigation)),
+        (
+            "资料截止 · 北京时间",
+            date_text(item["close_at"]) + "\n未完成或审核未通过的报名不参与开奖",
+        ),
+    ]
 
 
 def prize_sections(
@@ -216,6 +266,7 @@ class CatLottery(Star):
         self.wake = asyncio.Event()
         self.delivery_lock = asyncio.Lock()
         self.tool_switch_lock = asyncio.Lock()
+        self.avatars = AvatarCache(self.store.directory / "avatars", self.logger)
 
     async def initialize(self) -> None:
         """Open storage, register plugin-only APIs, and recover pending scheduled work."""
@@ -276,6 +327,25 @@ class CatLottery(Star):
                 ["GET"],
                 "Preview an award image or lottery cover",
             ),
+            (
+                "lotteries/<lottery_id>/entries",
+                self.web_entries,
+                ["GET"],
+                "Search paginated enrollment summaries",
+            ),
+            (
+                "lotteries/<lottery_id>/entries/<user_id>",
+                self.web_entry,
+                ["GET"],
+                "Read one participant's private answers",
+            ),
+            ("avatars/<user_id>", self.web_avatar, ["GET"], "Read a cached QQ avatar"),
+            (
+                "avatars/clear",
+                self.web_clear_avatars,
+                ["POST"],
+                "Clear the expiring avatar cache",
+            ),
         ):
             self.context.register_web_api(
                 f"/{PLUGIN_NAME}/{route}", handler, methods, description
@@ -324,6 +394,7 @@ class CatLottery(Star):
                 with contextlib.suppress(asyncio.CancelledError):
                     await task
         self.worker = self.sender = None
+        await self.avatars.close()
         await self.store.close()
         self.context.registered_web_apis[:] = [
             api
@@ -601,44 +672,11 @@ class CatLottery(Star):
             item: Activity rules.
             entry: Sender's pending entry.
         """
-        index = len(entry["answers"])
-        question = item["questions"][index]
-        text = question["prompt"]
-        if question["options"]:
-            text += "\n" + "\n".join(
-                f"{chr(65 + n)}. {option}"
-                for n, option in enumerate(question["options"])
-            )
-        instruction = {
-            "image": "发送一张图片（不超过 8 MB），可在同一条消息中附带文字。",
-            "mixed": "在同一条消息中发送 1–1000 字文字和一张图片（不超过 8 MB），两者都必填。",
-            "text": "发送 1–1000 字文本，可在同一条消息中附带一张图片。",
-            "quiz": "发送文本答案（1–1000 字），可附带一张图片。",
-        }[question["kind"]]
-        if question["options"]:
-            instruction = "发送选项字母、数字序号或完整选项文本。"
-        instruction += (
-            "\n答题当场核对，答错需重答当前题。"
-            if item.get("require_correct", True) and question["kind"] == "quiz"
-            else "\n提交后直接进入下一题，全部资料由管理员后续审核。"
-            if not item.get("require_correct", True)
-            else ""
-        )
+        index = await self.store.form_position(entry["bot_id"], entry["user_id"])
         await self.card(
             event,
             f"第 {index + 1} / {len(item['questions'])} 题",
-            [
-                ("当前问题", text),
-                (
-                    "怎么填写",
-                    instruction
-                    + "\n文字保留空格和换行。以斜杠开头时使用 /抽奖 回答 内容，可带图片。\n/抽奖 取消填写 可以暂停；/抽奖 填写 编号 可以继续。",
-                ),
-                (
-                    "请在截止前完成全部题目",
-                    f"{date_text(item['close_at'])}（北京时间）\n未完成或审核未通过的报名不会参与开奖。",
-                ),
-            ],
+            question_sections(item, entry, index),
             f"{item['title']}  ·  {item['id']}  ·  QQ {entry['user_id']}",
             "私聊填写",
         )
@@ -692,6 +730,10 @@ class CatLottery(Star):
                 if created
                 else f"{entry_text(entry, len(item['questions']))}，未重复计数；只有参与成功者进入开奖名单。"
             )
+        if not created:
+            await self.store.private_session(
+                entry["bot_id"], entry["user_id"], lottery_id
+            )
         try:
             original_platform = self.context.get_platform_inst(entry["platform_id"])
             if original_platform is None:
@@ -704,13 +746,15 @@ class CatLottery(Star):
             )
             is_friend = identity["user_id"] in {str(f["user_id"]) for f in friends}
             guidance = (
-                f"请私聊报名时的机器人 QQ {entry['bot_id']} 发送：\n/抽奖 填写 {lottery_id}"
+                f"题目会发送到机器人 QQ {entry['bot_id']} 的私聊，直接回答即可\n没有收到题目时，私聊发送 /抽奖 继续"
                 if is_friend
-                else f"请先添加机器人 QQ {entry['bot_id']} 为好友，再私聊发送：\n/抽奖 填写 {lottery_id}"
+                else f"请先添加机器人 QQ {entry['bot_id']} 为好友，再私聊发送 /抽奖 继续"
             )
         except NETWORK_ERRORS + (TypeError, KeyError) as exc:
-            guidance = f"暂时无法确认好友关系。请尝试私聊机器人 QQ {entry['bot_id']} 发送：\n/抽奖 填写 {lottery_id}\n如果私聊无法发送，再添加该机器人为好友。"
+            guidance = f"暂时无法确认好友关系，请私聊机器人 QQ {entry['bot_id']} 发送 /抽奖 继续\n如果私聊无法发送，先添加该机器人为好友"
             self.logger.warning("Friend lookup failed (%s).", type(exc).__name__)
+        await self.store.queue_question(lottery_id, entry["bot_id"], entry["user_id"])
+        self.wake.set()
         await self.card(
             event,
             "已预留报名 · 还差私聊资料",
@@ -814,7 +858,7 @@ class CatLottery(Star):
                         pending.append(
                             (
                                 item["title"],
-                                f"/抽奖 填写 {item['id']}\n已完成 {len(entry['answers'])}/{len(item['questions'])} 项",
+                                f"/抽奖 切换 {item['id']}\n已完成 {len(entry['answers'])}/{len(item['questions'])} 项",
                             )
                         )
                 await self.card(
@@ -830,7 +874,50 @@ class CatLottery(Star):
                     f"QQ {identity['user_id']}",
                     "私聊待办",
                 )
-            elif command == "取消填写":
+            elif command in {"继续", "上一题", "下一题"}:
+                if identity["group_id"]:
+                    raise ValueError("此指令请在报名机器人的私聊中使用")
+                lottery_id = await self.store.private_session(
+                    identity["bot_id"], identity["user_id"]
+                )
+                if not lottery_id:
+                    if command != "继续":
+                        raise ValueError("没有正在回答的题目，请私聊发送 /抽奖 继续")
+                    pending = []
+                    for candidate in await self.store.snapshot():
+                        entry = await self.store.entry(
+                            candidate["id"], identity["user_id"]
+                        )
+                        if (
+                            entry
+                            and entry["bot_id"] == identity["bot_id"]
+                            and entry["platform_id"] == identity["platform_id"]
+                            and entry["status"] == "pending"
+                            and candidate["phase"] == "open"
+                        ):
+                            pending.append(candidate["id"])
+                    if len(pending) != 1:
+                        raise ValueError(
+                            "有多场待办，请发送 /抽奖 待办 选择活动"
+                            if pending
+                            else "没有待回答的报名，请先在活动允许的群内参与"
+                        )
+                    lottery_id = pending[0]
+                    await self.store.private_session(
+                        identity["bot_id"], identity["user_id"], lottery_id
+                    )
+                item = await self.store.get(lottery_id)
+                self.check_target(item, identity)
+                entry = await self.store.entry(lottery_id, identity["user_id"])
+                if not entry or entry["platform_id"] != identity["platform_id"]:
+                    raise ValueError("请私聊报名时使用的平台机器人")
+                await self.store.form_position(
+                    identity["bot_id"],
+                    identity["user_id"],
+                    -1 if command == "上一题" else 1 if command == "下一题" else 0,
+                )
+                await self.show_question(event, item, entry)
+            elif command in {"取消填写", "取消回答"}:
                 if identity["group_id"]:
                     raise ValueError("此指令请在私聊中使用。")
                 await self.store.private_session(
@@ -842,7 +929,7 @@ class CatLottery(Star):
                     [
                         (
                             "随时继续",
-                            "已填写内容已保存，发送 /抽奖 填写 编号 继续。报名需要在截止前完成。",
+                            "已回答内容保留，私聊发送 /抽奖 继续 恢复回答\n请在报名截止前完成全部题目",
                         )
                     ],
                 )
@@ -855,9 +942,7 @@ class CatLottery(Star):
                     )
                     is None
                 ):
-                    raise ValueError(
-                        "请先私聊发送 /抽奖 填写 编号，选择已在群内报名的抽奖。"
-                    )
+                    raise ValueError("请私聊发送 /抽奖 继续 恢复已有的群报名资料")
                 await self.collect_private(event, content=argument)
             elif command == "创建":
                 await self.check_manager(identity)
@@ -912,6 +997,7 @@ class CatLottery(Star):
                 "状态",
                 "退出",
                 "填写",
+                "切换",
                 "发布",
                 "截止",
                 "开奖",
@@ -943,7 +1029,7 @@ class CatLottery(Star):
                             ),
                             (
                                 "继续操作",
-                                f"群聊报名：/抽奖 参与 {lottery_id}\n私聊补充：/抽奖 填写 {lottery_id}",
+                                f"群聊报名：/抽奖 参与 {lottery_id}\n私聊恢复：/抽奖 继续",
                             ),
                             ("报名截止", date_text(item["close_at"]) + "（北京时间）"),
                         ],
@@ -957,11 +1043,9 @@ class CatLottery(Star):
                         [("报名记录已移除", "截止前可以重新在允许的群内报名。")],
                         f"{item['title']} · {lottery_id}",
                     )
-                elif command == "填写":
+                elif command in {"填写", "切换"}:
                     if identity["group_id"]:
-                        raise ValueError(
-                            f"请私聊机器人发送 /抽奖 填写 {lottery_id}，避免把资料发到群里。"
-                        )
+                        raise ValueError("请私聊机器人回答题目，群聊不接收报名资料")
                     entry = await self.store.entry(lottery_id, identity["user_id"])
                     if entry and entry["platform_id"] != identity["platform_id"]:
                         raise ValueError("请私聊报名时使用的平台机器人。")
@@ -1073,7 +1157,9 @@ class CatLottery(Star):
             entry = await self.store.entry(lottery_id, identity["user_id"])
             if not entry or entry["status"] != "pending":
                 raise ValueError("这份报名已完成或移除，请查看 /抽奖 状态 编号。")
-            index = len(entry["answers"])
+            index = await self.store.form_position(
+                identity["bot_id"], identity["user_id"]
+            )
             if item["status"] != "open" or time.time() >= item["close_at"]:
                 await self.store.private_session(
                     identity["bot_id"], identity["user_id"], ""
@@ -1196,6 +1282,14 @@ class CatLottery(Star):
                             "Removed %d unbound lottery artwork uploads.", removed
                         )
                     next_cleanup = time.time() + 3600
+                    avatar_removed = await self.avatars.cleanup(
+                        (await self.store.settings())["avatar_cache_hours"]
+                    )
+                    if avatar_removed:
+                        self.logger.info(
+                            "Removed %d expired or excess QQ avatar cache files.",
+                            avatar_removed,
+                        )
             except Exception:
                 # Keep unexpected faults from killing the persistent scheduler.
                 self.logger.exception(
@@ -1237,8 +1331,45 @@ class CatLottery(Star):
                         raise ConnectionError("Bot offline")
                     subtitle = f"{item['title']} · {item['id']}"
                     kind = message["kind"]
-                    if kind in {"success", "submitted", "review"}:
+                    portrait = None
+                    if kind == "question":
+                        entry = await self.store.entry(
+                            item["id"], message["entry"]["user_id"]
+                        )
+                        active = await self.store.private_session(
+                            target["bot_id"], target["recipient"]
+                        )
+                        try:
+                            index = await self.store.form_position(
+                                target["bot_id"], target["recipient"]
+                            )
+                        except ValueError:
+                            index = -1
+                        if (
+                            not entry
+                            or active != item["id"]
+                            or index != message["entry"]["question_index"]
+                        ):
+                            await self.store.delivery_done(row["id"])
+                            continue
+                        title = f"第 {index + 1} / {len(item['questions'])} 题"
+                        sections = question_sections(item, entry, index)
+                    elif kind == "participation_guide":
+                        title, sections = "", []
+                    elif kind in {"success", "submitted", "review"}:
                         entry = message["entry"]
+                        try:
+                            portrait = await asyncio.wait_for(
+                                self.avatars.get(
+                                    entry["user_id"],
+                                    (await self.store.settings())["avatar_cache_hours"],
+                                ),
+                                timeout=2,
+                            )
+                        except asyncio.TimeoutError:
+                            self.logger.debug(
+                                "QQ avatar still loading; delivering the receipt with the brand fallback."
+                            )
                         status = entry.get("review_status", "approved")
                         title = entry_text(entry, len(item["questions"]))
                         explanation = {
@@ -1300,40 +1431,8 @@ class CatLottery(Star):
                             )
                         ]
                     else:
-                        title = item["title"]
-                        sections = prize_sections(
-                            item,
-                            self.store.directory / "artwork",
-                            results=bool(item.get("tier_draws")),
-                        ) + [
-                            (
-                                "抽奖规则",
-                                f"共 {item['winner_count']} 个名额，每个 QQ 号最多中奖一次；人数不足时按奖项顺序分配。",
-                            ),
-                            (
-                                "来参加吧",
-                                f"在本群发送 /抽奖 参与 {item['id']}\n"
-                                + (
-                                    f"群聊报名后，需私聊完成 {len(item['questions'])} 项问题或资料。"
-                                    + (
-                                        "答题当场核对。"
-                                        if item.get("require_correct", True)
-                                        else "提交后由管理员审核，全部通过才算成功参与。"
-                                    )
-                                    if item["questions"]
-                                    else "无需填写资料，群聊报名即可成功。"
-                                ),
-                            ),
-                            (
-                                "时间 · 北京时间",
-                                f"报名截止 {date_text(item['close_at'])}\n自动开奖 {date_text(item['draw_at'])}",
-                            ),
-                        ]
-                        if item["description"]:
-                            sections.append(("活动说明", item["description"]))
-                    if kind in {"result", "tier_result", "announcement"} and item.get(
-                        "cover"
-                    ):
+                        title, sections = item["title"], []
+                    if kind in {"result", "tier_result"} and item.get("cover"):
                         sections.insert(
                             0,
                             (
@@ -1342,16 +1441,27 @@ class CatLottery(Star):
                                 self.store.directory / "artwork" / item["cover"],
                             ),
                         )
-                    pngs = await asyncio.to_thread(
-                        render_pages,
-                        title,
-                        subtitle,
-                        sections,
-                        "报名确认"
-                        if kind in {"success", "submitted", "review"}
-                        else "开奖通知"
-                        if kind in {"result", "tier_result"}
-                        else "抽奖公告",
+                    pngs = (
+                        []
+                        if kind == "participation_guide"
+                        else await asyncio.to_thread(
+                            render_announcement, item, self.store.directory / "artwork"
+                        )
+                        if kind == "announcement"
+                        else await asyncio.to_thread(
+                            render_pages,
+                            title,
+                            subtitle,
+                            sections,
+                            "私聊回答"
+                            if kind == "question"
+                            else "报名确认"
+                            if kind in {"success", "submitted", "review"}
+                            else "开奖通知"
+                            if kind in {"result", "tier_result"}
+                            else "抽奖公告",
+                            **({"avatar_path": portrait} if portrait else {}),
+                        )
                     )
                     parameters = {
                         "self_id": int(target["bot_id"]),
@@ -1365,6 +1475,22 @@ class CatLottery(Star):
                             for png in pngs
                         ],
                     }
+                    if kind == "participation_guide":
+                        guide = f"【{item['title']}】\n在本群发送以下指令报名：\n/抽奖 参与 {item['id']}"
+                        guide += (
+                            f"\n报名后机器人会私聊发送题目，直接按题回答，共 {len(item['questions'])} 题\n未收到题目时，先添加机器人为好友，私聊发送 /抽奖 继续\n"
+                            + (
+                                "完成全部题目后获得资格"
+                                if item.get("require_correct", True)
+                                else "完成全部题目后等待管理员审核，通过后获得资格"
+                            )
+                            if item["questions"]
+                            else "\n无需填写资料，群内报名即可参与"
+                        )
+                        guide += f"\n报名截止：{date_text(item['close_at'])}（北京时间）\n活动详情：/抽奖 详情 {item['id']}"
+                        parameters["message"] = [
+                            {"type": "text", "data": {"text": guide}}
+                        ]
                     parameters[
                         "group_id" if target["channel"] == "group" else "user_id"
                     ] = int(target["recipient"])
@@ -1458,10 +1584,113 @@ class CatLottery(Star):
             Entries and per-channel delivery records.
         """
         try:
-            await self.store.get(lottery_id)
-            return json_response(await self.store.manage_entries(lottery_id))
+            item = await self.store.get(lottery_id)
+            data = await self.store.manage_entries(lottery_id, page=1)
+            data.update(item=item, server_time=time.time())
+            return json_response(data)
         except ValueError as exc:
             return error_response(str(exc), status_code=404)
+
+    @web_boundary
+    async def web_entries(self, lottery_id: str):
+        """Search bounded enrollment summaries without returning private answers.
+
+        Args:
+            lottery_id: Activity identifier.
+
+        Returns:
+            One filtered page and full activity counts.
+        """
+        try:
+            await self.store.get(lottery_id)
+            data = await self.store.manage_entries(
+                lottery_id,
+                page=int(request.query.get("page", "1")),
+                page_size=int(request.query.get("page_size", "20")),
+                status=request.query.get("status", "all"),
+                query=request.query.get("q", ""),
+                include_deliveries=False,
+            )
+            data.pop("deliveries")
+            return json_response(data)
+        except (ValueError, TypeError) as exc:
+            return error_response(
+                str(exc)
+                if isinstance(exc, ValueError)
+                and not str(exc).startswith("invalid literal")
+                else "页码或筛选条件无效"
+            )
+
+    @web_boundary
+    async def web_entry(self, lottery_id: str, user_id: str):
+        """Open one explicitly selected person's full private form for review.
+
+        Args:
+            lottery_id: Exact activity identifier.
+            user_id: Selected participant's actual QQ number.
+
+        Returns:
+            Private entry and current rules, including qualification lock status.
+        """
+        if not re.fullmatch(r"[1-9]\d{4,19}", user_id):
+            return error_response("报名不存在", status_code=404)
+        try:
+            item = await self.store.get(lottery_id)
+            entry = await self.store.entry(lottery_id, user_id)
+            if not entry:
+                raise ValueError("该报名已移除，请刷新列表")
+            return json_response(
+                {"entry": entry, "item": item, "server_time": time.time()}
+            )
+        except ValueError as exc:
+            return error_response(str(exc), status_code=404)
+
+    @web_boundary
+    async def web_avatar(self, user_id: str):
+        """Return an authenticated bounded avatar preview with cache expiry.
+
+        Args:
+            user_id: Numeric QQ number from a participant row.
+
+        Returns:
+            A sanitized data URL, or an empty preview for the identity fallback.
+        """
+        try:
+            hours = (await self.store.settings())["avatar_cache_hours"]
+            path = await self.avatars.get(user_id, hours)
+            data = await asyncio.to_thread(path.read_bytes) if path else None
+            return json_response(
+                {
+                    "preview": "data:image/jpeg;base64,"
+                    + base64.b64encode(data).decode("ascii")
+                    if data
+                    else "",
+                    "expires_at": path.stat().st_mtime + hours * 3600
+                    if path
+                    else time.time() + 300,
+                }
+            )
+        except ValueError as exc:
+            return error_response(str(exc), status_code=400)
+        except OSError:
+            self.logger.debug(
+                "QQ avatar was cleaned during preview; returning fallback."
+            )
+            return json_response({"preview": "", "expires_at": time.time() + 60})
+
+    @web_boundary
+    async def web_clear_avatars(self):
+        """Clear only avatar cache files after an explicit Dashboard request.
+
+        Returns:
+            The number of removed cache files.
+        """
+        payload = await request.json()
+        if not isinstance(payload, dict) or payload.get("confirmed") is not True:
+            return error_response("请确认清理头像缓存")
+        removed = await self.avatars.cleanup(clear=True)
+        self.logger.info("QQ avatar cache explicitly cleared; removed=%d.", removed)
+        return json_response({"removed": removed})
 
     @web_boundary
     async def web_action(self, lottery_id: str):
@@ -1647,6 +1876,24 @@ class CatLottery(Star):
         path = self.store.directory / "uploads" / filename
         if not path.is_file():
             return error_response("图片不存在或已删除。", status_code=404)
+        if request.query.get("preview") == "1":
+            try:
+                with await asyncio.to_thread(PillowImage.open, path) as original:
+                    with original.convert("RGB") as picture:
+                        picture.thumbnail((1000, 1000), PillowImage.Resampling.LANCZOS)
+                        output = BytesIO()
+                        await asyncio.to_thread(
+                            picture.save, output, "JPEG", quality=88
+                        )
+                return json_response(
+                    {
+                        "preview": "data:image/jpeg;base64,"
+                        + base64.b64encode(output.getvalue()).decode()
+                    },
+                    headers={"Cache-Control": "no-store"},
+                )
+            except OSError:
+                return error_response("图片不存在或已删除", status_code=404)
         return file_response(
             path,
             filename=filename,
@@ -1855,7 +2102,10 @@ class CatLottery(Star):
         must already have reserved a slot by joining from an allowed group, and
         must private-message the original robot through the original platform.
         If multiple pending forms exist, ask the sender to select an ID first.
-        The next question is sent as an image. The sender must then directly
+        Group enrollment already activates the form and queues its first private
+        question. Use this tool to resume a paused form or switch to an explicitly
+        selected pending activity; do not call it before every answer. The current
+        question is sent as an image. The sender must then directly
         send their actual text/quiz answer or image; do not fabricate, infer,
         or submit answers on their behalf. Completed or expired forms cannot
         be resumed. A group message must instead be directed to private chat.
@@ -1869,17 +2119,25 @@ class CatLottery(Star):
         try:
             identity = self.identity(event)
             if identity["group_id"]:
-                raise ValueError(f"请私聊机器人发送 /抽奖 填写 {lottery_id}。")
+                raise ValueError(
+                    "请私聊报名机器人直接回答题目；未收到题目时发送 /抽奖 继续"
+                )
             item = await self.store.get(lottery_id)
             self.check_target(item, identity)
             entry = await self.store.entry(lottery_id, identity["user_id"])
             if entry and entry["platform_id"] != identity["platform_id"]:
                 raise ValueError("请私聊报名时使用的平台机器人。")
-            await self.store.private_session(
-                identity["bot_id"], identity["user_id"], lottery_id
-            )
+            if (
+                await self.store.private_session(
+                    identity["bot_id"], identity["user_id"]
+                )
+                != lottery_id
+            ):
+                await self.store.private_session(
+                    identity["bot_id"], identity["user_id"], lottery_id
+                )
             await self.show_question(event, item, entry)
-            return "已发送下一题，等待用户真实私聊回答；尚未报名成功。"
+            return "已发送当前题，等待用户真实私聊回答；尚未报名成功。"
         except ValueError as exc:
             await self.card(event, "暂时无法填写", [("填写提示", str(exc))])
             return str(exc)

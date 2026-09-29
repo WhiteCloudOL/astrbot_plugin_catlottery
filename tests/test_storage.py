@@ -268,6 +268,7 @@ async def test_settings_switch_preserves_legacy_settings_and_survives_restart(st
     assert await store.settings() == {
         "manager_ids": ["9999999"],
         "llm_tools_enabled": False,
+        "avatar_cache_hours": 24,
     }
 
 
@@ -349,6 +350,177 @@ def sender():
         "user_id": "4444444",
         "nickname": "小猫",
     }
+
+
+async def test_form_navigation_updates_only_selected_question_and_survives_restart(
+    store, rules, sender
+):
+    rules.update(
+        require_correct=False,
+        questions=[{"kind": "text", "prompt": f"问题 {i}"} for i in range(3)],
+    )
+    item = await store.save(rules, "admin")
+    await store.enroll(item["id"], sender)
+    await store.private_session(sender["bot_id"], sender["user_id"], item["id"])
+    await store.queue_question(item["id"], sender["bot_id"], sender["user_id"])
+    with pytest.raises(ValueError):
+        await store.form_position(sender["bot_id"], sender["user_id"], 1)
+    identity = {**sender, "group_id": ""}
+    await store.answer(
+        item["id"], identity, {"kind": "text", "value": "  first  answer\n"}, 0
+    )
+    assert await store.form_position(sender["bot_id"], sender["user_id"], -1) == 0
+    await store.close()
+    await store.open()
+    assert await store.form_position(sender["bot_id"], sender["user_id"]) == 0
+    await store.answer(
+        item["id"], identity, {"kind": "text", "value": " revised  answer "}, 0
+    )
+    entry = await store.entry(item["id"], sender["user_id"])
+    assert (
+        len(entry["answers"]) == 1
+        and entry["answers"][0]["value"] == " revised  answer "
+    )
+    with pytest.raises(ValueError):
+        await store.answer(item["id"], identity, {"kind": "text", "value": "stale"}, 0)
+    await store.private_session(sender["bot_id"], sender["user_id"], "")
+    assert await store.private_session(sender["bot_id"], sender["user_id"]) is None
+    with pytest.raises(ValueError, match="暂停"):
+        await store.answer(
+            item["id"], identity, {"kind": "text", "value": "late after cancel"}, 1
+        )
+    assert len((await store.entry(item["id"], sender["user_id"]))["answers"]) == 1
+    await store.private_session(sender["bot_id"], sender["user_id"], item["id"])
+    assert await store.form_position(sender["bot_id"], sender["user_id"]) == 1
+    await store.answer(item["id"], identity, {"kind": "text", "value": "second"}, 1)
+    await store.answer(item["id"], identity, {"kind": "text", "value": "third"}, 2)
+    assert await store.private_session(sender["bot_id"], sender["user_id"]) is None
+    assert {json.loads(row["body"])["kind"] for row in await store.deliveries()} == {
+        "submitted"
+    }
+
+
+async def test_private_cursor_migrates_legacy_sessions_and_rejects_switched_activity(
+    store, rules, sender
+):
+    rules["questions"] = [{"kind": "text", "prompt": "姓名"}]
+    first = await store.save(rules, "admin")
+    second = await store.save(rules, "admin")
+    await store.enroll(first["id"], sender)
+    await store.enroll(second["id"], sender)
+    await store.db.execute("DROP TABLE sessions")
+    await store.db.execute(
+        "CREATE TABLE sessions (bot_id TEXT,user_id TEXT,lottery_id TEXT,PRIMARY KEY(bot_id,user_id))"
+    )
+    await store.db.execute(
+        "INSERT INTO sessions VALUES (?,?,?)",
+        (sender["bot_id"], sender["user_id"], first["id"]),
+    )
+    await store.close()
+    await store.open()
+    assert await store.form_position(sender["bot_id"], sender["user_id"]) == 0
+    await store.private_session(sender["bot_id"], sender["user_id"], second["id"])
+    with pytest.raises(ValueError, match="切换"):
+        await store.answer(
+            first["id"],
+            {**sender, "group_id": ""},
+            {"kind": "text", "value": "wrong form"},
+            0,
+        )
+    assert (await store.entry(first["id"], sender["user_id"]))["answers"] == []
+
+
+async def test_paged_management_search_filters_and_bulk_review_are_atomic(
+    store, rules, sender
+):
+    rules.update(require_correct=False, questions=[{"kind": "text", "prompt": "资料"}])
+    item = await store.save(rules, "admin")
+    for index in range(65):
+        identity = {
+            **sender,
+            "user_id": str(4444444 + index),
+            "nickname": f"猫猫 {index}" if index else "猫%_!",
+        }
+        await store.enroll(item["id"], identity)
+        if index < 64:
+            await store.answer(
+                item["id"],
+                {**identity, "group_id": ""},
+                {"kind": "text", "value": "private text"},
+                0,
+            )
+    page = await store.manage_entries(item["id"], page=2, page_size=20)
+    assert page["total"] == 65 and len(page["entries"]) == 20
+    assert page["entries"][0]["user_id"] == str(4444444 + 20)
+    assert all("answers" not in entry for entry in page["entries"])
+    assert page["summary"] == {
+        "total": 65,
+        "incomplete": 1,
+        "approved": 0,
+        "pending": 64,
+        "rejected": 0,
+    }
+    literal = await store.manage_entries(item["id"], page=1, query="%_!")
+    assert literal["total"] == 1
+    selected = ["4444444", "4444445"]
+    await store.review(
+        item["id"],
+        {"action": "bulk", "user_ids": selected, "correct": True},
+        "operator",
+    )
+    approved = await store.manage_entries(item["id"], page=1, status="approved")
+    assert [entry["user_id"] for entry in approved["entries"]] == selected
+    assert (await store.entry(item["id"], "4444446"))["review_status"] == "pending"
+    for invalid in ["9999999", str(4444444 + 64)]:
+        with pytest.raises(ValueError):
+            await store.review(
+                item["id"],
+                {
+                    "action": "bulk",
+                    "user_ids": [selected[0], invalid],
+                    "correct": False,
+                },
+                "operator",
+            )
+        assert (await store.entry(item["id"], selected[0]))[
+            "review_status"
+        ] == "approved"
+    assert (await store.manage_entries(item["id"], page=10000))["page"] == 4
+
+
+@pytest.mark.parametrize("hours", [0, 169, True, "24", 24.5, None])
+async def test_avatar_lifetime_validation_is_strict(store, hours):
+    with pytest.raises(ValueError):
+        await store.settings({"manager_ids": [], "avatar_cache_hours": hours})
+    assert (await store.settings())["avatar_cache_hours"] == 24
+
+
+async def test_announcement_text_waits_for_image_and_retries_independently(
+    store, rules
+):
+    item = await store.save(rules, "admin")
+    await store.action(item["id"], "publish")
+    images = await store.deliveries()
+    assert len(images) == 2 and all(
+        json.loads(row["body"])["kind"] == "announcement" for row in images
+    )
+    await store.delivery_done(images[0]["id"])
+    rows = await store.deliveries()
+    guide = next(
+        row for row in rows if json.loads(row["body"])["kind"] == "participation_guide"
+    )
+    assert json.loads(guide["body"])["depends_on"] == images[0]["id"]
+    await store.delivery_done(guide["id"], "ConnectionError")
+    await store.close()
+    await store.open()
+    assert images[0]["id"] not in {row["id"] for row in await store.deliveries()}
+    details = await store.manage_entries(item["id"])
+    assert (
+        next(row for row in details["deliveries"] if row["id"] == guide["id"])[
+            "attempts"
+        ]
+        == 1
+    )
 
 
 async def test_cross_platform_and_group_duplicate_counts_once(store, rules, sender):

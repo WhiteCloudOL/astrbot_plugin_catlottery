@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import copy
 import hashlib
 import json
@@ -317,6 +318,12 @@ class Store:
                 next_at REAL NOT NULL DEFAULT 0, delivered_at REAL, error TEXT NOT NULL DEFAULT ''
             );
         """)
+        async with self.db.execute("PRAGMA table_info(sessions)") as cursor:
+            columns = {row[1] for row in await cursor.fetchall()}
+        if "question_index" not in columns:
+            await self.db.execute(
+                "ALTER TABLE sessions ADD COLUMN question_index INTEGER"
+            )
 
     async def close(self) -> None:
         """Flush and close the plugin-owned database connection."""
@@ -419,6 +426,7 @@ class Store:
             ) as cursor:
                 settings = json.loads((await cursor.fetchone())[0])
             settings.setdefault("llm_tools_enabled", True)
+            settings.setdefault("avatar_cache_hours", 24)
             if payload is not None:
                 ids = payload.get("manager_ids") if isinstance(payload, dict) else None
                 if (
@@ -435,9 +443,19 @@ class Store:
                 )
                 if not isinstance(enabled, bool):
                     raise ValueError("LLM 工具开关必须为启用或关闭。")
+                hours = payload.get(
+                    "avatar_cache_hours", settings["avatar_cache_hours"]
+                )
+                if (
+                    isinstance(hours, bool)
+                    or not isinstance(hours, int)
+                    or not 1 <= hours <= 168
+                ):
+                    raise ValueError("头像缓存时间必须为 1–168 小时的整数")
                 settings = {
                     "manager_ids": list(dict.fromkeys(ids)),
                     "llm_tools_enabled": enabled,
+                    "avatar_cache_hours": hours,
                 }
                 await self.db.execute(
                     "UPDATE settings SET body=? WHERE id=1", (json.dumps(settings),)
@@ -611,6 +629,11 @@ class Store:
                 )
                 if entry["status"] == "complete":
                     await self.queue(item, "success", entry=entry)
+                else:
+                    await self.db.execute(
+                        "INSERT OR REPLACE INTO sessions (bot_id,user_id,lottery_id,question_index) VALUES (?,?,?,0)",
+                        (identity["bot_id"], identity["user_id"], lottery_id),
+                    )
                 await self.db.commit()
                 return entry, True
             except BaseException:
@@ -640,6 +663,11 @@ class Store:
                         "DELETE FROM sessions WHERE bot_id=? AND user_id=?",
                         (bot_id, user_id),
                     )
+                    await self.db.execute(
+                        "DELETE FROM outbox WHERE delivered_at IS NULL AND json_extract(body,'$.kind')='question' "
+                        "AND json_extract(body,'$.target.bot_id')=? AND json_extract(body,'$.entry.user_id')=?",
+                        (bot_id, user_id),
+                    )
                     return None
                 async with self.db.execute(
                     "SELECT body FROM entries WHERE lottery_id=? AND user_id=?",
@@ -662,8 +690,8 @@ class Store:
                 if item["status"] != "open" or time.time() >= item["close_at"]:
                     raise ValueError("报名已截止，不能继续填写。")
                 await self.db.execute(
-                    "INSERT OR REPLACE INTO sessions VALUES (?, ?, ?)",
-                    (bot_id, user_id, lottery_id),
+                    "INSERT OR REPLACE INTO sessions (bot_id, user_id, lottery_id, question_index) VALUES (?, ?, ?, ?)",
+                    (bot_id, user_id, lottery_id, len(entry["answers"])),
                 )
             async with self.db.execute(
                 "SELECT lottery_id FROM sessions WHERE bot_id=? AND user_id=?",
@@ -672,10 +700,83 @@ class Store:
                 row = await cursor.fetchone()
         return row[0] if row else None
 
+    async def form_position(self, bot_id: str, user_id: str, direction: int = 0) -> int:
+        """Read or move the sender's private question cursor without skipping answers.
+
+        Args:
+            bot_id: Trusted robot QQ number.
+            user_id: Trusted sender QQ number.
+            direction: Zero to read, minus one for previous, or one for next.
+
+        Returns:
+            Current zero-based question index.
+
+        Raises:
+            ValueError: There is no active form or the requested question is unavailable.
+        """
+        if direction not in (-1, 0, 1):
+            raise ValueError("题目方向无效")
+        async with self.lock:
+            async with self.db.execute(
+                "SELECT s.question_index, e.body, l.body FROM sessions s "
+                "JOIN entries e ON e.lottery_id=s.lottery_id AND e.user_id=s.user_id "
+                "JOIN lotteries l ON l.id=s.lottery_id WHERE s.bot_id=? AND s.user_id=?",
+                (bot_id, user_id),
+            ) as cursor:
+                row = await cursor.fetchone()
+            if not row:
+                raise ValueError("没有正在回答的题目，请私聊发送 /抽奖 继续")
+            entry, item = json.loads(row[1]), json.loads(row[2])
+            if (
+                entry["status"] != "pending"
+                or item["status"] != "open"
+                or time.time() >= item["close_at"]
+            ):
+                raise ValueError("资料已提交或报名已截止，不能继续回答")
+            index = (
+                row[0] if row[0] is not None else len(entry["answers"])
+            ) + direction
+            if not 0 <= index < len(item["questions"]) or index > len(entry["answers"]):
+                raise ValueError("没有可切换的题目，请先回答当前题")
+            if direction:
+                await self.db.execute(
+                    "UPDATE sessions SET question_index=? WHERE bot_id=? AND user_id=?",
+                    (index, bot_id, user_id),
+                )
+            return index
+
+    async def queue_question(self, lottery_id: str, bot_id: str, user_id: str) -> None:
+        """Queue the active question to the enrolled QQ user's private conversation.
+
+        Args:
+            lottery_id: Group-created reservation identifier.
+            bot_id: Original robot QQ number.
+            user_id: Original group sender QQ number.
+        """
+        async with self.lock:
+            async with self.db.execute(
+                "SELECT s.question_index,e.body,l.body FROM sessions s "
+                "JOIN entries e ON e.lottery_id=s.lottery_id AND e.user_id=s.user_id "
+                "JOIN lotteries l ON l.id=s.lottery_id WHERE s.lottery_id=? AND s.bot_id=? AND s.user_id=?",
+                (lottery_id, bot_id, user_id),
+            ) as cursor:
+                row = await cursor.fetchone()
+            if row:
+                entry, item = json.loads(row[1]), json.loads(row[2])
+                entry["question_index"] = (
+                    row[0] if row[0] is not None else len(entry["answers"])
+                )
+                await self.db.execute(
+                    "DELETE FROM outbox WHERE lottery_id=? AND delivered_at IS NULL "
+                    "AND json_extract(body,'$.kind')='question' AND json_extract(body,'$.entry.user_id')=?",
+                    (lottery_id, user_id),
+                )
+                await self.queue(item, "question", entry=entry)
+
     async def answer(
         self, lottery_id: str, identity: dict, answer: dict, index: int
     ) -> tuple[dict, dict]:
-        """Accept exactly the next private answer and commit success atomically.
+        """Accept the active private question and commit completion atomically.
 
         Args:
             lottery_id: Previously selected activity identifier.
@@ -716,7 +817,24 @@ class Store:
                     raise ValueError("请用报名时的 QQ 号私聊同一个机器人填写。")
                 if item["status"] != "open" or time.time() >= item["close_at"]:
                     raise ValueError("报名截止，未完成的资料不会进入开奖名单。")
-                if entry["status"] != "pending" or index != len(entry["answers"]):
+                async with self.db.execute(
+                    "SELECT question_index,lottery_id FROM sessions WHERE bot_id=? AND user_id=?",
+                    (identity["bot_id"], identity["user_id"]),
+                ) as cursor:
+                    session = await cursor.fetchone()
+                if not session:
+                    raise ValueError("当前回答已暂停，请私聊发送 /抽奖 继续 恢复")
+                expected = (
+                    session[0] if session[0] is not None else len(entry["answers"])
+                )
+                if session[1] != lottery_id:
+                    raise ValueError("已切换到另一场活动，请按最新题目卡片回答")
+                if (
+                    entry["status"] != "pending"
+                    or index != expected
+                    or not 0 <= index < len(item["questions"])
+                    or index > len(entry["answers"])
+                ):
                     raise ValueError("这题已处理，请按最新的问题卡片作答。")
                 question = item["questions"][index]
                 expected_kind = (
@@ -778,7 +896,24 @@ class Store:
                         raise ValueError("答案还不正确，再想一想喵！请重新回答当前题。")
                 if not item.get("require_correct", True):
                     answer["correct"] = None
-                entry["answers"].append(answer)
+                old_image = None
+                if index < len(entry["answers"]):
+                    old = entry["answers"][index]
+                    old_image = (
+                        old["value"] if old["kind"] == "image" else old.get("image")
+                    )
+                    entry["answers"][index] = answer
+                else:
+                    entry["answers"].append(answer)
+                await self.db.execute(
+                    "UPDATE sessions SET question_index=? WHERE bot_id=? AND user_id=? AND lottery_id=?",
+                    (index + 1, identity["bot_id"], identity["user_id"], lottery_id),
+                )
+                await self.db.execute(
+                    "DELETE FROM outbox WHERE lottery_id=? AND delivered_at IS NULL "
+                    "AND json_extract(body,'$.kind')='question' AND json_extract(body,'$.entry.user_id')=?",
+                    (lottery_id, identity["user_id"]),
+                )
                 if len(entry["answers"]) == len(item["questions"]):
                     entry["status"] = "complete"
                     entry["completed_at"] = time.time()
@@ -803,6 +938,11 @@ class Store:
                     ),
                 )
                 await self.db.commit()
+                if old_image and old_image != filename:
+                    with contextlib.suppress(OSError):
+                        (self.directory / "uploads" / Path(old_image).name).unlink(
+                            missing_ok=True
+                        )
                 return item, entry
             except BaseException:
                 await self.db.rollback()
@@ -825,9 +965,26 @@ class Store:
         if not isinstance(payload, dict) or payload.get("action") not in (
             "mark",
             "match",
+            "bulk",
         ):
             raise ValueError("请选择逐题标记或文字答案匹配。")
         action = payload["action"]
+        selected_ids = []
+        if action == "bulk":
+            selected_ids = payload.get("user_ids")
+            correct = payload.get("correct")
+            if (
+                not isinstance(selected_ids, list)
+                or not 1 <= len(selected_ids) <= 100
+                or any(
+                    not isinstance(value, str)
+                    or not re.fullmatch(r"[1-9]\d{4,19}", value)
+                    for value in selected_ids
+                )
+                or not isinstance(correct, bool)
+            ):
+                raise ValueError("请明确选择 1–100 份已提交报名及通过或不通过标记")
+            selected_ids = list(dict.fromkeys(selected_ids))
         if action == "mark":
             user_id = payload.get("user_id")
             index = payload.get("question_index")
@@ -860,10 +1017,28 @@ class Store:
                     )
                 if item.get("require_correct", True):
                     raise ValueError("本场采用当场答对模式，无需后续审核。")
+                if action == "mark":
+                    selected_ids = [user_id]
+                selection = (
+                    " AND user_id IN (" + ",".join("?" for _ in selected_ids) + ")"
+                    if selected_ids
+                    else ""
+                )
                 async with self.db.execute(
-                    "SELECT body FROM entries WHERE lottery_id=?", (lottery_id,)
+                    "SELECT body FROM entries WHERE lottery_id=?" + selection,
+                    (lottery_id, *selected_ids),
                 ) as cursor:
                     entries = [json.loads(row[0]) for row in await cursor.fetchall()]
+                if action == "bulk" and (
+                    len(entries) != len(selected_ids)
+                    or any(
+                        entry["status"] != "complete" or entry["user_id"] in winner_ids
+                        for entry in entries
+                    )
+                ):
+                    raise ValueError(
+                        "所选报名中有未提交、已删除或已中奖者，请刷新列表后重试"
+                    )
                 if action == "mark":
                     entries = [
                         entry for entry in entries if entry["user_id"] == user_id
@@ -878,8 +1053,8 @@ class Store:
                         continue
                     previous = entry.get("review_status", "approved")
                     for question_index, answer in enumerate(entry["answers"]):
-                        if action == "mark":
-                            if question_index != index:
+                        if action in {"mark", "bulk"}:
+                            if action == "mark" and question_index != index:
                                 continue
                             result = correct
                         else:
@@ -1023,6 +1198,8 @@ class Store:
                 {**entry, "channel": "group", "recipient": entry["group_id"]},
                 {**entry, "channel": "private", "recipient": entry["user_id"]},
             ]
+            if kind == "question":
+                targets = targets[1:]
         for target in targets:
             message = {
                 "kind": kind,
@@ -1046,6 +1223,20 @@ class Store:
                 "INSERT INTO outbox (id, lottery_id, body) VALUES (?, ?, ?)",
                 (delivery_id, item["id"], json.dumps(message, ensure_ascii=False)),
             )
+            if kind == "announcement":
+                guide = {
+                    **message,
+                    "kind": "participation_guide",
+                    "depends_on": delivery_id,
+                }
+                await self.db.execute(
+                    "INSERT INTO outbox (id, lottery_id, body) VALUES (?, ?, ?)",
+                    (
+                        secrets.token_hex(16),
+                        item["id"],
+                        json.dumps(guide, ensure_ascii=False),
+                    ),
+                )
 
     async def action(
         self,
@@ -1216,7 +1407,10 @@ class Store:
         """
         async with self.lock:
             async with self.db.execute(
-                "SELECT * FROM outbox WHERE delivered_at IS NULL AND next_at<=? ORDER BY rowid LIMIT 40",
+                "SELECT o.* FROM outbox o WHERE o.delivered_at IS NULL AND o.next_at<=? "
+                "AND (json_extract(o.body,'$.depends_on') IS NULL OR EXISTS "
+                "(SELECT 1 FROM outbox parent WHERE parent.id=json_extract(o.body,'$.depends_on') "
+                "AND parent.delivered_at IS NOT NULL)) ORDER BY o.rowid LIMIT 40",
                 (time.time(),),
             ) as cursor:
                 return [dict(row) for row in await cursor.fetchall()]
@@ -1246,24 +1440,104 @@ class Store:
                     (time.time(), delivery_id),
                 )
 
-    async def manage_entries(self, lottery_id: str) -> dict:
+    async def manage_entries(
+        self,
+        lottery_id: str,
+        *,
+        page: int | None = None,
+        page_size: int = 20,
+        status: str = "all",
+        query: str = "",
+        include_deliveries: bool = True,
+    ) -> dict:
         """Read private forms and per-target delivery state for an authenticated operator.
 
         Args:
             lottery_id: Activity identifier.
+            page: One-based page, or None for an internal full-record read.
+            page_size: Bounded list size, limited to 10, 20, or 50.
+            status: Eligibility filter, including incomplete submissions.
+            query: Literal nickname, QQ, or origin group substring.
+            include_deliveries: Include the latest 200 notification records.
 
         Returns:
             Enrollment and delivery records with correct answers excluded.
         """
+        if page is not None and (
+            isinstance(page, bool)
+            or not isinstance(page, int)
+            or not 1 <= page <= 10000
+        ):
+            raise ValueError("页码必须为 1–10000 的整数")
+        if (
+            isinstance(page_size, bool)
+            or not isinstance(page_size, int)
+            or page_size not in {10, 20, 50}
+        ):
+            raise ValueError("每页支持 10、20 或 50 份报名")
+        if not isinstance(status, str) or status not in {
+            "all",
+            "pending",
+            "approved",
+            "rejected",
+            "incomplete",
+        }:
+            raise ValueError("报名筛选条件无效")
+        if not isinstance(query, str) or len(query) > 80:
+            raise ValueError("搜索内容不能超过 80 字")
+        filters, values = "lottery_id=?", [lottery_id]
+        if status == "incomplete":
+            filters += " AND json_extract(body, '$.status')!='complete'"
+        elif status != "all":
+            filters += " AND json_extract(body, '$.status')='complete' AND coalesce(json_extract(body, '$.review_status'), 'approved')=?"
+            values.append(status)
+        if query.strip():
+            pattern = (
+                "%"
+                + query.strip().replace("!", "!!").replace("%", "!%").replace("_", "!_")
+                + "%"
+            )
+            filters += " AND (user_id LIKE ? ESCAPE '!' OR json_extract(body, '$.nickname') LIKE ? ESCAPE '!' OR json_extract(body, '$.group_id') LIKE ? ESCAPE '!')"
+            values.extend([pattern] * 3)
         async with self.lock:
             async with self.db.execute(
-                "SELECT body FROM entries WHERE lottery_id=? ORDER BY json_extract(body,'$.joined_at')",
+                "SELECT count(*) FROM entries WHERE " + filters, values
+            ) as cursor:
+                total = (await cursor.fetchone())[0]
+            if page is not None:
+                page = min(page, max(1, (total + page_size - 1) // page_size))
+            async with self.db.execute(
+                "SELECT count(*), coalesce(sum(json_extract(body,'$.status')!='complete'),0),"
+                "coalesce(sum(json_extract(body,'$.status')='complete' AND coalesce(json_extract(body,'$.review_status'),'approved')='approved'),0),"
+                "coalesce(sum(json_extract(body,'$.review_status')='pending'),0), coalesce(sum(json_extract(body,'$.review_status')='rejected'),0) FROM entries WHERE lottery_id=?",
                 (lottery_id,),
             ) as cursor:
+                summary = dict(
+                    zip(
+                        ("total", "incomplete", "approved", "pending", "rejected"),
+                        await cursor.fetchone(),
+                    )
+                )
+            async with self.db.execute(
+                "SELECT body FROM entries WHERE "
+                + filters
+                + " ORDER BY json_extract(body,'$.joined_at'), user_id"
+                + (" LIMIT ? OFFSET ?" if page is not None else ""),
+                (*values, page_size, (page - 1) * page_size)
+                if page is not None
+                else values,
+            ) as cursor:
                 entries = [json.loads(row[0]) for row in await cursor.fetchall()]
+            if page is not None:
+                for entry in entries:
+                    entry["answer_count"] = len(entry["answers"])
+                    entry["marked_count"] = sum(
+                        answer.get("correct") is not None for answer in entry["answers"]
+                    )
+                    entry.pop("answers")
             async with self.db.execute(
                 "SELECT id, body, attempts, next_at, delivered_at, error FROM outbox WHERE lottery_id=? ORDER BY rowid DESC LIMIT 200",
-                (lottery_id,),
+                (lottery_id,) if include_deliveries else ("",),
             ) as cursor:
                 deliveries = []
                 for row in await cursor.fetchall():
@@ -1279,7 +1553,14 @@ class Store:
                             "error": row[5],
                         }
                     )
-        return {"entries": entries, "deliveries": deliveries}
+        return {
+            "entries": entries,
+            "deliveries": deliveries,
+            "summary": summary,
+            "total": total,
+            "page": page,
+            "page_size": page_size,
+        }
 
     async def delete(self, lottery_id: str) -> None:
         """Delete a finished activity and its private attachments.

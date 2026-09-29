@@ -94,6 +94,7 @@ async def plugin(tmp_path):
     )
     instance = CatLottery(context)
     instance.store = Store(tmp_path)
+    instance.avatars.get = AsyncMock(return_value=None)
     await instance.store.open()
     yield instance
     await instance.terminate()
@@ -549,7 +550,7 @@ async def test_due_draw_recovery_not_blocked_by_slow_delivery(plugin, rules):
             await task
 
 
-def web_request(payload=None, username="operator", *, uploaded=None):
+def web_request(payload=None, username="operator", *, uploaded=None, query=""):
     """Bind real framework request objects without running a public HTTP server.
 
     Args:
@@ -583,7 +584,7 @@ def web_request(payload=None, username="operator", *, uploaded=None):
         "method": "POST",
         "path": "/test",
         "headers": headers,
-        "query_string": b"",
+        "query_string": query.encode(),
         "server": ("localhost", 6185),
         "scheme": "http",
     }
@@ -602,9 +603,148 @@ async def test_all_management_endpoints_deny_unauthenticated_access(plugin):
         (plugin.web_action, ("12345678",)),
         (plugin.web_review, ("12345678",)),
         (plugin.web_image, ("a" * 32 + ".jpg",)),
+        (plugin.web_entries, ("12345678",)),
+        (plugin.web_entry, ("12345678", "4444444")),
+        (plugin.web_avatar, ("4444444",)),
+        (plugin.web_clear_avatars, ()),
     ):
         with web_request(username=None):
             assert (await handler(*args)).status_code == 403
+
+
+async def test_real_request_query_pagination_single_entry_and_private_image_preview(
+    plugin, rules
+):
+    rules.update(
+        require_correct=False, questions=[{"kind": "mixed", "prompt": "图片与文字"}]
+    )
+    item = await plugin.store.save(rules, "admin")
+    filename = "a" * 32 + ".jpg"
+    with PillowImage.new("RGB", (1500, 1200), "pink") as picture:
+        picture.save(plugin.store.directory / "uploads" / filename)
+    for index in range(25):
+        identity = {
+            **plugin.identity(event(plugin)),
+            "user_id": str(4444444 + index),
+            "nickname": f"猫猫 {index}",
+        }
+        await plugin.store.enroll(item["id"], identity)
+        await plugin.store.answer(
+            item["id"],
+            {**identity, "group_id": ""},
+            {"kind": "mixed", "value": "  private  text\n", "image": filename},
+            0,
+        )
+    with web_request(query="page=2&page_size=10&status=pending"):
+        response = await plugin.web_entries(item["id"])
+        data = json.loads(response.body)
+        assert (
+            response.status_code == 200
+            and data["page"] == 2
+            and len(data["entries"]) == 10
+        )
+        assert "private  text" not in response.body.decode()
+    with web_request(query="q=4444444"):
+        data = json.loads((await plugin.web_entries(item["id"])).body)
+        assert data["total"] == 1
+    with web_request(query="page=wrong"):
+        assert (await plugin.web_entries(item["id"])).status_code == 400
+    with web_request():
+        response = await plugin.web_entry(item["id"], "4444444")
+        assert (
+            json.loads(response.body)["entry"]["answers"][0]["value"]
+            == "  private  text\n"
+        )
+        assert response.headers["cache-control"] == "no-store"
+    with web_request(query="preview=1"):
+        response = await plugin.web_image(filename)
+        picture = base64.b64decode(
+            json.loads(response.body)["preview"].split(",", 1)[1]
+        )
+        with PillowImage.open(BytesIO(picture)) as image:
+            assert image.format == "JPEG" and max(image.size) == 1000
+        assert response.headers["cache-control"] == "no-store"
+
+
+async def test_group_join_starts_private_question_and_navigation_needs_no_activity_id(
+    plugin, rules, monkeypatch
+):
+    rules.update(
+        require_correct=False,
+        questions=[{"kind": "text", "prompt": f"问题 {index}"} for index in range(3)],
+    )
+    item = await plugin.store.save(rules, "admin")
+    cards = []
+
+    async def card(destination, title, sections, *args):
+        cards.append((title, sections))
+
+    monkeypatch.setattr(plugin, "card", card)
+    await plugin.join(event(plugin), item["id"])
+    assert await plugin.store.private_session("1234567", "4444444") == item["id"]
+    deliveries = await plugin.store.deliveries()
+    assert (
+        len(deliveries) == 1
+        and json.loads(deliveries[0]["body"])["target"]["channel"] == "private"
+    )
+    monkeypatch.setattr(
+        "astrbot_plugin_catlottery.main.render_pages", lambda *args: [b"image"]
+    )
+    await plugin.send_deliveries()
+    client = plugin.context.get_platform_inst("napcat").client
+    assert client.calls[-1][0] == "send_private_msg"
+    assert client.calls[-1][1]["user_id"] == 4444444
+    await plugin.collect_private(event(plugin, group="", text="  answer  one  "))
+    await plugin.lottery_command(event(plugin, group="", text="/抽奖 上一题"))
+    assert cards[-1][0] == "第 1 / 3 题"
+    assert "/抽奖 上一题" not in str(cards[-1][1]) and "/抽奖 下一题" in str(
+        cards[-1][1]
+    )
+    await plugin.lottery_command(event(plugin, group="", text="/抽奖 下一题"))
+    assert cards[-1][0] == "第 2 / 3 题"
+    assert "/抽奖 下一题" not in str(cards[-1][1])
+    await plugin.lottery_command(event(plugin, group="", text="/抽奖 取消回答"))
+    assert await plugin.store.private_session("1234567", "4444444") is None
+    await plugin.lottery_command(event(plugin, group="", text="/抽奖 继续"))
+    assert cards[-1][0] == "第 2 / 3 题"
+    assert "填写 编号" not in str(cards)
+
+
+async def test_announcement_text_is_a_separate_onebot_send_and_retry_does_not_repeat_images(
+    plugin, rules, monkeypatch
+):
+    item = await plugin.store.save(rules, "admin")
+    await plugin.store.action(item["id"], "publish")
+    monkeypatch.setattr(
+        "astrbot_plugin_catlottery.main.render_announcement", lambda *args: [b"image"]
+    )
+    await plugin.send_deliveries()
+    for platform in plugin.context.platform_manager.platform_insts:
+        assert len(platform.client.calls) == 1
+        assert platform.client.calls[0][1]["message"][0]["type"] == "image"
+    client = plugin.context.get_platform_inst("napcat").client
+    original = client.call_action
+    failed = False
+
+    async def transport(action, **parameters):
+        nonlocal failed
+        if parameters["message"][0]["type"] == "text" and not failed:
+            failed = True
+            raise ConnectionError("Text failed")
+        return await original(action, **parameters)
+
+    monkeypatch.setattr(client, "call_action", transport)
+    await plugin.send_deliveries()
+    with web_request({"action": "retry", "confirmed": True}):
+        assert (await plugin.web_action(item["id"])).status_code == 200
+    await plugin.send_deliveries()
+    assert [params["message"][0]["type"] for _, params in client.calls] == [
+        "image",
+        "text",
+    ]
+    text = client.calls[-1][1]["message"][0]["data"]["text"]
+    assert f"/抽奖 参与 {item['id']}" in text
+    assert client.calls[-1][1]["group_id"] == 2222222
 
 
 async def test_web_malformed_shapes_and_irreversible_confirmation(plugin, rules):
@@ -695,7 +835,7 @@ async def test_lifecycle_registers_only_owned_routes_and_stops_tasks(plugin, tmp
     instance = CatLottery(context)
     instance.store = Store(tmp_path / "lifecycle")
     await instance.initialize()
-    assert len(context.registered_web_apis) == 11
+    assert len(context.registered_web_apis) == 15
     tasks = (instance.worker, instance.sender)
     await instance.terminate()
     assert all(task.done() for task in tasks)

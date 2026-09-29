@@ -2,8 +2,54 @@
 
 from io import BytesIO
 
-from astrbot_plugin_catlottery.cards import render, render_pages
-from PIL import Image
+from astrbot_plugin_catlottery.cards import (
+    FONT_PATH,
+    render,
+    render_announcement,
+    render_pages,
+    wrap,
+)
+from PIL import Image, ImageFont
+
+
+def test_landscape_pages_bound_long_copy_and_preserve_all_award_images(tmp_path):
+    import time
+
+    filename = "a" * 32 + ".jpg"
+    with Image.new("RGB", (320, 240), "#e62080") as picture:
+        picture.save(tmp_path / filename)
+    item = {
+        "id": "a1234567",
+        "title": "很长的活动名称" * 13,
+        "description": "说明" * 750,
+        "prize_tiers": [
+            {
+                "name": f"第 {index + 1} 项",
+                "prize": "很长奖品" * 75,
+                "count": 1,
+                "image": filename,
+            }
+            for index in range(10)
+        ],
+        "winner_count": 10,
+        "cover": filename,
+        "questions": [],
+        "close_at": time.time() + 3600,
+        "draw_at": time.time() + 7200,
+    }
+    pages = render_announcement(item, tmp_path)
+    assert len(pages) == 4
+    for png in pages:
+        with Image.open(BytesIO(png)) as picture:
+            assert picture.size == (1280, 860)
+            assert picture.getpixel((1140, 125))[0] > 200
+            assert picture.getpixel((1140, 125))[1] < 100
+    font = ImageFont.truetype(str(FONT_PATH), 24)
+    lines = wrap(
+        "一二三四五六七八九。", font, int(font.getlength("一二三四五六七八九"))
+    )
+    assert "".join(lines) == "一二三四五六七八九。"
+    assert all(not line.startswith("。") for line in lines)
 
 
 def test_chinese_help_and_long_titles_render_without_browser():
@@ -16,6 +62,18 @@ def test_chinese_help_and_long_titles_render_without_browser():
         assert image.format == "PNG"
         assert image.width == 860
         assert image.height > 800
+
+
+def test_enrollment_receipt_uses_the_selected_qq_avatar(tmp_path):
+    path = tmp_path / "4444444.jpg"
+    with Image.new("RGB", (160, 160), "#247abd") as avatar:
+        avatar.save(path)
+    pages = render_pages(
+        "参与成功", "QQ 4444444", [("报名确认", "报名已保存")], avatar_path=path
+    )
+    with Image.open(BytesIO(pages[0])) as image:
+        color = image.getpixel((740, 115))
+        assert color[2] > 150 and color[0] < 70
 
 
 def test_large_winner_list_is_paginated_into_readable_images():
