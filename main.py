@@ -1624,18 +1624,18 @@ class CatLottery(Star):
                         ],
                     }
                     if kind == "participation_guide":
-                        guide = f"【{item['title']}】\n在本群发送以下指令报名：\n/抽奖 参与 {item['id']}"
+                        guide = f"【喵喵抽奖】{item['title']}\n✅ 参与抽奖请发送：/抽奖 参与 {item['id']}"
                         guide += (
-                            f"\n报名后机器人会私聊发送题目，直接按题回答，共 {len(item['questions'])} 题\n未收到题目时，先添加机器人为好友，私聊发送 /抽奖 继续\n"
+                            f"\n✨ 报名后我会私聊发送题目，请按题回答，共 {len(item['questions'])} 题\n未收到题目时，先添加机器人为好友，私聊发送 /抽奖 继续\n"
                             + (
                                 "完成全部题目后获得资格"
                                 if item.get("require_correct", True)
                                 else "完成全部题目后等待管理员审核，通过后获得资格"
                             )
                             if item["questions"]
-                            else "\n无需填写资料，群内报名即可参与"
+                            else "\n✨ 无需填写资料，群内报名即可参与"
                         )
-                        guide += f"\n报名截止：{date_text(item['close_at'])}（北京时间）\n活动详情：/抽奖 详情 {item['id']}"
+                        guide += f"\n-------\n报名截止：{date_text(item['close_at'])}（北京时间）\n活动详情：/抽奖 详情 {item['id']}"
                         guide += f"\n成功参与 {live['approved']} 人 · 待审核 {live['pending']} 人"
                         parameters["message"] = [
                             {"type": "text", "data": {"text": guide}}
