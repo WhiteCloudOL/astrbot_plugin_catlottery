@@ -1,0 +1,20 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="light" />
+    <title>喵喵抽奖 · 管理工作台</title>
+    <link rel="icon" href="./assets/cat.png" type="image/png" />
+    <link rel="stylesheet" href="./style.css" />
+  </head>
+  <body>
+    <template id="cat-template"><img src="./assets/cat.png" alt="" /></template>
+    <div id="app" aria-busy="true">
+      <div class="boot"><img src="./assets/cat.png" alt="" /><h1>喵喵抽奖</h1><p>正在打开你的好运工作台…</p></div>
+    </div>
+    <div id="overlay-root"></div>
+    <div id="toast-root" aria-live="polite" aria-atomic="false"></div>
+    <script type="module" src="./app.js"></script>
+  </body>
+</html>
