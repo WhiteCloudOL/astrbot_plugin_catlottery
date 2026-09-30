@@ -22,7 +22,7 @@ import aiohttp
 from aiocqhttp.exceptions import ActionFailed
 from aiocqhttp.exceptions import Error as OneBotError
 from astrbot.api.event import AstrMessageEvent, MessageChain, filter
-from astrbot.api.message_components import Image, Plain
+from astrbot.api.message_components import Image, Plain, Reply
 from astrbot.api.star import Context, Star
 from astrbot.api.web import error_response, file_response, json_response, request
 from astrbot.core.platform.message_type import MessageType
@@ -65,7 +65,7 @@ HELP = [
     ),
     (
         "私聊 · 补充报名资料",
-        "请先添加我为好友，再私聊回答\n作答模式持续 30 分钟，到期用 /抽奖 继续 恢复\n首条回答后收集 5 秒，可补充文字和多张图片\n等我确认保存并发送下一题后，再回答下一题\n/抽奖 上一题 · 查看并修改上一题答案\n/抽奖 下一题 · 前往已回答题的下一题\n/抽奖 取消回答 · 暂停并保留已保存资料\n/抽奖 继续 · 恢复回答\n/抽奖 待办 · 查看并切换多场待办\n/抽奖 回答 内容 · 可附图片，保留空格与换行",
+        "请先添加我为好友，再私聊回答\n作答模式持续 30 分钟，到期用 /抽奖 继续 恢复\n直接发送答案，等 5 秒后自动提交，无需确认指令\n这 5 秒内可补充文字和图片，等下一题发出后再回答\n回答指令示例（请把示例文字换成自己的答案）\n/抽奖 回答 我喜欢猫猫\n图片可直接发、附在回答指令后，或引用自己发过的图片\n/抽奖 上一题 · 查看并修改上一题答案\n/抽奖 下一题 · 前往已回答题的下一题\n/抽奖 取消回答 · 暂停并保留已保存资料\n/抽奖 继续 · 恢复回答\n/抽奖 待办 · 查看并切换多场待办",
     ),
     (
         "管理员 · 管理抽奖",
@@ -112,8 +112,16 @@ def question_sections(
     if item.get("require_correct", True) and question["kind"] == "quiz":
         instruction += "\n答题当场核对，答错需重答当前题"
     elif not item.get("require_correct", True):
-        instruction += "\n回答后直接进入下一题，提交全部资料后等待管理员审核"
-    instruction += "\n直接回复或引用题目回复即可，均提交到当前题\n首条回答后收集 5 秒，期间可补充文字和图片\n结束后确认保存再发下一题，图片分别保留\n保留空格与换行；以斜杠开头的文本用 /抽奖 回答 内容 提交"
+        instruction += "\n全部题目提交后，等待管理员审核"
+    instruction += (
+        "\n直接发送答案，或引用题目回复，都会答到当前题"
+        "\n发送后等 5 秒自动提交，无需再发开始、确认或提交指令"
+        "\n这 5 秒内可补充文字和图片，我保存后会发送下一题"
+        "\n回答指令示例（请把示例文字换成自己的答案）"
+        "\n/抽奖 回答 我喜欢猫猫"
+        "\n图片可附在 /抽奖 回答 后，或引用自己发过的图片"
+        "\n空格与换行原样保留，多张图片分别保存"
+    )
     navigation = []
     if index > 0:
         navigation.append("/抽奖 上一题")
@@ -1092,6 +1100,21 @@ class CatLottery(Star):
             parts = re.match(r"(\S+)(?:\s([\s\S]*))?", text.lstrip())
             command = parts.group(1) if parts else "帮助"
             argument = (parts.group(2) or "") if parts else ""
+            if (
+                not parts
+                and not identity["group_id"]
+                and any(
+                    isinstance(part, Image)
+                    or isinstance(part, Reply)
+                    and str(part.sender_id) == identity["user_id"]
+                    and any(
+                        isinstance(attachment, Image)
+                        for attachment in (part.chain or [])
+                    )
+                    for part in event.get_messages()
+                )
+            ):
+                command = "回答"
             if command != "回答":
                 argument = argument.strip()
             if command in {"帮助", "help"}:
@@ -1243,7 +1266,28 @@ class CatLottery(Star):
                     )
                     is None
                 ):
-                    raise ValueError("请私聊发送 /抽奖 继续 恢复已有的群报名资料")
+                    pending = []
+                    for candidate in await self.store.snapshot():
+                        entry = await self.store.entry(
+                            candidate["id"], identity["user_id"]
+                        )
+                        if (
+                            entry
+                            and entry["bot_id"] == identity["bot_id"]
+                            and entry["platform_id"] == identity["platform_id"]
+                            and entry["status"] == "pending"
+                            and candidate["phase"] == "open"
+                        ):
+                            pending.append(candidate["id"])
+                    if len(pending) != 1:
+                        raise ValueError(
+                            "有多场待填写活动，请发送 /抽奖 待办 选择活动"
+                            if pending
+                            else "没有待填写的群报名，请先在活动群内参与"
+                        )
+                    await self.store.private_session(
+                        identity["bot_id"], identity["user_id"], pending[0]
+                    )
                 await self.collect_private(event, content=argument)
             elif command == "创建":
                 await self.check_manager(identity)
@@ -1602,6 +1646,21 @@ class CatLottery(Star):
                 )
                 return
             if submission is None:
+                # Only the sender's quoted images are answers; quoted bot question cards are ignored.
+                for part in event.get_messages():
+                    if (
+                        isinstance(part, Reply)
+                        and str(part.sender_id) == identity["user_id"]
+                    ):
+                        images.extend(
+                            attachment
+                            for attachment in (part.chain or [])
+                            if isinstance(attachment, Image)
+                        )
+                if not text.strip() and not images:
+                    raise ValueError(
+                        "请直接发送答案文字或图片\n引用图片时请引用自己发送的图片，或重新附图发送"
+                    )
                 if message_id:
                     self.private_receipts[receipt_key] = now
                 window = self.private_windows.get(scope)
@@ -1691,7 +1750,7 @@ class CatLottery(Star):
                             MessageChain(
                                 [
                                     Plain(
-                                        "已进入 5 秒答题收集窗口，可继续补充文字和图片；结束后我会确认保存，再发送下一题"
+                                        "已收到答案，接下来 5 秒可继续补充文字和图片；窗口结束自动提交，无需再发确认或提交指令"
                                     )
                                 ]
                             )

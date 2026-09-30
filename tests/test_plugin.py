@@ -595,8 +595,9 @@ async def test_rapid_concurrent_answers_wait_for_the_next_question_card(
     assert second.is_stopped()
 
 
+@pytest.mark.parametrize("method", ["plain", "command", "quoted_photo"])
 async def test_collection_timer_sends_confirmation_before_next_image(
-    plugin, rules, monkeypatch
+    plugin, rules, monkeypatch, method
 ):
     rules["questions"] = [
         {"kind": "text", "prompt": "第一题"},
@@ -604,14 +605,34 @@ async def test_collection_timer_sends_confirmation_before_next_image(
     ]
     item = await plugin.store.save(rules, "admin")
     await plugin.store.enroll(item["id"], plugin.identity(event(plugin)))
-    current = event(plugin, group="", text="  原样答案  ")
+    text = "  原样答案  " if method == "plain" else "/抽奖 回答   原样答案  "
+    components = [Plain(text)]
+    if method == "quoted_photo":
+        data = BytesIO()
+        with PillowImage.new("RGB", (20, 30), "pink") as photo:
+            photo.save(data, "PNG")
+        components.insert(
+            0,
+            Reply(
+                id="own-photo",
+                sender_id="4444444",
+                chain=[Plain("不应保存的图片说明"), Image.fromBytes(data.getvalue())],
+            ),
+        )
+    current = event(plugin, group="", text=text, components=components)
     current.message_obj.message_id = "timer"
     current.send = AsyncMock()
     monkeypatch.setattr(plugin_module, "render_pages", lambda *a, **k: [b"image"])
     start = time.monotonic()
-    await plugin.collect_private(current)
+    await (
+        plugin.collect_private(current)
+        if method == "plain"
+        else plugin.lottery_command(current)
+    )
     window = next(iter(plugin.private_windows.values()))
     assert "5 秒" in current.send.call_args.args[0].chain[0].text
+    assert "自动提交" in current.send.call_args.args[0].chain[0].text
+    assert "无需再发" in current.send.call_args.args[0].chain[0].text
     assert not (await plugin.store.entry(item["id"], "4444444"))["answers"]
     await asyncio.wait_for(window["task"], 8)
     assert time.monotonic() - start >= 4.9
@@ -619,6 +640,9 @@ async def test_collection_timer_sends_confirmation_before_next_image(
     assert "答案已保存" in messages[1][0].text
     assert isinstance(messages[2][0], Image)
     assert not plugin.private_windows
+    answer = (await plugin.store.entry(item["id"], "4444444"))["answers"][0]
+    assert answer["value"] == "  原样答案  "
+    assert bool(answer.get("image")) is (method == "quoted_photo")
 
 
 @pytest.mark.parametrize("kind", ["text", "mixed", "image"])
@@ -779,6 +803,206 @@ async def test_quoted_answer_ignores_reference_and_echoes_only_actual_own_answer
     assert "不应读取" not in str(captured) and "错误引用" not in str(captured)
     assert "30 分钟" in str(captured)
     chat.assert_not_awaited()
+
+
+@pytest.mark.parametrize("command", ["", "/抽奖 回答", "/抽奖"])
+@pytest.mark.parametrize("direct_duplicate", [False, True])
+async def test_own_quoted_photos_are_answers_without_quoted_caption_or_duplicates(
+    plugin, rules, dispatch, monkeypatch, command, direct_duplicate
+):
+    rules.update(
+        require_correct=False,
+        questions=[
+            {"kind": "image", "prompt": "自己的照片"},
+            {"kind": "text", "prompt": "下一题"},
+        ],
+    )
+    item = await plugin.store.save(rules, "admin")
+    await plugin.store.enroll(item["id"], plugin.identity(event(plugin)))
+    photos = []
+    for color in ("pink", "blue"):
+        data = BytesIO()
+        with PillowImage.new("RGB", (20, 30), color) as photo:
+            photo.save(data, "PNG")
+        photos.append(Image.fromBytes(data.getvalue()))
+    captured = []
+    monkeypatch.setattr(
+        plugin_module,
+        "render_pages",
+        lambda title, subtitle, sections, *a, **k: (
+            captured.append(sections) or [b"image"]
+        ),
+    )
+    current = event(
+        plugin,
+        group="",
+        text=command,
+        components=[
+            Reply(
+                id="own-photo",
+                sender_id=4444444,
+                chain=[Plain("旧消息说明不能作为本题答案"), *photos],
+            ),
+            Plain(command),
+            *([photos[0]] if direct_duplicate else []),
+        ],
+    )
+    current.message_obj.message_id = "quote-photo"
+    run, chat = dispatch
+    await run(current)
+    assert not (await plugin.store.entry(item["id"], "4444444"))["answers"]
+    assert len(next(iter(plugin.private_windows.values()))["images"]) == 2
+    await flush_window(plugin)
+    answer = (await plugin.store.entry(item["id"], "4444444"))["answers"][0]
+    assert answer.get("text", "") == ""
+    assert len(answer["images"]) == 2
+    assert len(list((plugin.store.directory / "uploads").glob("*.jpg"))) == 2
+    assert "旧消息说明" not in str(captured)
+    assert [section[2].name for section in captured[-1] if len(section) == 3] == answer[
+        "images"
+    ]
+    assert await plugin.store.form_position("1234567", "4444444") == 1
+    chat.assert_not_awaited()
+
+
+@pytest.mark.parametrize("sender", ["1234567", "5555555", None, "4444444"])
+async def test_unavailable_or_other_sender_quoted_images_do_not_advance(
+    plugin, rules, monkeypatch, sender
+):
+    rules["questions"] = [{"kind": "image", "prompt": "图片资料"}]
+    item = await plugin.store.save(rules, "admin")
+    await plugin.store.enroll(item["id"], plugin.identity(event(plugin)))
+    monkeypatch.setattr(plugin, "read_submission_image", AsyncMock())
+    monkeypatch.setattr(plugin, "card", AsyncMock())
+    current = event(
+        plugin,
+        group="",
+        text="/抽奖 回答",
+        components=[
+            Reply(
+                id="question-or-unavailable",
+                sender_id=sender,
+                chain=None if sender == "4444444" else [Image(file="file:///not-read")],
+            ),
+            Plain("/抽奖 回答"),
+        ],
+    )
+    await plugin.lottery_command(current)
+    assert not plugin.private_windows
+    plugin.read_submission_image.assert_not_awaited()
+    assert not (await plugin.store.entry(item["id"], "4444444"))["answers"]
+    assert "自己发送的图片" in str(plugin.card.await_args)
+    assert current.is_stopped()
+
+
+@pytest.mark.parametrize("expired", [False, True])
+async def test_explicit_answer_resumes_one_pending_form_without_extra_command(
+    plugin, rules, monkeypatch, expired
+):
+    rules.update(
+        require_correct=False,
+        questions=[
+            {"kind": "text", "prompt": "已填写"},
+            {"kind": "text", "prompt": "未填写"},
+        ],
+    )
+    item = await plugin.store.save(rules, "admin")
+    identity = plugin.identity(event(plugin))
+    await plugin.store.enroll(item["id"], identity)
+    await plugin.store.answer(
+        item["id"],
+        {**identity, "group_id": ""},
+        {"kind": "text", "value": "已有答案"},
+        0,
+    )
+    if expired:
+        await plugin.store.db.execute(
+            "UPDATE sessions SET expires_at=?", (time.time() - 1,)
+        )
+    else:
+        await plugin.store.private_session("1234567", "4444444", "")
+    current = event(plugin, group="", text="/抽奖 回答 我的新答案")
+    current.message_obj.message_id = "resume-answer"
+    monkeypatch.setattr(plugin_module, "render_pages", lambda *a, **k: [b"image"])
+    await plugin.lottery_command(current)
+    window = next(iter(plugin.private_windows.values()))
+    assert window["index"] == 1 and window["lottery_id"] == item["id"]
+    assert time.time() + 1790 < window["mode_expires_at"] <= time.time() + 1800
+    notices = [json.loads(row["body"]) for row in await plugin.store.deliveries()]
+    assert all(notice["kind"] != "form_timeout" for notice in notices)
+    await flush_window(plugin)
+    assert [
+        answer["value"]
+        for answer in (await plugin.store.entry(item["id"], "4444444"))["answers"]
+    ] == ["已有答案", "我的新答案"]
+
+
+@pytest.mark.parametrize(
+    "case", ["none", "other_user", "other_platform", "closed", "complete", "multiple"]
+)
+async def test_answer_command_never_creates_private_enrollment_or_guesses_form(
+    plugin, rules, monkeypatch, case
+):
+    rules["questions"] = [{"kind": "text", "prompt": "资料"}]
+    item = await plugin.store.save(rules, "admin")
+    if case != "none":
+        identity = plugin.identity(
+            event(
+                plugin,
+                user="5555555" if case == "other_user" else "4444444",
+                platform="snowluma" if case == "other_platform" else "napcat",
+                group="3333333" if case == "other_platform" else "2222222",
+            )
+        )
+        await plugin.store.enroll(item["id"], identity)
+        if case == "closed":
+            await plugin.store.action(item["id"], "close")
+        elif case == "complete":
+            await plugin.store.answer(
+                item["id"],
+                {**identity, "group_id": ""},
+                {"kind": "text", "value": "原答案"},
+                0,
+            )
+        elif case == "multiple":
+            second = await plugin.store.save(rules, "admin")
+            await plugin.store.enroll(second["id"], identity)
+        await plugin.store.private_session(identity["bot_id"], identity["user_id"], "")
+    before = [
+        await plugin.store.entry(item["id"], user) for user in ("4444444", "5555555")
+    ]
+    monkeypatch.setattr(plugin, "card", AsyncMock())
+    current = event(plugin, group="", text="/抽奖 回答 不应保存")
+    await plugin.lottery_command(current)
+    assert [
+        await plugin.store.entry(item["id"], user) for user in ("4444444", "5555555")
+    ] == before
+    assert not plugin.private_windows
+    assert await plugin.store.private_session("1234567", "4444444") is None
+    assert (
+        "待办" in str(plugin.card.await_args)
+        if case == "multiple"
+        else "群报名" in str(plugin.card.await_args)
+    )
+
+
+@pytest.mark.parametrize("group", ["", "2222222"])
+@pytest.mark.parametrize("command", ["/抽奖", "/抽奖 帮助"])
+async def test_explicit_help_and_group_root_photo_do_not_start_answers(
+    plugin, rules, monkeypatch, group, command
+):
+    rules["questions"] = [{"kind": "text", "prompt": "资料"}]
+    item = await plugin.store.save(rules, "admin")
+    await plugin.store.enroll(item["id"], plugin.identity(event(plugin)))
+    monkeypatch.setattr(plugin, "card", AsyncMock())
+    components = [Plain(command)]
+    if group or command != "/抽奖":
+        components.append(Image(file="file:///not-read"))
+    current = event(plugin, group=group, text=command, components=components)
+    await plugin.lottery_command(current)
+    assert "使用帮助" in str(plugin.card.await_args)
+    assert not plugin.private_windows
+    assert not (await plugin.store.entry(item["id"], "4444444"))["answers"]
 
 
 async def test_expiry_reminder_is_private_and_resume_revokes_old_reminder(
