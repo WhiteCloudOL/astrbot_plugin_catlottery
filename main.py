@@ -6,11 +6,13 @@ import asyncio
 import base64
 import binascii
 import contextlib
+import hashlib
 import json
 import re
 import secrets
 import sqlite3
 import time
+from collections import OrderedDict
 from functools import wraps
 from io import BytesIO
 from pathlib import Path
@@ -32,7 +34,14 @@ from PIL import ImageOps, UnidentifiedImageError
 
 from .avatars import AvatarCache
 from .cards import FONT_PATH, LOGO_PATH, CardSection, render_announcement, render_pages
-from .storage import Store, date_text, form_progress, prize_tiers, validate_lottery
+from .storage import (
+    Store,
+    answer_images,
+    date_text,
+    form_progress,
+    prize_tiers,
+    validate_lottery,
+)
 
 PLUGIN_NAME = "astrbot_plugin_catlottery"
 TOOL_NAMES = (
@@ -53,7 +62,7 @@ HELP = [
     ),
     (
         "私聊 · 补充报名资料",
-        "请先添加我为好友，再私聊回答\n群聊报名后，我会私聊发题，直接回答即可\n/抽奖 上一题 · 返回已回答的上一题\n/抽奖 下一题 · 前往已回答题的下一题\n/抽奖 取消回答 · 暂停并保留资料\n/抽奖 继续 · 恢复回答\n/抽奖 待办 · 查看并切换多场待办\n/抽奖 回答 内容 · 可附图片，保留空格与换行",
+        "请先添加我为好友，再私聊回答\n作答模式持续 20 分钟，到期用 /抽奖 继续 恢复\n首条回答后收集 5 秒，可补充文字和多张图片\n等我确认保存并发送下一题后，再回答下一题\n/抽奖 上一题 · 查看并修改上一题答案\n/抽奖 下一题 · 前往已回答题的下一题\n/抽奖 取消回答 · 暂停并保留已保存资料\n/抽奖 继续 · 恢复回答\n/抽奖 待办 · 查看并切换多场待办\n/抽奖 回答 内容 · 可附图片，保留空格与换行",
     ),
     (
         "管理员 · 管理抽奖",
@@ -69,13 +78,16 @@ NETWORK_ERRORS = (
 )
 
 
-def question_sections(item: dict, entry: dict, index: int) -> list[CardSection]:
+def question_sections(
+    item: dict, entry: dict, index: int, directory: Path | None = None
+) -> list[CardSection]:
     """Compose a private question with only available navigation commands.
 
     Args:
         item: Activity rules with public question prompts.
         entry: Sender's reservation and saved progress.
         index: Current zero-based question cursor.
+        directory: Private uploads directory for the sender's own previous attachment.
 
     Returns:
         Question, input instructions, navigation, and deadline blocks.
@@ -87,10 +99,10 @@ def question_sections(item: dict, entry: dict, index: int) -> list[CardSection]:
             f"{chr(65 + n)} · {option}" for n, option in enumerate(question["options"])
         )
     instruction = {
-        "image": "发送一张图片（不超过 8 MB），可附带文字",
-        "mixed": "在同一条消息中发送 1–1000 字文字和一张图片（不超过 8 MB），两者都必填",
-        "text": "发送 1–1000 字文本，可在同一条消息中附带一张图片",
-        "quiz": "发送文本答案（1–1000 字），可附带一张图片",
+        "image": "发送图片，可附带文字；每题最多 9 张，每张不超过 8 MB",
+        "mixed": "发送 1–1000 字文字和图片，两者都必填\n每题最多 9 张图片，每张不超过 8 MB",
+        "text": "发送 1–1000 字文本，可附带最多 9 张图片，每张不超过 8 MB",
+        "quiz": "发送文本答案（1–1000 字），可附带最多 9 张图片",
     }[question["kind"]]
     if question["options"]:
         instruction = "发送选项字母、数字序号或完整选项文本"
@@ -98,7 +110,7 @@ def question_sections(item: dict, entry: dict, index: int) -> list[CardSection]:
         instruction += "\n答题当场核对，答错需重答当前题"
     elif not item.get("require_correct", True):
         instruction += "\n回答后直接进入下一题，提交全部资料后等待管理员审核"
-    instruction += "\n保留空格与换行；以斜杠开头的文本用 /抽奖 回答 内容 提交"
+    instruction += "\n直接回复或引用题目回复即可，均提交到当前题\n首条回答后收集 5 秒，期间可补充文字和图片\n结束后确认保存再发下一题，图片分别保留\n保留空格与换行；以斜杠开头的文本用 /抽奖 回答 内容 提交"
     navigation = []
     if index > 0:
         navigation.append("/抽奖 上一题")
@@ -112,7 +124,7 @@ def question_sections(item: dict, entry: dict, index: int) -> list[CardSection]:
         and entry["answers"][index]["kind"] != "deleted"
     ):
         instruction += "\n这题已有回答，重新发送会替换原答案"
-    return [
+    sections: list[CardSection] = [
         ("当前问题", prompt),
         ("如何回答", instruction),
         ("题目操作", "   ·   ".join(navigation)),
@@ -121,6 +133,52 @@ def question_sections(item: dict, entry: dict, index: int) -> list[CardSection]:
             date_text(item["close_at"]) + "\n未完成或审核未通过的报名不参与开奖",
         ),
     ]
+    if entry.get("mode_expires_at"):
+        sections.insert(
+            2,
+            (
+                "抽奖作答模式 · 20 分钟",
+                f"本轮至 {date_text(entry['mode_expires_at'])}（北京时间）\n到期保留答案并退出，私聊发送 /抽奖 继续 可恢复",
+            ),
+        )
+    previous = (
+        index
+        if index < len(entry.get("answers", []))
+        and entry["answers"][index]["kind"] != "deleted"
+        else entry.get("last_answer_index", index - 1)
+    )
+    if 0 <= previous <= index and previous < len(entry.get("answers", [])):
+        answer = entry["answers"][previous]
+        if answer.get("kind") != "deleted":
+            text = (
+                answer.get("text", "")
+                if answer["kind"] == "image"
+                else answer.get("value", "")
+            )
+            images = answer_images(answer)
+            label = (
+                f"本题已保存的回答 · 第 {previous + 1} 题"
+                if previous == index
+                else f"上次回答 · 第 {previous + 1} 题"
+            )
+            text += (
+                "\n重新发送可替换本题答案"
+                if previous == index
+                else "\n可用 /抽奖 上一题 返回查看并修改"
+            )
+            if images and directory is not None:
+                for offset, filename in enumerate(images):
+                    sections.insert(
+                        1 + offset,
+                        (
+                            label if offset == 0 else f"上次回答 · 图片 {offset + 1}",
+                            text if offset == 0 else "",
+                            directory / filename,
+                        ),
+                    )
+            else:
+                sections.insert(1, (label, text))
+    return sections
 
 
 def prize_sections(
@@ -273,6 +331,8 @@ class CatLottery(Star):
         self.avatars = AvatarCache(self.store.directory / "avatars", self.logger)
         self.image_session: aiohttp.ClientSession | None = None
         self.image_slots = asyncio.Semaphore(4)
+        self.private_receipts: OrderedDict[tuple[str, ...], float] = OrderedDict()
+        self.private_windows: dict[tuple[str, ...], dict] = {}
 
     async def initialize(self) -> None:
         """Open storage, register plugin-only APIs, and recover pending scheduled work."""
@@ -402,14 +462,21 @@ class CatLottery(Star):
 
     async def terminate(self) -> None:
         """Stop owned tasks and close SQLite before plugin reload."""
-        for task in (self.worker, self.sender):
+        tasks = [
+            self.worker,
+            self.sender,
+            *(window["task"] for window in self.private_windows.values()),
+        ]
+        for task in tasks:
             if task:
                 task.cancel()
-        for task in (self.worker, self.sender):
+        for task in tasks:
             if task:
                 with contextlib.suppress(asyncio.CancelledError):
                     await task
         self.worker = self.sender = None
+        self.private_receipts.clear()
+        self.private_windows.clear()
         await self.avatars.close()
         if self.image_session is not None:
             await self.image_session.close()
@@ -863,10 +930,11 @@ class CatLottery(Star):
             entry: Sender's pending entry.
         """
         index = await self.store.form_position(entry["bot_id"], entry["user_id"])
+        entry = await self.store.entry(item["id"], entry["user_id"]) or entry
         await self.card(
             event,
             f"第 {index + 1} / {len(item['questions'])} 题",
-            question_sections(item, entry, index),
+            question_sections(item, entry, index, self.store.directory / "uploads"),
             f"{item['title']}  ·  {item['id']}  ·  QQ {entry['user_id']}",
             "私聊填写",
             participation_counts=await self.store.participation_state(item["id"]),
@@ -892,7 +960,9 @@ class CatLottery(Star):
             )
         item = await self.store.get(lottery_id)
         self.check_target(item, identity)
-        entry, created = await self.store.enroll(lottery_id, identity)
+        entry, created = await self.store.enroll(
+            lottery_id, identity, restart_existing=True
+        )
         if created:
             self.logger.info(
                 "Lottery %s enrollment reserved; status=%s.",
@@ -900,7 +970,9 @@ class CatLottery(Star):
                 entry["status"],
             )
         else:
-            self.logger.debug("Lottery %s duplicate enrollment ignored.", lottery_id)
+            self.logger.debug(
+                "Lottery %s existing enrollment returned or restarted.", lottery_id
+            )
         self.wake.set()
         if entry["status"] == "complete":
             if not created:
@@ -1123,6 +1195,10 @@ class CatLottery(Star):
                             else "没有待回答的报名，请先在活动允许的群内参与"
                         )
                     lottery_id = pending[0]
+                    await self.store.private_session(
+                        identity["bot_id"], identity["user_id"], lottery_id
+                    )
+                elif command == "继续":
                     await self.store.private_session(
                         identity["bot_id"], identity["user_id"], lottery_id
                     )
@@ -1362,16 +1438,51 @@ class CatLottery(Star):
                 "Friend-add lottery restoration failed; manual continuation remains available."
             )
 
+    async def finish_private_window(
+        self, scope: tuple[str, ...], window: dict, *, wait: bool = True
+    ) -> None:
+        """Commit a fixed collection window and retain ownership through the next reply.
+
+        Args:
+            scope: Trusted platform, bot, and sender identifiers.
+            window: Captured question, mode generation, and ordered message fragments.
+            wait: Wait for the collection deadline before saving.
+        """
+        try:
+            if wait:
+                await asyncio.sleep(max(0, window["deadline"] - time.monotonic()))
+            if self.private_windows.get(scope) is not window:
+                return
+            window["closing"] = True
+            await self.collect_private(
+                window["event"], content="\n".join(window["texts"]), submission=window
+            )
+        except NETWORK_ERRORS as exc:
+            self.logger.warning(
+                "Private answer window reply failed (%s).", type(exc).__name__
+            )
+        except Exception:
+            # A detached task must report unexpected failures without leaving ownership stuck.
+            self.logger.exception("Private answer collection window failed.")
+        finally:
+            if self.private_windows.get(scope) is window:
+                del self.private_windows[scope]
+
     @filter.event_message_type(filter.EventMessageType.PRIVATE_MESSAGE)
     @filter.platform_adapter_type(filter.PlatformAdapterType.AIOCQHTTP, priority=80)
     async def collect_private(
-        self, event: AstrMessageEvent, content: str | None = None
+        self,
+        event: AstrMessageEvent,
+        content: str | None = None,
+        *,
+        submission: dict | None = None,
     ):
         """Consume only actual private messages for an explicitly selected pending form.
 
         Args:
             event: Real private sender event with trusted message components.
             content: Explicit answer command content, including text starting with a slash.
+            submission: Captured collection window, supplied only by the owned timer.
         """
         text = (
             content
@@ -1401,15 +1512,41 @@ class CatLottery(Star):
                 and isinstance(segment["data"].get("text"), str)
             )
         lottery_id = ""
-        stored_image: Path | None = None
+        stored_images: list[Path] = []
         try:
             identity = self.identity(event)
             if identity["group_id"]:
+                return
+            message_id = str(
+                raw.get("message_id", getattr(event.message_obj, "message_id", ""))
+                or ""
+            )
+            scope = (identity["platform_id"], identity["bot_id"], identity["user_id"])
+            receipt_key = (*scope, message_id)
+            now = time.monotonic()
+            while self.private_receipts:
+                first = next(iter(self.private_receipts))
+                if (
+                    len(self.private_receipts) <= 10000
+                    and now - self.private_receipts[first] < 1200
+                ):
+                    break
+                self.private_receipts.popitem(last=False)
+            if (
+                submission is None
+                and message_id
+                and receipt_key in self.private_receipts
+            ):
+                event.stop_event()
+                event.should_call_llm(True)
+                self.logger.debug("Duplicate private lottery message suppressed.")
                 return
             lottery_id = await self.store.private_session(
                 identity["bot_id"], identity["user_id"]
             )
             if lottery_id is None:
+                if submission is not None:
+                    self.wake.set()
                 return
             entry = await self.store.entry(lottery_id, identity["user_id"])
             if entry and entry["platform_id"] != identity["platform_id"]:
@@ -1418,6 +1555,11 @@ class CatLottery(Star):
                 raise ValueError("请通过报名时使用的平台私聊我。")
             event.stop_event()
             event.should_call_llm(True)
+            images = (
+                submission["images"]
+                if submission is not None
+                else [part for part in event.get_messages() if isinstance(part, Image)]
+            )
             item = await self.store.get(lottery_id)
             self.check_target(item, identity)
             entry = await self.store.entry(lottery_id, identity["user_id"])
@@ -1431,54 +1573,196 @@ class CatLottery(Star):
                     identity["bot_id"], identity["user_id"], ""
                 )
                 raise ValueError("报名已截止，未完成的资料不会进入开奖名单。")
+            if submission is not None and (
+                submission["lottery_id"] != lottery_id
+                or submission["index"] != index
+                or submission["mode_expires_at"] != entry.get("mode_expires_at")
+            ):
+                self.logger.debug(
+                    "Stale private answer collection discarded after mode or question change."
+                )
+                return
+            if submission is None:
+                if message_id:
+                    self.private_receipts[receipt_key] = now
+                window = self.private_windows.get(scope)
+                if window and (
+                    window["lottery_id"] != lottery_id
+                    or window["mode_expires_at"] != entry.get("mode_expires_at")
+                ):
+                    window["task"].cancel()
+                    del self.private_windows[scope]
+                    window = None
+                if window and (window["closing"] or now >= window["deadline"]):
+                    if not window.get("saving_notice"):
+                        window["saving_notice"] = True
+                        await event.send(
+                            MessageChain(
+                                [Plain("本题正在保存，请等我发送下一题后再回答")]
+                            )
+                        )
+                    return
+                if window and window["index"] != index:
+                    window["task"].cancel()
+                    del self.private_windows[scope]
+                    window = None
+                if window is None:
+                    if len(self.private_windows) >= 1000:
+                        raise ValueError("当前作答人数较多，请稍后重新回答本题")
+                    window = {
+                        "event": event,
+                        "lottery_id": lottery_id,
+                        "index": index,
+                        "mode_expires_at": entry.get("mode_expires_at"),
+                        "deadline": now + 5,
+                        "texts": [],
+                        "images": [],
+                        "fingerprints": set(),
+                        "image_sources": set(),
+                        "closing": False,
+                    }
+                    self.private_windows[scope] = window
+                    window["task"] = asyncio.create_task(
+                        self.finish_private_window(scope, window)
+                    )
+                fingerprint = hashlib.sha256(
+                    json.dumps(
+                        [
+                            text,
+                            [str(image.file or image.url or "") for image in images],
+                        ],
+                        ensure_ascii=False,
+                    ).encode()
+                ).hexdigest()
+                first = not window["fingerprints"]
+                if fingerprint in window["fingerprints"]:
+                    return
+                sources = [str(image.file or image.url or "") for image in images]
+                texts = window["texts"] + (
+                    [text] if text and text not in window["texts"] else []
+                )
+                if (
+                    len("\n".join(texts)) > 1000
+                    or len(window["image_sources"] | set(sources)) > 9
+                ):
+                    if first:
+                        window["task"].cancel()
+                        del self.private_windows[scope]
+                    raise ValueError(
+                        "本条补充未加入收集窗口：每题文字最多 1000 字，图片最多 9 张"
+                    )
+                window["fingerprints"].add(fingerprint)
+                window["texts"] = texts
+                for image, source in zip(images, sources):
+                    if source not in window["image_sources"]:
+                        window["images"].append(image)
+                        window["image_sources"].add(source)
+                if first:
+                    try:
+                        await event.send(
+                            MessageChain(
+                                [
+                                    Plain(
+                                        "已进入 5 秒答题收集窗口，可继续补充文字和图片；结束后我会确认保存，再发送下一题"
+                                    )
+                                ]
+                            )
+                        )
+                    except NETWORK_ERRORS as exc:
+                        self.logger.warning(
+                            "Private collection reminder failed (%s); collection continues.",
+                            type(exc).__name__,
+                        )
+                return
             question = item["questions"][index]
-            images = [part for part in event.get_messages() if isinstance(part, Image)]
-            if len(images) > 1:
-                raise ValueError("每题最多发送一张图片，可与文字在同一条消息中提交。")
+            if len(images) > 9:
+                raise ValueError("每题最多保留 9 张图片")
             if question["kind"] in {"image", "mixed"} and not images:
                 raise ValueError("本题需要一张图片，请按题目要求重新发送。")
             if len(text) > 1000 or (question["kind"] != "image" and not text.strip()):
                 raise ValueError(
-                    "本题需要 1–1000 字非空文本，可附带一张图片；空格与换行也计入长度。"
+                    "本题需要 1–1000 字非空文本，可附带图片；空格与换行也计入长度。"
                 )
-            if images:
-                data = await self.read_submission_image(images[0])
-                with await asyncio.to_thread(
-                    PillowImage.open, BytesIO(data)
-                ) as original:
-                    if original.format not in {"JPEG", "PNG", "WEBP", "GIF"}:
-                        raise ValueError("请发送 JPG、PNG、WebP 或 GIF 图片。")
-                    if original.width * original.height > 24_000_000:
-                        raise ValueError("图片分辨率过大，请缩小后发送。")
-                    await asyncio.to_thread(original.load)
+            image_hashes = set()
+            for image in images:
+                data = await self.read_submission_image(image)
+                digest = hashlib.sha256(data).digest()
+                if digest in image_hashes:
+                    continue
+                image_hashes.add(digest)
+                async with self.image_slots:
                     with await asyncio.to_thread(
-                        ImageOps.exif_transpose, original
-                    ) as oriented:
-                        with await asyncio.to_thread(oriented.convert, "RGBA") as rgba:
-                            with PillowImage.new("RGB", rgba.size, "white") as picture:
-                                await asyncio.to_thread(
-                                    picture.paste, rgba, (0, 0), rgba
-                                )
-                                await asyncio.to_thread(picture.thumbnail, (2000, 2000))
-                                stored_image = (
-                                    self.store.directory
-                                    / "uploads"
-                                    / f"{secrets.token_hex(16)}.jpg"
-                                )
-                                await asyncio.to_thread(
-                                    picture.save, stored_image, "JPEG", quality=88
-                                )
+                        PillowImage.open, BytesIO(data)
+                    ) as original:
+                        if original.format not in {"JPEG", "PNG", "WEBP", "GIF"}:
+                            raise ValueError("请发送 JPG、PNG、WebP 或 GIF 图片。")
+                        if original.width * original.height > 24_000_000:
+                            raise ValueError("图片分辨率过大，请缩小后发送。")
+                        await asyncio.to_thread(original.load)
+                        with await asyncio.to_thread(
+                            ImageOps.exif_transpose, original
+                        ) as oriented:
+                            with await asyncio.to_thread(
+                                oriented.convert, "RGBA"
+                            ) as rgba:
+                                with PillowImage.new(
+                                    "RGB", rgba.size, "white"
+                                ) as picture:
+                                    await asyncio.to_thread(
+                                        picture.paste, rgba, (0, 0), rgba
+                                    )
+                                    await asyncio.to_thread(
+                                        picture.thumbnail, (2000, 2000)
+                                    )
+                                    stored_image = (
+                                        self.store.directory
+                                        / "uploads"
+                                        / f"{secrets.token_hex(16)}.jpg"
+                                    )
+                                    stored_images.append(stored_image)
+                                    await asyncio.to_thread(
+                                        picture.save, stored_image, "JPEG", quality=88
+                                    )
             if question["kind"] == "image":
-                answer = {"kind": "image", "value": stored_image.name, "text": text}
+                answer = {"kind": "image", "value": stored_images[0].name, "text": text}
             else:
                 answer = {
                     "kind": "mixed" if question["kind"] == "mixed" else "text",
                     "value": text,
                 }
-                if stored_image is not None:
-                    answer["image"] = stored_image.name
-            item, entry = await self.store.answer(lottery_id, identity, answer, index)
-            stored_image = None
+                if stored_images:
+                    answer["image"] = stored_images[0].name
+            if len(stored_images) > 1:
+                answer["images"] = [path.name for path in stored_images]
+            item, entry = await self.store.answer(
+                lottery_id,
+                identity,
+                answer,
+                index,
+                mode_expires_at=entry.get("mode_expires_at"),
+            )
+            stored_images.clear()
+            if submission is not None:
+                try:
+                    await event.send(
+                        MessageChain(
+                            [
+                                Plain(
+                                    f"第 {index + 1} 题作答结束，答案已保存"
+                                    + (
+                                        "，全部资料已提交"
+                                        if entry["status"] == "complete"
+                                        else "，接下来是下一题"
+                                    )
+                                )
+                            ]
+                        )
+                    )
+                except NETWORK_ERRORS as exc:
+                    self.logger.warning(
+                        "Private answer confirmation failed (%s); saved answer retained.",
+                        type(exc).__name__,
+                    )
             if entry["status"] == "complete":
                 self.logger.info(
                     "Lottery %s private form completed; eligibility=%s; notices queued.",
@@ -1539,13 +1823,13 @@ class CatLottery(Star):
                 type(exc).__name__,
             )
         finally:
-            if stored_image is not None:
+            if stored_images:
                 try:
-                    stored_image.unlink(missing_ok=True)
-                except OSError:
-                    self.logger.warning(
-                        "An uncommitted private image could not be removed."
+                    await self.store.cleanup_artwork(
+                        {path.name for path in stored_images}
                     )
+                except (sqlite3.Error, RuntimeError):
+                    self.logger.warning("Uncommitted private image cleanup deferred.")
 
     async def read_submission_image(self, image: Image) -> bytes:
         """Read a bounded QQ image without arbitrary URL fetching or local file access.
@@ -1634,6 +1918,8 @@ class CatLottery(Star):
         next_cleanup = 0.0
         while True:
             try:
+                if await self.store.expire_forms():
+                    self.wake.set()
                 for item in await self.store.snapshot():
                     if item["status"] == "open" and time.time() >= item["draw_at"]:
                         try:
@@ -1651,6 +1937,12 @@ class CatLottery(Star):
                     )
                     self.wake.set()
                 if time.time() >= next_cleanup:
+                    now = time.monotonic()
+                    self.private_receipts = OrderedDict(
+                        (key, value)
+                        for key, value in self.private_receipts.items()
+                        if now - value < 1200
+                    )
                     removed = await self.store.cleanup_artwork()
                     if removed:
                         self.logger.info(
@@ -1778,7 +2070,24 @@ class CatLottery(Star):
                             await self.store.delivery_done(row["id"], skipped=True)
                             continue
                         title = f"第 {index + 1} / {len(item['questions'])} 题"
-                        sections = question_sections(item, entry, index)
+                        sections = question_sections(
+                            item, entry, index, self.store.directory / "uploads"
+                        )
+                    elif kind == "form_timeout":
+                        if await self.store.private_session(
+                            target["bot_id"], target["recipient"]
+                        ):
+                            await self.store.delivery_done(row["id"], skipped=True)
+                            continue
+                        title = "已退出抽奖作答模式"
+                        sections = [
+                            (
+                                "恢复作答",
+                                "本轮 20 分钟已结束，你已填写的答案会保留\n报名截止前，私聊发送 /抽奖 继续 可恢复作答\n有多场待办时发送 /抽奖 待办 选择活动\n也可回原报名群发送 /抽奖 参与 "
+                                + item["id"]
+                                + "，从第一题重新作答",
+                            )
+                        ]
                     elif kind == "participation_guide":
                         title, sections = "", []
                     elif kind in {"success", "submitted", "review", "answer_changed"}:
@@ -1960,6 +2269,13 @@ class CatLottery(Star):
                         ) as cursor:
                             if await cursor.fetchone() is None:
                                 continue
+                        if kind == "form_timeout":
+                            async with self.store.db.execute(
+                                "SELECT 1 FROM sessions WHERE bot_id=? AND user_id=?",
+                                (target["bot_id"], target["recipient"]),
+                            ) as cursor:
+                                if await cursor.fetchone() is not None:
+                                    continue
                     if kind in {"announcement", "participation_guide", "question"}:
                         current = await self.store.get(item["id"])
                         if (
@@ -2566,6 +2882,10 @@ class CatLottery(Star):
         Never claim eligibility while review is pending or rejected. With no
         questions a private success image is queued; a group success image is
         also queued only when enabled for this activity.
+        Rejoining an unsuccessful enrollment through its original group clears
+        that activity's existing answers and starts question one again. Call
+        only with explicit intent to join or restart, never merely to check status.
+        Approved participants keep eligibility and never have to answer again.
 
         Args:
             lottery_id (string): Exact ID selected by the sender, from catlottery_list or a real announcement.
@@ -2654,8 +2974,13 @@ class CatLottery(Star):
         selected pending activity; do not call it before every answer. The current
         question is sent as an image. The sender must then directly
         send their actual text/quiz answer or image; do not fabricate, infer,
-        or submit answers on their behalf. Completed or expired forms cannot
-        be resumed. A group message must instead be directed to private chat.
+        or submit answers on their behalf. Each resume opens a 20-minute answer
+        mode, preserving saved answers and selecting the first missing question.
+        Mode timeout can be resumed before the enrollment cutoff. Completed
+        forms and activities past the cutoff cannot be resumed. The first actual
+        answer starts a 5-second collection window for that question; text and
+        up to nine separate images can be added until it ends. Never call this
+        tool during that window. A group message must be directed to private chat.
 
         Args:
             lottery_id (string): Exact ID of the sender's already-reserved pending lottery.
@@ -2674,15 +2999,9 @@ class CatLottery(Star):
             entry = await self.store.entry(lottery_id, identity["user_id"])
             if entry and entry["platform_id"] != identity["platform_id"]:
                 raise ValueError("请通过报名时使用的平台私聊我。")
-            if (
-                await self.store.private_session(
-                    identity["bot_id"], identity["user_id"]
-                )
-                != lottery_id
-            ):
-                await self.store.private_session(
-                    identity["bot_id"], identity["user_id"], lottery_id
-                )
+            await self.store.private_session(
+                identity["bot_id"], identity["user_id"], lottery_id
+            )
             await self.show_question(event, item, entry)
             return "已发送当前题，等待用户真实私聊回答；尚未报名成功。"
         except ValueError as exc:

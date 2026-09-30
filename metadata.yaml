@@ -1,7 +1,7 @@
 name: astrbot_plugin_catlottery
 display_name: 喵喵抽奖
 desc: QQ 群抽奖，支持多奖项、私聊报名资料、资格审核、定时开奖和群公告，可在猫咪风格管理页中操作。
-version: v1.5.0
+version: v1.6.0
 author: 清蒸云鸭
 repo: https://github.com/WhiteCloudOL/astrbot_plugin_catlottery
 support_platforms:

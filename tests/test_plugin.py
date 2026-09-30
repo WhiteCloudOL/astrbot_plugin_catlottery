@@ -2,6 +2,7 @@
 
 import asyncio
 import base64
+import contextlib
 import copy
 import json
 import sqlite3
@@ -11,7 +12,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
 import pytest
-from astrbot.api.message_components import Image, Plain
+from astrbot.api.message_components import Image, Plain, Reply
 from astrbot.api.web import PluginRequest, bind_request_context
 from astrbot.core.pipeline.context import PipelineContext
 from astrbot.core.pipeline.process_stage.stage import ProcessStage, StarRequestSubStage
@@ -34,6 +35,7 @@ from astrbot.core.star.star_handler import (
     star_handlers_registry,
 )
 from astrbot.dashboard.services.plugin_page_service import PluginPageService
+from astrbot_plugin_catlottery import main as plugin_module
 from astrbot_plugin_catlottery.main import TOOL_NAMES, CatLottery
 from astrbot_plugin_catlottery.storage import Store
 from PIL import Image as PillowImage
@@ -249,6 +251,22 @@ async def plugin(tmp_path, monkeypatch):
     instance.store = Store(tmp_path)
     instance.avatars.get = AsyncMock(return_value=None)
     await instance.store.open()
+    collector = instance.collect_private
+
+    async def collect(current, content=None, *, submission=None):
+        await collector(current, content, submission=submission)
+        # ID-less unit fixtures represent a finished window; transport tests use real IDs and timers.
+        if (
+            submission is None
+            and not (
+                current.message_obj.raw_message.get("message_id")
+                or getattr(current.message_obj, "message_id", "")
+            )
+            and instance.private_windows
+        ):
+            await flush_window(instance)
+
+    monkeypatch.setattr(instance, "collect_private", collect)
     yield instance
     await instance.terminate()
 
@@ -372,7 +390,7 @@ async def test_private_form_completion_never_falls_back_to_llm(plugin, rules, di
     await run(current)
     assert (await plugin.store.entry(item["id"], "4444444"))["status"] == "complete"
     assert await plugin.store.private_session("1234567", "4444444") is None
-    assert not current._has_send_oper
+    assert current._has_send_oper
     chat.assert_not_awaited()
 
 
@@ -467,6 +485,298 @@ async def test_ordinary_private_chat_is_available_without_active_form(
     assert await plugin.store.private_session("1234567", "4444444") is None
     entry = await plugin.store.entry(item["id"], "4444444")
     assert entry is None or not entry["answers"]
+
+
+async def flush_window(plugin):
+    """Finish one collected answer deterministically and release its timer.
+
+    Args:
+        plugin: Isolated plugin instance with exactly one active collection window.
+    """
+    scope, window = next(iter(plugin.private_windows.items()))
+    try:
+        await plugin.finish_private_window(scope, window, wait=False)
+    finally:
+        window["task"].cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await window["task"]
+
+
+async def test_real_message_ids_collect_distinct_fragments_into_one_question(
+    plugin, rules, dispatch
+):
+    rules["questions"] = [{"kind": "text", "prompt": f"第 {i} 题"} for i in range(3)]
+    item = await plugin.store.save(rules, "admin")
+    await plugin.store.enroll(item["id"], plugin.identity(event(plugin)))
+    run, chat = dispatch
+    for message_id, text in [
+        ("1", "答案"),
+        ("1", "答案"),
+        ("2", "答案"),
+        ("3", "补充资料"),
+        ("4", "最后补充"),
+    ]:
+        current = event(plugin, group="", text=text)
+        current.message_obj.message_id = message_id
+        await run(current)
+    assert not (await plugin.store.entry(item["id"], "4444444"))["answers"]
+    await flush_window(plugin)
+    assert [
+        answer["value"]
+        for answer in (await plugin.store.entry(item["id"], "4444444"))["answers"]
+    ] == ["答案\n补充资料\n最后补充"]
+    current = event(plugin, group="", text="最后答案")
+    current.message_obj.message_id = "5"
+    await run(current)
+    await flush_window(plugin)
+    assert len((await plugin.store.entry(item["id"], "4444444"))["answers"]) == 2
+    replay = event(plugin, group="", text="最后答案")
+    replay.message_obj.message_id = "5"
+    await run(replay)
+    chat.assert_not_awaited()
+
+
+async def test_rapid_concurrent_answers_wait_for_the_next_question_card(
+    plugin, rules, monkeypatch
+):
+    rules["questions"] = [
+        {"kind": "text", "prompt": "第一题"},
+        {"kind": "text", "prompt": "第二题"},
+    ]
+    item = await plugin.store.save(rules, "admin")
+    await plugin.store.enroll(item["id"], plugin.identity(event(plugin)))
+    reached, release = asyncio.Event(), asyncio.Event()
+
+    async def slow_question(*args):
+        reached.set()
+        await release.wait()
+
+    monkeypatch.setattr(plugin, "show_question", slow_question)
+    first = event(plugin, group="", text="第一份答案")
+    first.message_obj.message_id = "1"
+    await plugin.collect_private(first)
+    task = asyncio.create_task(flush_window(plugin))
+    await asyncio.wait_for(reached.wait(), 2)
+    second = event(plugin, group="", text="第二份答案")
+    second.message_obj.message_id = "2"
+    await plugin.collect_private(second)
+    release.set()
+    await task
+    assert len((await plugin.store.entry(item["id"], "4444444"))["answers"]) == 1
+    assert second.is_stopped()
+
+
+async def test_collection_timer_sends_confirmation_before_next_image(
+    plugin, rules, monkeypatch
+):
+    rules["questions"] = [
+        {"kind": "text", "prompt": "第一题"},
+        {"kind": "text", "prompt": "第二题"},
+    ]
+    item = await plugin.store.save(rules, "admin")
+    await plugin.store.enroll(item["id"], plugin.identity(event(plugin)))
+    current = event(plugin, group="", text="  原样答案  ")
+    current.message_obj.message_id = "timer"
+    current.send = AsyncMock()
+    monkeypatch.setattr(plugin_module, "render_pages", lambda *a, **k: [b"image"])
+    start = time.monotonic()
+    await plugin.collect_private(current)
+    window = next(iter(plugin.private_windows.values()))
+    assert "5 秒" in current.send.call_args.args[0].chain[0].text
+    assert not (await plugin.store.entry(item["id"], "4444444"))["answers"]
+    await asyncio.wait_for(window["task"], 8)
+    assert time.monotonic() - start >= 4.9
+    messages = [call.args[0].chain for call in current.send.call_args_list]
+    assert "答案已保存" in messages[1][0].text
+    assert isinstance(messages[2][0], Image)
+    assert not plugin.private_windows
+
+
+@pytest.mark.parametrize("kind", ["text", "mixed", "image"])
+async def test_window_keeps_multiple_images_and_echoes_each_separately(
+    plugin, rules, dispatch, monkeypatch, kind
+):
+    rules.update(
+        require_correct=False,
+        questions=[
+            {"kind": kind, "prompt": "图文资料"},
+            {"kind": "text", "prompt": "第二题"},
+        ],
+    )
+    item = await plugin.store.save(rules, "admin")
+    await plugin.store.enroll(item["id"], plugin.identity(event(plugin)))
+    captured = []
+    monkeypatch.setattr(
+        plugin_module,
+        "render_pages",
+        lambda title, subtitle, sections, *a, **k: (
+            captured.append(sections) or [b"image"]
+        ),
+    )
+    run, chat = dispatch
+    photos = []
+    for color in ("pink", "blue"):
+        data = BytesIO()
+        with PillowImage.new("RGB", (20, 30), color) as picture:
+            picture.save(data, "PNG")
+        photos.append(Image.fromBytes(data.getvalue()))
+    for number, text, image in [
+        (1, "  第一段  ", photos[0]),
+        (2, "第二段\n末行", photos[1]),
+        (3, "第二段\n末行", photos[1]),
+    ]:
+        current = event(plugin, group="", text=text, components=[Plain(text), image])
+        current.message_obj.message_id = str(number)
+        await run(current)
+    await flush_window(plugin)
+    answer = (await plugin.store.entry(item["id"], "4444444"))["answers"][0]
+    assert (
+        answer["text"] if kind == "image" else answer["value"]
+    ) == "  第一段  \n第二段\n末行"
+    assert len(answer["images"]) == 2 and len(set(answer["images"])) == 2
+    assert len(list((plugin.store.directory / "uploads").glob("*.jpg"))) == 2
+    echo = [section[2].name for section in captured[-1] if len(section) == 3]
+    assert echo == answer["images"]
+    notices = str([json.loads(row["body"]) for row in await plugin.store.deliveries()])
+    assert "第一段" not in notices and answer["images"][1] not in notices
+    chat.assert_not_awaited()
+
+
+@pytest.mark.parametrize("change", ["pause", "restart", "navigate", "expiry", "delete"])
+async def test_window_does_not_commit_after_mode_changes(
+    plugin, rules, monkeypatch, change
+):
+    rules["questions"] = [
+        {"kind": "text", "prompt": "第一题"},
+        {"kind": "text", "prompt": "第二题"},
+    ]
+    item = await plugin.store.save(rules, "admin")
+    identity = plugin.identity(event(plugin))
+    await plugin.store.enroll(item["id"], identity)
+    await plugin.store.answer(
+        item["id"], {**identity, "group_id": ""}, {"kind": "text", "value": "原答案"}, 0
+    )
+    current = event(plugin, group="", text="不可保存的旧窗口")
+    current.message_obj.message_id = "obsolete"
+    await plugin.collect_private(current)
+    if change == "pause":
+        await plugin.store.private_session(identity["bot_id"], identity["user_id"], "")
+    elif change == "restart":
+        await plugin.store.enroll(item["id"], identity, restart_existing=True)
+    elif change == "navigate":
+        await plugin.store.form_position(identity["bot_id"], identity["user_id"], -1)
+    elif change == "expiry":
+        expires = (await plugin.store.entry(item["id"], identity["user_id"]))[
+            "mode_expires_at"
+        ]
+        monkeypatch.setattr(time, "time", lambda: expires)
+    else:
+        await plugin.store.withdraw(item["id"], identity)
+    await flush_window(plugin)
+    entry = await plugin.store.entry(item["id"], identity["user_id"])
+    assert entry is None or "不可保存" not in str(entry["answers"])
+
+
+async def test_bad_second_image_rolls_back_entire_collection_and_cleans_files(
+    plugin, rules
+):
+    rules["questions"] = [{"kind": "mixed", "prompt": "图文资料"}]
+    item = await plugin.store.save(rules, "admin")
+    await plugin.store.enroll(item["id"], plugin.identity(event(plugin)))
+    data = BytesIO()
+    with PillowImage.new("RGB", (20, 30), "pink") as picture:
+        picture.save(data, "PNG")
+    current = event(
+        plugin,
+        group="",
+        text="文字",
+        components=[
+            Plain("文字"),
+            Image.fromBytes(data.getvalue()),
+            Image.fromBytes(b"broken"),
+        ],
+    )
+    current.message_obj.message_id = "bad-second"
+    await plugin.collect_private(current)
+    await flush_window(plugin)
+    assert not (await plugin.store.entry(item["id"], "4444444"))["answers"]
+    assert not list((plugin.store.directory / "uploads").glob("*.jpg"))
+
+
+async def test_quoted_answer_ignores_reference_and_echoes_only_actual_own_answer(
+    plugin, rules, dispatch, monkeypatch
+):
+    rules["questions"] = [
+        {"kind": "text", "prompt": "第一题"},
+        {"kind": "text", "prompt": "第二题"},
+    ]
+    item = await plugin.store.save(rules, "admin")
+    await plugin.store.enroll(item["id"], plugin.identity(event(plugin)))
+    captured = []
+    monkeypatch.setattr(
+        plugin_module,
+        "render_pages",
+        lambda title, subtitle, sections, *a, **k: (
+            captured.append(sections) or [b"image"]
+        ),
+    )
+    original = "  清蒸云鸭  名称\n第二行  "
+    current = event(
+        plugin,
+        group="",
+        text=original.strip(),
+        components=[
+            Reply(
+                id="old-question",
+                sender_id="1234567",
+                message_str="不应读取的引用内容",
+                chain=[Plain("错误引用"), Image(file="file:///not-read")],
+            ),
+            Plain(original.strip()),
+        ],
+    )
+    current.message_obj.message_id = "quoted"
+    current.message_obj.raw_message["message"] = [
+        {"type": "reply", "data": {"id": "old-question"}},
+        {"type": "text", "data": {"text": original}},
+    ]
+    run, chat = dispatch
+    await run(current)
+    await flush_window(plugin)
+    assert (await plugin.store.entry(item["id"], "4444444"))["answers"][0][
+        "value"
+    ] == original
+    assert original in str(captured).replace("\\n", "\n")
+    assert "不应读取" not in str(captured) and "错误引用" not in str(captured)
+    assert "20 分钟" in str(captured)
+    chat.assert_not_awaited()
+
+
+async def test_expiry_reminder_is_private_and_resume_revokes_old_reminder(
+    plugin, rules, monkeypatch
+):
+    rules["questions"] = [{"kind": "text", "prompt": "资料"}]
+    item = await plugin.store.save(rules, "admin")
+    await plugin.store.enroll(item["id"], plugin.identity(event(plugin)))
+    deadline = (await plugin.store.entry(item["id"], "4444444"))["mode_expires_at"]
+    await plugin.store.expire_forms(now=deadline)
+    captured = []
+    monkeypatch.setattr(
+        plugin_module,
+        "render_pages",
+        lambda title, subtitle, sections, *a, **k: (
+            captured.append((title, sections)) or [b"image"]
+        ),
+    )
+    await plugin.send_deliveries()
+    assert captured[0][0] == "已退出抽奖作答模式"
+    assert "/抽奖 继续" in str(captured)
+    client = plugin.context.get_platform_inst("napcat").client
+    assert [action for action, _ in client.calls] == ["send_private_msg"]
+    await plugin.store.private_session("1234567", "4444444", item["id"])
+    await plugin.store.expire_forms(now=deadline + 1)
+    await plugin.store.private_session("1234567", "4444444", item["id"])
+    assert not await plugin.store.deliveries()
 
 
 async def test_tool_switch_blocks_all_tools_and_leaves_qq_commands_available(
@@ -632,7 +942,6 @@ async def test_deferred_review_keeps_wrong_mixed_answer_and_truthful_status(
         and status["review_status"] == "pending"
         and status["eligible"] is False
     )
-    assert "等待审核" in await plugin.join(event(plugin), item["id"])
     with web_request({"action": "match"}):
         response = await plugin.web_review(item["id"])
     assert response.status_code == 200

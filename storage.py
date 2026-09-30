@@ -18,6 +18,7 @@ from typing import Any
 import aiosqlite
 
 CHINA_TZ = timezone(timedelta(hours=8))
+FORM_MODE_SECONDS = 20 * 60
 logger = logging.getLogger("astrbot.plugin.astrbot_plugin_catlottery")
 
 
@@ -313,6 +314,23 @@ def form_progress(entry: dict, question_count: int) -> tuple[int, int]:
     )
 
 
+def answer_images(answer: dict) -> list[str]:
+    """Read separate attachments, including legacy single-image records.
+
+    Args:
+        answer: Saved or submitted answer record.
+
+    Returns:
+        Unique attachment filenames in submission order.
+    """
+    first = (
+        answer.get("value", "")
+        if answer.get("kind") == "image"
+        else answer.get("image", "")
+    )
+    return list(dict.fromkeys(([first] if first else []) + answer.get("images", [])))
+
+
 def validate_answer(question: dict, answer: dict, require_correct: bool) -> dict:
     """Normalize one submission without changing its whitespace or trusting review fields.
 
@@ -338,6 +356,16 @@ def validate_answer(question: dict, answer: dict, require_correct: bool) -> dict
     filename = (
         answer.get("value", "") if expected_kind == "image" else answer.get("image", "")
     )
+    images = answer.get("images", [])
+    if (
+        not isinstance(images, list)
+        or len(images) > 9
+        or any(
+            not isinstance(value, str) or not re.fullmatch(r"[a-f0-9]{32}\.jpg", value)
+            for value in images
+        )
+    ):
+        raise ValueError("每题最多保留 9 张有效图片")
     if not isinstance(original_text, str) or len(original_text) > 1000:
         raise ValueError("文本请控制在 1000 字以内，空格和换行也计入长度。")
     if expected_kind != "image" and not original_text.strip():
@@ -346,6 +374,10 @@ def validate_answer(question: dict, answer: dict, require_correct: bool) -> dict
         filename and not re.fullmatch(r"[a-f0-9]{32}\.jpg", filename)
     ):
         raise ValueError("图片记录无效。")
+    images = list(dict.fromkeys(([filename] if filename else []) + images))
+    if len(images) > 9:
+        raise ValueError("每题最多保留 9 张图片")
+    filename = images[0] if images else ""
     if expected_kind in {"image", "mixed"} and not filename:
         raise ValueError("本题需要一张图片，请按题目要求重新发送。")
     answer = {
@@ -356,6 +388,8 @@ def validate_answer(question: dict, answer: dict, require_correct: bool) -> dict
         answer["text"] = original_text
     elif expected_kind != "image" and filename:
         answer["image"] = filename
+    if len(images) > 1:
+        answer["images"] = images
     if question["kind"] == "quiz" and require_correct:
         text = original_text.strip()
         options = question["options"]
@@ -448,6 +482,12 @@ class Store:
             await self.db.execute(
                 "ALTER TABLE sessions ADD COLUMN question_index INTEGER"
             )
+        if "expires_at" not in columns:
+            await self.db.execute("ALTER TABLE sessions ADD COLUMN expires_at REAL")
+        await self.db.execute(
+            "UPDATE sessions SET expires_at=? WHERE expires_at IS NULL",
+            (time.time() + FORM_MODE_SECONDS,),
+        )
 
     async def close(self) -> None:
         """Flush and close the plugin-owned database connection."""
@@ -813,18 +853,29 @@ class Store:
         """
         async with self.lock:
             async with self.db.execute(
-                "SELECT body FROM entries WHERE lottery_id=? AND user_id=?",
+                "SELECT e.body,s.expires_at FROM entries e LEFT JOIN sessions s "
+                "ON s.lottery_id=e.lottery_id AND s.user_id=e.user_id "
+                "AND s.bot_id=json_extract(e.body,'$.bot_id') "
+                "WHERE e.lottery_id=? AND e.user_id=?",
                 (lottery_id, user_id),
             ) as cursor:
                 row = await cursor.fetchone()
-        return json.loads(row[0]) if row else None
+        if not row:
+            return None
+        entry = json.loads(row[0])
+        if row[1] is not None:
+            entry["mode_expires_at"] = row[1]
+        return entry
 
-    async def enroll(self, lottery_id: str, identity: dict) -> tuple[dict, bool]:
+    async def enroll(
+        self, lottery_id: str, identity: dict, *, restart_existing: bool = False
+    ) -> tuple[dict, bool]:
         """Reserve one slot across all groups; finish immediately when no form is needed.
 
         Args:
             lottery_id: Activity identifier.
             identity: Trusted group, platform, bot, and actual QQ sender.
+            restart_existing: Restart an unsuccessful original group entry from question one.
 
         Returns:
             The entry and whether it was newly created.
@@ -852,16 +903,71 @@ class Store:
                     raise ValueError(
                         "只能从该抽奖允许的平台和群发起报名，私聊不能参与。"
                     )
-                if item["status"] != "open" or time.time() >= item["close_at"]:
-                    raise ValueError("报名已截止，请查看抽奖详情。")
                 async with self.db.execute(
                     "SELECT body FROM entries WHERE lottery_id=? AND user_id=?",
                     (lottery_id, identity["user_id"]),
                 ) as cursor:
                     row = await cursor.fetchone()
-                if row:
+                if (
+                    row
+                    and restart_existing
+                    and item["status"] != "cancelled"
+                    and review_status(item, json.loads(row[0])) == "approved"
+                ):
                     await self.db.commit()
                     return json.loads(row[0]), False
+                if item["status"] != "open" or time.time() >= item["close_at"]:
+                    raise ValueError("报名已截止，请查看抽奖详情。")
+                if row:
+                    entry = json.loads(row[0])
+                    if (
+                        restart_existing
+                        and item["questions"]
+                        and review_status(item, entry) != "approved"
+                        and all(
+                            entry[key] == identity[key]
+                            for key in ("platform_id", "bot_id", "group_id")
+                        )
+                    ):
+                        entry.update(
+                            answers=[],
+                            status="pending",
+                            review_status="incomplete",
+                            completed_at=None,
+                            answer_revision=entry.get("answer_revision", 0) + 1,
+                        )
+                        entry.pop("last_answer_index", None)
+                        for key in ("review_decision", "reviewed_at", "reviewed_by"):
+                            entry.pop(key, None)
+                        await self.db.execute(
+                            "UPDATE entries SET body=? WHERE lottery_id=? AND user_id=?",
+                            (
+                                json.dumps(entry, ensure_ascii=False),
+                                lottery_id,
+                                identity["user_id"],
+                            ),
+                        )
+                        await self.db.execute(
+                            "INSERT OR REPLACE INTO sessions (bot_id,user_id,lottery_id,question_index,expires_at) VALUES (?,?,?,0,?)",
+                            (
+                                entry["bot_id"],
+                                entry["user_id"],
+                                lottery_id,
+                                time.time() + FORM_MODE_SECONDS,
+                            ),
+                        )
+                        await self.db.execute(
+                            "DELETE FROM outbox WHERE delivered_at IS NULL AND json_extract(body,'$.entry.user_id')=? "
+                            "AND (lottery_id=? AND json_extract(body,'$.kind') IN ('success','submitted','review','answer_changed') "
+                            "OR json_extract(body,'$.target.bot_id')=? AND json_extract(body,'$.kind') IN ('question','form_timeout'))",
+                            (entry["user_id"], lottery_id, entry["bot_id"]),
+                        )
+                        logger.info(
+                            "Lottery %s unsuccessful group entry restarted from question one.",
+                            lottery_id,
+                        )
+                    await self.db.commit()
+                    return entry, False
                 async with self.db.execute(
                     "SELECT count(*) FROM entries WHERE lottery_id=?", (lottery_id,)
                 ) as cursor:
@@ -888,8 +994,13 @@ class Store:
                     await self.queue(item, "success", entry=entry)
                 else:
                     await self.db.execute(
-                        "INSERT OR REPLACE INTO sessions (bot_id,user_id,lottery_id,question_index) VALUES (?,?,?,0)",
-                        (identity["bot_id"], identity["user_id"], lottery_id),
+                        "INSERT OR REPLACE INTO sessions (bot_id,user_id,lottery_id,question_index,expires_at) VALUES (?,?,?,0,?)",
+                        (
+                            identity["bot_id"],
+                            identity["user_id"],
+                            lottery_id,
+                            time.time() + FORM_MODE_SECONDS,
+                        ),
                     )
                 await self.db.commit()
                 return entry, True
@@ -913,6 +1024,7 @@ class Store:
         Raises:
             ValueError: The sender did not reserve a slot with this robot.
         """
+        await self.expire_forms(bot_id=bot_id, user_id=user_id)
         async with self.lock:
             if lottery_id is not None:
                 if not lottery_id:
@@ -947,13 +1059,19 @@ class Store:
                 if item["status"] != "open" or time.time() >= item["close_at"]:
                     raise ValueError("报名已截止，不能继续填写。")
                 await self.db.execute(
-                    "INSERT OR REPLACE INTO sessions (bot_id, user_id, lottery_id, question_index) VALUES (?, ?, ?, ?)",
+                    "INSERT OR REPLACE INTO sessions (bot_id, user_id, lottery_id, question_index,expires_at) VALUES (?, ?, ?, ?,?)",
                     (
                         bot_id,
                         user_id,
                         lottery_id,
                         form_progress(entry, len(item["questions"]))[1],
+                        time.time() + FORM_MODE_SECONDS,
                     ),
+                )
+                await self.db.execute(
+                    "DELETE FROM outbox WHERE delivered_at IS NULL AND json_extract(body,'$.kind')='form_timeout' "
+                    "AND json_extract(body,'$.target.bot_id')=? AND json_extract(body,'$.entry.user_id')=?",
+                    (bot_id, user_id),
                 )
             async with self.db.execute(
                 "SELECT s.lottery_id, l.body FROM sessions s "
@@ -975,6 +1093,54 @@ class Store:
                 )
         return row[0] if row else None
 
+    async def expire_forms(
+        self, *, bot_id: str = "", user_id: str = "", now: float | None = None
+    ) -> int:
+        """Exit expired answer modes and durably queue one private reminder per mode.
+
+        Args:
+            bot_id: Optional original bot for a sender-scoped expiry check.
+            user_id: Optional actual sender paired with bot_id.
+            now: Testable UTC deadline; defaults to current time.
+
+        Returns:
+            Number of modes expired, limited to 200 per scheduler cycle.
+        """
+        now = time.time() if now is None else now
+        selection = " AND s.bot_id=? AND s.user_id=?" if bot_id and user_id else ""
+        async with self.lock:
+            await self.db.execute("BEGIN IMMEDIATE")
+            try:
+                async with self.db.execute(
+                    "SELECT s.bot_id,s.user_id,s.lottery_id,e.body,l.body FROM sessions s "
+                    "JOIN entries e ON e.lottery_id=s.lottery_id AND e.user_id=s.user_id "
+                    "JOIN lotteries l ON l.id=s.lottery_id WHERE s.expires_at<=?"
+                    + selection
+                    + " LIMIT 200",
+                    (now, bot_id, user_id) if selection else (now,),
+                ) as cursor:
+                    rows = await cursor.fetchall()
+                for row in rows:
+                    await self.db.execute(
+                        "DELETE FROM sessions WHERE bot_id=? AND user_id=?",
+                        (row[0], row[1]),
+                    )
+                    await self.db.execute(
+                        "DELETE FROM outbox WHERE delivered_at IS NULL AND json_extract(body,'$.kind')='question' "
+                        "AND json_extract(body,'$.target.bot_id')=? AND json_extract(body,'$.entry.user_id')=?",
+                        (row[0], row[1]),
+                    )
+                    entry, item = json.loads(row[3]), json.loads(row[4])
+                    if entry["status"] == "pending":
+                        await self.queue(item, "form_timeout", entry=entry)
+                await self.db.commit()
+            except BaseException:
+                await self.db.rollback()
+                raise
+        if rows:
+            logger.info("Expired %d private lottery answer modes.", len(rows))
+        return len(rows)
+
     async def form_position(self, bot_id: str, user_id: str, direction: int = 0) -> int:
         """Read or move the sender's private question cursor without skipping answers.
 
@@ -993,7 +1159,7 @@ class Store:
             raise ValueError("题目方向无效")
         async with self.lock:
             async with self.db.execute(
-                "SELECT s.question_index, e.body, l.body FROM sessions s "
+                "SELECT s.question_index, e.body, l.body,s.expires_at FROM sessions s "
                 "JOIN entries e ON e.lottery_id=s.lottery_id AND e.user_id=s.user_id "
                 "JOIN lotteries l ON l.id=s.lottery_id WHERE s.bot_id=? AND s.user_id=?",
                 (bot_id, user_id),
@@ -1006,6 +1172,7 @@ class Store:
                 entry["status"] != "pending"
                 or item["status"] != "open"
                 or time.time() >= item["close_at"]
+                or time.time() >= row[3]
             ):
                 raise ValueError("资料已提交或报名已截止，不能继续回答")
             index = (
@@ -1056,7 +1223,13 @@ class Store:
                 await self.queue(item, "question", entry=entry)
 
     async def answer(
-        self, lottery_id: str, identity: dict, answer: dict, index: int
+        self,
+        lottery_id: str,
+        identity: dict,
+        answer: dict,
+        index: int,
+        *,
+        mode_expires_at: float | None = None,
     ) -> tuple[dict, dict]:
         """Accept the active private question and commit completion atomically.
 
@@ -1065,6 +1238,7 @@ class Store:
             identity: Actual sender, bot, and platform; group_id must be empty.
             answer: Original text and an optional internal image filename.
             index: Expected question index to reject simultaneous stale submissions.
+            mode_expires_at: Original mode deadline to reject uploads from a replaced mode.
 
         Returns:
             Updated activity and entry.
@@ -1100,12 +1274,16 @@ class Store:
                 if item["status"] != "open" or time.time() >= item["close_at"]:
                     raise ValueError("报名截止，未完成的资料不会进入开奖名单。")
                 async with self.db.execute(
-                    "SELECT question_index,lottery_id FROM sessions WHERE bot_id=? AND user_id=?",
+                    "SELECT question_index,lottery_id,expires_at FROM sessions WHERE bot_id=? AND user_id=?",
                     (identity["bot_id"], identity["user_id"]),
                 ) as cursor:
                     session = await cursor.fetchone()
                 if not session:
                     raise ValueError("当前回答已暂停，请私聊发送 /抽奖 继续 恢复")
+                if time.time() >= session[2]:
+                    raise ValueError("已退出抽奖作答模式，请私聊发送 /抽奖 继续 恢复")
+                if mode_expires_at is not None and mode_expires_at != session[2]:
+                    raise ValueError("作答模式已重新开启，请按最新题目重新回答")
                 expected = (
                     session[0]
                     if session[0] is not None
@@ -1124,16 +1302,11 @@ class Store:
                 answer = validate_answer(
                     question, answer, item.get("require_correct", True)
                 )
-                filename = (
-                    answer["value"]
-                    if answer["kind"] == "image"
-                    else answer.get("image", "")
-                )
-                old_image = None
+                discarded = set()
                 if index < len(entry["answers"]):
                     old = entry["answers"][index]
-                    old_image = (
-                        old["value"] if old["kind"] == "image" else old.get("image")
+                    discarded.update(
+                        set(answer_images(old)) - set(answer_images(answer))
                     )
                     entry["answers"][index] = answer
                 else:
@@ -1153,6 +1326,7 @@ class Store:
                     (lottery_id, identity["user_id"]),
                 )
                 entry["answer_revision"] = entry.get("answer_revision", 0) + 1
+                entry["last_answer_index"] = index
                 if form_progress(entry, len(item["questions"]))[0] == len(
                     item["questions"]
                 ):
@@ -1179,17 +1353,12 @@ class Store:
                     ),
                 )
                 await self.db.commit()
-                if old_image and old_image != filename:
-                    try:
-                        (self.directory / "uploads" / Path(old_image).name).unlink(
-                            missing_ok=True
-                        )
-                    except OSError:
-                        logger.warning("Replaced lottery attachment cleanup deferred.")
-                return item, entry
             except BaseException:
                 await self.db.rollback()
                 raise
+        if discarded:
+            await self.cleanup_artwork(discarded)
+        return item, entry
 
     async def review(self, lottery_id: str, payload: dict, reviewer_id: str) -> dict:
         """Mark submitted answers or match text references before the draw freezes eligibility.
@@ -1505,39 +1674,27 @@ class Store:
                     )
                     for position in slots:
                         previous = entry["answers"][position]
-                        old_image = (
-                            previous["value"]
-                            if previous["kind"] == "image"
-                            else previous.get("image", "")
-                        )
+                        old_images = set(answer_images(previous))
                         if action == "edit_answer":
                             answer = validate_answer(
                                 item["questions"][position],
                                 payload.get("answer"),
                                 item.get("require_correct", True),
                             )
-                            image = (
-                                answer["value"]
-                                if answer["kind"] == "image"
-                                else answer.get("image", "")
-                            )
-                            if (
-                                image
-                                and not (self.directory / "uploads" / image).is_file()
+                            images = set(answer_images(answer))
+                            if any(
+                                not (self.directory / "uploads" / image).is_file()
+                                for image in images
                             ):
                                 raise ValueError("答案图片已失效，请重新上传")
-                            if image and image != old_image:
+                            if images - old_images:
                                 async with self.db.execute(
                                     "SELECT body FROM entries"
                                 ) as cursor:
                                     for row in await cursor.fetchall():
                                         if any(
-                                            image
-                                            == (
-                                                value["value"]
-                                                if value["kind"] == "image"
-                                                else value.get("image")
-                                            )
+                                            (images - old_images)
+                                            & set(answer_images(value))
                                             for value in json.loads(row[0])["answers"]
                                         ):
                                             raise ValueError(
@@ -1545,15 +1702,14 @@ class Store:
                                             )
                             answer.update(edited_by=reviewer_id, edited_at=time.time())
                         else:
-                            image = ""
+                            images = set()
                             answer = {
                                 "kind": "deleted",
                                 "value": "",
                                 "deleted_by": reviewer_id,
                                 "deleted_at": time.time(),
                             }
-                        if old_image and old_image != image:
-                            discarded.add(old_image)
+                        discarded.update(old_images - images)
                         entry["answers"][position] = answer
                     entry.pop("review_decision", None)
                     entry.pop("reviewed_by", None)
@@ -1686,8 +1842,8 @@ class Store:
                         continue
                     selected[key] = identifier
                     await self.db.execute(
-                        "INSERT OR REPLACE INTO sessions (bot_id,user_id,lottery_id,question_index) VALUES (?,?,?,?)",
-                        (*key, identifier, missing),
+                        "INSERT OR REPLACE INTO sessions (bot_id,user_id,lottery_id,question_index,expires_at) VALUES (?,?,?,?,?)",
+                        (*key, identifier, missing, time.time() + FORM_MODE_SECONDS),
                     )
                     # Replace backoff jobs so a new friendship does not inherit failed delivery delays.
                     await self.db.execute(
@@ -1763,17 +1919,9 @@ class Store:
             except BaseException:
                 await self.db.rollback()
                 raise
-        for answer in entry["answers"]:
-            filename = (
-                answer["value"] if answer["kind"] == "image" else answer.get("image")
-            )
-            if filename:
-                try:
-                    (self.directory / "uploads" / Path(filename).name).unlink(
-                        missing_ok=True
-                    )
-                except OSError:
-                    logger.warning("Withdrawn lottery attachment cleanup deferred.")
+        await self.cleanup_artwork(
+            {image for answer in entry["answers"] for image in answer_images(answer)}
+        )
 
     async def queue(
         self,
@@ -1798,7 +1946,7 @@ class Store:
                 {**entry, "channel": "private", "recipient": entry["user_id"]},
             ]
             if (
-                kind in {"question", "answer_changed"}
+                kind in {"question", "answer_changed", "form_timeout"}
                 or (
                     not item.get("group_success_notify", True)
                     and (
@@ -2316,20 +2464,14 @@ class Store:
                     )
                 except OSError:
                     logger.warning("Deleted lottery artwork cleanup deferred.")
-        for entry in entries:
-            for answer in entry["answers"]:
-                filename = (
-                    answer["value"]
-                    if answer["kind"] == "image"
-                    else answer.get("image")
-                )
-                if filename:
-                    try:
-                        (self.directory / "uploads" / Path(filename).name).unlink(
-                            missing_ok=True
-                        )
-                    except OSError:
-                        logger.warning("Deleted lottery attachment cleanup deferred.")
+        await self.cleanup_artwork(
+            {
+                image
+                for entry in entries
+                for answer in entry["answers"]
+                for image in answer_images(answer)
+            }
+        )
 
     async def cleanup_artwork(self, discarded: set[str] | None = None) -> int:
         """Remove unbound artwork and private attachments after one day.
@@ -2356,11 +2498,7 @@ class Store:
             async with self.db.execute("SELECT body FROM entries") as cursor:
                 for row in await cursor.fetchall():
                     for answer in json.loads(row[0])["answers"]:
-                        attachments.add(
-                            answer["value"]
-                            if answer["kind"] == "image"
-                            else answer.get("image")
-                        )
+                        attachments.update(answer_images(answer))
             for directory, retained in (
                 ("artwork", references),
                 ("uploads", attachments),

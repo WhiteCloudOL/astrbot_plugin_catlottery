@@ -511,3 +511,45 @@ test("whole review is a single decision and image-required edits reject removal 
   assert.equal(document.querySelector('[name="answer_text"]').value,"图片与文字");
   assert.equal(calls.length,1);
 });
+
+test("multiple answer images have individual previews and can be removed or added without losing draft text", async t => {
+  const entries = participants(3), first = "1".repeat(32)+".jpg", second = "2".repeat(32)+".jpg";
+  entries[0].answers[1] = {kind:"mixed",value:"图文原答案",image:first,images:[first,second],correct:null};
+  const {document,window,calls,forms} = await setup(t,{lotteries:[reviewActivity()],entries,hash:"#detail/a1234567"});
+  document.querySelector('[data-tab="participants"]').click(); await flush();
+  document.querySelector('[data-action="review-person"]').click(); await flush();
+  document.querySelector('[data-action="review-next"]').click(); await flush();
+  assert.deepEqual([...document.querySelectorAll('[data-review-image]')].map(image => image.dataset.reviewImage),[first,second]);
+  assert.equal(document.querySelectorAll('[data-review-image].loaded').length,2);
+  assert.equal(document.querySelectorAll('[data-action="review-download"]').length,2);
+  document.querySelector('[data-action="answer-edit"]').click(); await flush();
+  const text = "  保留空格\n多张图片  "; document.querySelector('[name="answer_text"]').value = text;
+  const originalUploads = document.querySelectorAll("meow-upload");
+  originalUploads[0].querySelector('[data-clear-image]').click();
+  document.querySelector('[data-action="answer-add-image"]').click();
+  assert.equal(document.querySelector('[name="answer_text"]').value,text);
+  const uploads = document.querySelectorAll("meow-upload");
+  await uploads[2].upload(new window.File(["image"],"third.png",{type:"image/png"}));
+  document.querySelector('[data-action="answer-save"]').click(); await flush();
+  assert.equal(calls[0].payload.answer.value,text);
+  assert.deepEqual(calls[0].payload.answer.images,[second,"00000000000000000000000000000001.jpg"]);
+  assert.equal(forms[0].answers[1].image,second);
+  assert.equal(document.querySelectorAll('[data-review-image]').length,2);
+  assert.equal(document.querySelectorAll('select,input[type="checkbox"],input[type="radio"]').length,0);
+});
+
+test("additional image slots stop at nine and an upload in any slot blocks saving and closing", async t => {
+  const {document,calls} = await setup(t,{lotteries:[reviewActivity()],entries:participants(3),hash:"#detail/a1234567"});
+  document.querySelector('[data-tab="participants"]').click(); await flush();
+  document.querySelector('[data-action="review-person"]').click(); await flush();
+  document.querySelector('[data-action="answer-edit"]').click();
+  for (let index=0;index<10;index++) document.querySelector('[data-action="answer-add-image"]').click();
+  assert.equal(document.querySelectorAll("meow-upload").length,9);
+  assert.ok(document.querySelector('[data-action="answer-add-image"]').disabled);
+  document.querySelectorAll("meow-upload")[8].busy = true;
+  document.querySelector('[data-action="answer-save"]').click();
+  document.querySelector('.modal-close').click();
+  assert.equal(calls.length,0);
+  assert.equal(document.querySelectorAll('.modal-backdrop').length,1);
+  assert.match(document.querySelector('.toast').textContent,/等待图片上传/);
+});

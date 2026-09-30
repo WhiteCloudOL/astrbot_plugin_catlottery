@@ -187,7 +187,7 @@ export class ActivityView {
     const assets = new Map();
     const dialog = modal("管理填写资料", "逐题查看或编辑答案，整份资料统一审核", "", '<div class="review-actions-footer"></div>', {
       wide:true,
-      canClose:() => { if (busy || dialog.holder.querySelector("meow-upload")?.busy) return false; if (mode !== "view") { toast("请先保存或取消当前操作"); return false; } return true; },
+      canClose:() => { if (busy || [...dialog.holder.querySelectorAll("meow-upload")].some(upload => upload.busy)) return false; if (mode !== "view") { toast("请先保存或取消当前操作"); return false; } return true; },
       onClose:() => { closed = true; this.reviewOpen = false; assets.clear(); }
     });
     dialog.holder.classList.add("review-dialog");
@@ -197,6 +197,7 @@ export class ActivityView {
       const canReview = canChange && !item.require_correct && entry.status === "complete";
       const question = item.questions[questionIndex], slot = entry.answers[questionIndex], answer = slot?.kind === "deleted" ? null : slot;
       const image = answer?.kind === "image" ? answer.value : answer?.image;
+      const images = [...new Set([...(image ? [image] : []), ...(answer?.images || [])])];
       const text = answer?.kind === "image" ? (answer.text || "") : (answer?.value || "");
       let content = `<div class="review-person">${avatar(entry.user_id, entry.nickname)}<div><h3>${esc(entry.nickname)}</h3><p>QQ ${esc(entry.user_id)} · 来源群 ${esc(entry.group_id)}</p></div><span class="entry-status ${statusOf(entry)}">${labels[statusOf(entry)]}</span></div>`;
       if (mode === "view") content += `<div class="review-question-nav" aria-label="查看填写题目">${item.questions.map((value,index) => `<button data-review-question="${index}" class="${index === questionIndex ? "selected" : ""}" aria-label="第 ${index + 1} 题${entry.answers[index] && entry.answers[index].kind !== "deleted" ? "已填写" : "未填写"}">${index + 1}</button>`).join("")}</div>`;
@@ -204,7 +205,7 @@ export class ActivityView {
         content += `<div class="review-answer-layout"><section><span class="guide-category">第 ${questionIndex + 1} / ${item.questions.length} 题</span><h3 class="review-prompt">${esc(question.prompt)}</h3>${question.options?.length ? `<div class="review-options">${question.options.map((value,index) => `<p>${String.fromCharCode(65+index)} · ${esc(value)}</p>`).join("")}</div>` : ""}`;
         content += mode === "edit" ? field("答案文字", "answer_text", text, {multiline:true,hint:question.kind === "image" ? "文字可留空，图片必填" : "保留空格与换行，最多 1000 字"}) : `<span class="answer-caption">用户回答</span><div class="review-answer-text">${answer ? esc(text || "本题仅提交图片") : slot ? "本题答案已删除" : "尚未回答本题"}</div>`;
         content += question.answers?.length ? `<div class="review-reference"><strong>管理员参考答案</strong><p>${question.answers.map(value => esc(value)).join("<br/>")}</p></div>` : "";
-        content += `</section><section class="review-image-panel">${mode === "edit" ? artwork("answer_image",image || "","答案图片",{privateImage:true}) : image ? `<div class="review-image-loading" role="status">正在读取提交图片</div><img data-review-image="${esc(image)}" alt="当前用户本题提交的图片"/><div class="review-image-actions">${button("下载图片",{action:"review-download",attrs:`data-file="${esc(image)}"`,style:"text",glyph:"file"})}</div>` : `<div class="review-no-image">${icon("image")}<span>本题没有附图</span></div>`}</section></div>`;
+        content += `</section><section class="review-image-panel">${mode === "edit" ? `<div class="review-image-edit-list">${(images.length ? images : [""]).map((value,index) => artwork(index ? `answer_image_${index}` : "answer_image",value,`答案图片 ${index + 1}`,{privateImage:true})).join("")}</div>${button("添加图片",{action:"answer-add-image",style:"tonal",glyph:"plus",attrs:images.length >= 9 ? "disabled" : ""})}<p class="field-hint">每题最多 9 张，图片分别保留<br/>可更换或移除任意一张，保存后重新审核整份资料</p>` : images.length ? `<div class="review-image-gallery ${images.length > 1 ? "multiple" : ""}">${images.map((value,index) => `<figure class="review-image-item"><div class="review-image-loading" role="status">正在读取图片 ${index + 1}</div><img data-review-image="${esc(value)}" alt="当前用户本题提交的图片 ${index + 1}"/><figcaption class="review-image-actions">${button(`下载图片 ${index + 1}`,{action:"review-download",attrs:`data-file="${esc(value)}"`,style:"text",glyph:"file"})}</figcaption></figure>`).join("")}</div>` : `<div class="review-no-image">${icon("image")}<span>本题没有附图</span></div>`}</section></div>`;
         if (mode === "edit") content += `<div class="notice">${item.require_correct ? "当场答对模式仍需符合题目要求和参考答案" : "保存后整份资料需要重新审核，原通过结果会取消"}</div>`;
         if (mode === "delete") content += `<div class="answer-delete-confirm"><strong>确认删除本题答案？</strong><p>文字和图片会永久删除，其他题答案保留<br/>该用户恢复为资料未齐，补齐并审核通过后才有开奖资格</p></div>`;
         if (mode !== "view") content += `<div class="delete-notify-choice"><div><strong>是否私聊通知该用户</strong><p>只说明整体作答状态，不包含题号、错误原因或答案</p></div>${toggle("answer_notify",true,"通知用户")}</div>`;
@@ -218,12 +219,12 @@ export class ActivityView {
       } else footer += `<div class="review-navigation">${button("取消操作",{action:"answer-cancel",style:"text"})}${button(mode === "edit" ? "保存答案" : "确认删除本题答案",{action:mode === "edit" ? "answer-save" : "answer-delete-confirm",glyph:mode === "edit" ? "check" : "trash"})}</div>`;
       dialog.holder.querySelector(".review-actions-footer").innerHTML = footer;
       dialog.holder.querySelector(".modal-body").scrollTop = 0;
-      if (image && mode === "view") {
+      if (mode === "view") for (const image of images) {
         if (!assets.has(image)) assets.set(image,this.bridge.apiGet(`images/${image}`,{preview:"1"}));
         assets.get(image).then(data => {
           const element = dialog.holder.querySelector(`[data-review-image="${image}"]`);
-          if (!closed && element && /^data:image\/jpeg;base64,/.test(data.preview || "")) { element.src = data.preview; element.classList.add("loaded"); dialog.holder.querySelector(".review-image-loading")?.remove(); }
-        }).catch(() => { if (!closed && dialog.holder.querySelector(`[data-review-image="${image}"]`)) (dialog.holder.querySelector(".review-image-loading") || {}).textContent = "图片无法读取，可下载或稍后重试"; });
+          if (!closed && element && /^data:image\/jpeg;base64,/.test(data.preview || "")) { element.src = data.preview; element.classList.add("loaded"); element.parentElement.querySelector(".review-image-loading")?.remove(); }
+        }).catch(() => { const element = dialog.holder.querySelector(`[data-review-image="${image}"]`); if (!closed && element) (element.parentElement.querySelector(".review-image-loading") || {}).textContent = "图片无法读取，可下载或稍后重试"; });
       }
       if (mode === "edit") dialog.holder.querySelector('textarea[name="answer_text"]')?.focus();
     };
@@ -231,11 +232,17 @@ export class ActivityView {
     dialog.holder.addEventListener("click",async event => {
       const target = event.target.closest("button"), action = target?.dataset.action;
       if (!target || target.disabled || busy || closed) return;
-      if (dialog.holder.querySelector("meow-upload")?.busy && action?.startsWith("answer-")) { toast("请等待图片上传完成"); return; }
+      if ([...dialog.holder.querySelectorAll("meow-upload")].some(upload => upload.busy) && action?.startsWith("answer-")) { toast("请等待图片上传完成"); return; }
       if (target.dataset.reviewQuestion !== undefined && mode === "view") { questionIndex = Number(target.dataset.reviewQuestion); paint(); return; }
       if (action === "review-previous" || action === "review-next") { questionIndex += action === "review-previous" ? -1 : 1; paint(); return; }
       if (action === "answer-edit" || action === "answer-delete") { mode = action === "answer-edit" ? "edit" : "delete"; paint(); return; }
       if (action === "answer-cancel") { mode = "view"; paint(); return; }
+      if (action === "answer-add-image") {
+        const list = dialog.holder.querySelector(".review-image-edit-list"), index = list.querySelectorAll("meow-upload").length;
+        if (index < 9) list.insertAdjacentHTML("beforeend",artwork(`answer_image_${index}`,"",`答案图片 ${index + 1}`,{privateImage:true}));
+        target.disabled = index + 1 >= 9;
+        return;
+      }
       if (action === "review-download") {
         target.disabled = true;
         try { await this.bridge.download(`images/${target.dataset.file}`,{},`喵喵抽奖-${entry.user_id}-${target.dataset.file}`); }
@@ -258,11 +265,12 @@ export class ActivityView {
             const notify = dialog.holder.querySelector('meow-switch[name="answer_notify"]').value;
             payload = {action:action === "answer-save" ? "edit_answer" : "delete_answer",user_id:entry.user_id,question_index:questionIndex,revision:entry.answer_revision || 0,notify};
             if (action === "answer-save") {
-              const question = item.questions[questionIndex], text = dialog.holder.querySelector('[name="answer_text"]').value, image = dialog.holder.querySelector('meow-upload[name="answer_image"]').value;
+              const question = item.questions[questionIndex], text = dialog.holder.querySelector('[name="answer_text"]').value, images = [...new Set([...dialog.holder.querySelectorAll("meow-upload")].map(upload => upload.value).filter(Boolean))], image = images[0];
               const kind = ["image","mixed"].includes(question.kind) ? question.kind : "text";
               if (text.length > 1000 || kind !== "image" && !text.trim()) throw Error("本题需要 1–1000 字非空文字，空格与换行也计入长度");
               if (["image","mixed"].includes(kind) && !image) throw Error("本题需要一张图片，请上传后保存");
               payload.answer = kind === "image" ? {kind,value:image,text} : {kind,value:text,...(image ? {image} : {})};
+              if (images.length > 1) payload.answer.images = images;
             } else payload.confirmed = true;
           }
           await this.bridge.apiPost(`lotteries/${this.id}/review`,payload);

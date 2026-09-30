@@ -8,7 +8,268 @@ import time
 from copy import deepcopy
 
 import pytest
-from astrbot_plugin_catlottery.storage import Store, timestamp, validate_lottery
+from astrbot_plugin_catlottery.storage import (
+    Store,
+    answer_images,
+    timestamp,
+    validate_answer,
+    validate_lottery,
+)
+
+
+@pytest.mark.parametrize(
+    "images",
+    [None, "image.jpg", ["../../secret.jpg"], [True], ["f" * 32 + ".jpg"] * 10],
+)
+def test_multiple_attachment_validation_rejects_invalid_references(images):
+    with pytest.raises(ValueError):
+        validate_answer(
+            {"kind": "text"},
+            {"kind": "text", "value": "answer", "images": images},
+            False,
+        )
+
+
+def test_multi_attachment_normalization_preserves_legacy_and_order():
+    first, second = "1" * 32 + ".jpg", "2" * 32 + ".jpg"
+    answer = validate_answer(
+        {"kind": "image"},
+        {
+            "kind": "image",
+            "value": first,
+            "images": [second, first, second],
+            "text": "  exact  ",
+        },
+        False,
+    )
+    assert answer_images(answer) == [first, second]
+    assert answer["text"] == "  exact  " and answer["correct"] is None
+    assert answer_images({"kind": "text", "image": first}) == [first]
+
+
+@pytest.mark.parametrize(
+    "action", ["edit_answer", "delete_answer", "delete_entries", "withdraw", "delete"]
+)
+async def test_multi_image_management_removes_only_unreferenced_files(
+    store, rules, sender, action
+):
+    rules.update(require_correct=False, questions=[{"kind": "mixed", "prompt": "图片"}])
+    item = await store.save(rules, "admin")
+    await store.enroll(item["id"], sender)
+    filenames = [str(number) * 32 + ".jpg" for number in (1, 2, 3)]
+    for filename in filenames:
+        (store.directory / "uploads" / filename).write_bytes(b"private attachment")
+    await store.answer(
+        item["id"],
+        {**sender, "group_id": ""},
+        {
+            "kind": "mixed",
+            "value": "private",
+            "image": filenames[0],
+            "images": filenames[:2],
+        },
+        0,
+    )
+    other = await store.save({**rules, "title": "another activity"}, "admin")
+    await store.enroll(other["id"], sender)
+    await store.answer(
+        other["id"],
+        {**sender, "group_id": ""},
+        {"kind": "mixed", "value": "shared legacy record", "image": filenames[1]},
+        0,
+    )
+    entry = await store.entry(item["id"], sender["user_id"])
+    if action == "withdraw":
+        await store.withdraw(item["id"], sender)
+    elif action == "delete":
+        await store.action(item["id"], "cancel")
+        await store.delete(item["id"])
+    else:
+        payload = {
+            "action": action,
+            "user_id": sender["user_id"],
+            "user_ids": [sender["user_id"]],
+            "question_index": 0,
+            "revision": entry["answer_revision"],
+            "revisions": {sender["user_id"]: entry["answer_revision"]},
+            "confirmed": True,
+            "notify": False,
+        }
+        if action == "edit_answer":
+            payload["answer"] = {
+                "kind": "mixed",
+                "value": "changed",
+                "images": [filenames[2], filenames[1]],
+            }
+        await store.manage_answers(item["id"], payload, "admin")
+    assert not (store.directory / "uploads" / filenames[0]).exists()
+    assert (store.directory / "uploads" / filenames[1]).exists()
+    if action == "edit_answer":
+        saved = await store.entry(item["id"], sender["user_id"])
+        assert answer_images(saved["answers"][0]) == [filenames[2], filenames[1]]
+        assert saved["review_status"] == "pending"
+
+
+async def test_admin_cannot_bind_another_answers_secondary_image(
+    store, sender, managed_form
+):
+    item, entry = managed_form
+    second = "2" * 32 + ".jpg"
+    (store.directory / "uploads" / second).write_bytes(b"secondary")
+    await store.manage_answers(
+        item["id"],
+        {
+            "action": "edit_answer",
+            "user_id": sender["user_id"],
+            "question_index": 1,
+            "revision": entry["answer_revision"],
+            "notify": False,
+            "answer": {**entry["answers"][1], "images": [second]},
+        },
+        "admin",
+    )
+    entry = await store.entry(item["id"], sender["user_id"])
+    with pytest.raises(ValueError, match="其他答案"):
+        await store.manage_answers(
+            item["id"],
+            {
+                "action": "edit_answer",
+                "user_id": sender["user_id"],
+                "question_index": 0,
+                "revision": entry["answer_revision"],
+                "notify": False,
+                "answer": {"kind": "text", "value": "stolen image", "images": [second]},
+            },
+            "admin",
+        )
+
+
+async def test_approved_group_repeat_after_cutoff_preserves_qualification(
+    store, rules, sender, monkeypatch
+):
+    item = await store.save(rules, "admin")
+    entry, _ = await store.enroll(item["id"], sender)
+    monkeypatch.setattr(time, "time", lambda: item["close_at"])
+    repeated, created = await store.enroll(item["id"], sender, restart_existing=True)
+    assert repeated == entry and not created
+    assert await store.private_session(sender["bot_id"], sender["user_id"]) is None
+
+
+async def test_answer_mode_expires_once_and_survives_reload(
+    store, rules, sender, monkeypatch
+):
+    start = time.time()
+    monkeypatch.setattr(time, "time", lambda: start)
+    rules.update(
+        require_correct=False,
+        questions=[
+            {"kind": "text", "prompt": "第一题"},
+            {"kind": "text", "prompt": "第二题"},
+        ],
+    )
+    item = await store.save(rules, "admin")
+    await store.enroll(item["id"], sender)
+    deadline = (await store.entry(item["id"], sender["user_id"]))["mode_expires_at"]
+    assert deadline == start + 1200
+    await store.answer(
+        item["id"], {**sender, "group_id": ""}, {"kind": "text", "value": "保留答案"}, 0
+    )
+    await store.queue_question(item["id"], sender["bot_id"], sender["user_id"])
+    await store.close()
+    await store.open()
+    assert (await store.entry(item["id"], sender["user_id"]))[
+        "mode_expires_at"
+    ] == deadline
+    assert await store.expire_forms(now=math.nextafter(deadline, -math.inf)) == 0
+    assert await store.expire_forms(now=deadline) == 1
+    assert await store.expire_forms(now=deadline) == 0
+    entry = await store.entry(item["id"], sender["user_id"])
+    assert entry["answers"][0]["value"] == "保留答案"
+    notices = [json.loads(row["body"]) for row in await store.deliveries()]
+    assert len(notices) == 1 and notices[0]["kind"] == "form_timeout"
+    assert notices[0]["target"]["channel"] == "private"
+    assert "保留答案" not in json.dumps(notices, ensure_ascii=False)
+    monkeypatch.setattr(time, "time", lambda: deadline + 1)
+    await store.private_session(sender["bot_id"], sender["user_id"], item["id"])
+    assert await store.form_position(sender["bot_id"], sender["user_id"]) == 1
+    assert (await store.entry(item["id"], sender["user_id"]))[
+        "mode_expires_at"
+    ] == deadline + 1201
+    assert not await store.deliveries()
+
+
+@pytest.mark.parametrize("state", ["incomplete", "pending", "rejected", "approved"])
+async def test_group_reentry_restarts_only_unsuccessful_forms(
+    store, rules, sender, state
+):
+    rules.update(
+        require_correct=False,
+        questions=[
+            {"kind": "text", "prompt": "第一题"},
+            {"kind": "text", "prompt": "第二题"},
+        ],
+    )
+    item = await store.save(rules, "admin")
+    await store.enroll(item["id"], sender)
+    private = {**sender, "group_id": ""}
+    await store.answer(item["id"], private, {"kind": "text", "value": "第一份答案"}, 0)
+    if state != "incomplete":
+        await store.answer(
+            item["id"], private, {"kind": "text", "value": "第二份答案"}, 1
+        )
+    if state in {"rejected", "approved"}:
+        await store.review(
+            item["id"],
+            {
+                "action": "decision",
+                "user_id": sender["user_id"],
+                "correct": state == "approved",
+            },
+            "admin",
+        )
+    before = await store.entry(item["id"], sender["user_id"])
+    entry, created = await store.enroll(item["id"], sender, restart_existing=True)
+    assert created is False
+    if state == "approved":
+        assert entry["answers"] == before["answers"]
+        assert entry["answer_revision"] == before["answer_revision"]
+        assert await store.private_session(sender["bot_id"], sender["user_id"]) is None
+    else:
+        assert entry["answers"] == [] and entry["status"] == "pending"
+        assert "review_decision" not in entry
+        assert entry["answer_revision"] == before["answer_revision"] + 1
+        assert await store.form_position(sender["bot_id"], sender["user_id"]) == 0
+        assert not await store.deliveries()
+
+
+async def test_expired_or_replaced_mode_cannot_accept_inflight_answer(
+    store, rules, sender, monkeypatch
+):
+    start = time.time()
+    monkeypatch.setattr(time, "time", lambda: start)
+    rules["questions"] = [{"kind": "text", "prompt": "资料"}]
+    item = await store.save(rules, "admin")
+    await store.enroll(item["id"], sender)
+    deadline = start + 1200
+    monkeypatch.setattr(time, "time", lambda: start + 1)
+    await store.enroll(item["id"], sender, restart_existing=True)
+    with pytest.raises(ValueError, match="重新开启"):
+        await store.answer(
+            item["id"],
+            {**sender, "group_id": ""},
+            {"kind": "text", "value": "旧模式答案"},
+            0,
+            mode_expires_at=deadline,
+        )
+    monkeypatch.setattr(time, "time", lambda: deadline + 1)
+    with pytest.raises(ValueError, match="已退出"):
+        await store.answer(
+            item["id"],
+            {**sender, "group_id": ""},
+            {"kind": "text", "value": "过期答案"},
+            0,
+        )
+    assert not (await store.entry(item["id"], sender["user_id"]))["answers"]
 
 
 @pytest.mark.parametrize("mode", ["once", "repeat"])
