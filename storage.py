@@ -18,7 +18,7 @@ from typing import Any
 import aiosqlite
 
 CHINA_TZ = timezone(timedelta(hours=8))
-FORM_MODE_SECONDS = 20 * 60
+FORM_MODE_SECONDS = 30 * 60
 logger = logging.getLogger("astrbot.plugin.astrbot_plugin_catlottery")
 
 
@@ -823,6 +823,14 @@ class Store:
                         "(json_extract(body,'$.kind')='review' AND json_extract(body,'$.entry.review_status')='pending'))",
                         (lottery_id,),
                     )
+                # Failed reviews are private, including jobs created by older versions.
+                await self.db.execute(
+                    "DELETE FROM outbox WHERE lottery_id=? AND delivered_at IS NULL "
+                    "AND json_extract(body,'$.target.channel')='group' "
+                    "AND json_extract(body,'$.kind')='review' "
+                    "AND json_extract(body,'$.entry.review_status')='rejected'",
+                    (lottery_id,),
+                )
                 if schedule_changed:
                     await self.db.execute(
                         "DELETE FROM outbox WHERE lottery_id=? AND delivered_at IS NULL "
@@ -1947,6 +1955,8 @@ class Store:
             ]
             if (
                 kind in {"question", "answer_changed", "form_timeout"}
+                or kind == "review"
+                and entry.get("review_status") == "rejected"
                 or (
                     not item.get("group_success_notify", True)
                     and (

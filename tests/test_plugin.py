@@ -12,6 +12,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
 import pytest
+from aiocqhttp.exceptions import ActionFailed
 from astrbot.api.message_components import Image, Plain, Reply
 from astrbot.api.web import PluginRequest, bind_request_context
 from astrbot.core.pipeline.context import PipelineContext
@@ -304,7 +305,7 @@ async def dispatch(plugin, monkeypatch):
             handler_module_path="test_private_chat",
             handler=competing_chat,
             event_filters=[EventMessageTypeFilter(EventMessageType.PRIVATE_MESSAGE)],
-            extras_configs={"priority": 20},
+            extras_configs={"priority": 10_000},
         )
     )
     monkeypatch.setitem(
@@ -392,6 +393,34 @@ async def test_private_form_completion_never_falls_back_to_llm(plugin, rules, di
     assert await plugin.store.private_session("1234567", "4444444") is None
     assert current._has_send_oper
     chat.assert_not_awaited()
+
+
+async def test_thirty_minute_mode_owns_answers_until_the_exact_deadline(
+    plugin, rules, dispatch, monkeypatch
+):
+    started = time.time()
+    monkeypatch.setattr(time, "time", lambda: started)
+    rules["questions"] = [
+        {"kind": "text", "prompt": "第一题"},
+        {"kind": "text", "prompt": "第二题"},
+    ]
+    item = await plugin.store.save(rules, "admin")
+    await plugin.store.enroll(item["id"], plugin.identity(event(plugin)))
+    run, chat = dispatch
+    monkeypatch.setattr(time, "time", lambda: started + 29 * 60)
+    answer = event(plugin, group="", text="accepted after twenty minutes")
+    await run(answer)
+    entry = await plugin.store.entry(item["id"], "4444444")
+    assert entry["answers"][0]["value"] == "accepted after twenty minutes"
+    assert answer.is_stopped()
+    chat.assert_not_awaited()
+    monkeypatch.setattr(time, "time", lambda: started + 30 * 60)
+    await run(event(plugin, group="", text="ordinary chat after timeout"))
+    chat.assert_awaited_once()
+    entry = await plugin.store.entry(item["id"], "4444444")
+    assert len(entry["answers"]) == 1
+    notices = [json.loads(row["body"]) for row in await plugin.store.deliveries()]
+    assert len(notices) == 1 and notices[0]["kind"] == "form_timeout"
 
 
 async def test_invalid_private_answer_stays_in_form_without_chat(
@@ -748,7 +777,7 @@ async def test_quoted_answer_ignores_reference_and_echoes_only_actual_own_answer
     ] == original
     assert original in str(captured).replace("\\n", "\n")
     assert "不应读取" not in str(captured) and "错误引用" not in str(captured)
-    assert "20 分钟" in str(captured)
+    assert "30 分钟" in str(captured)
     chat.assert_not_awaited()
 
 
@@ -2060,11 +2089,16 @@ async def test_private_answer_image_upload_is_authenticated_and_not_public_artwo
     assert preview.status_code == 200 and preview.headers["cache-control"] == "no-store"
 
 
+@pytest.mark.parametrize("muted", [False, True])
+@pytest.mark.parametrize("closed", [False, True])
 async def test_web_review_only_accepts_whole_form_and_failure_notices_are_generic(
-    plugin, rules, monkeypatch
+    plugin, rules, monkeypatch, muted, closed
 ):
     rules.update(
-        require_correct=False, questions=[{"kind": "text", "prompt": "secret question"}]
+        require_correct=False,
+        group_success_notify=not muted,
+        group_pending_notify=not muted,
+        questions=[{"kind": "text", "prompt": "secret question"}],
     )
     item = await plugin.store.save(rules, "admin")
     await plugin.join(event(plugin), item["id"])
@@ -2085,18 +2119,148 @@ async def test_web_review_only_accepts_whole_form_and_failure_notices_are_generi
         }
     ):
         assert (await plugin.web_review(item["id"])).status_code == 200
+    if closed:
+        monkeypatch.setattr(time, "time", lambda: item["close_at"])
+    plugin.context.get_platform_inst("napcat").client.calls.clear()
     captured = []
     monkeypatch.setattr(
         "astrbot_plugin_catlottery.main.render_pages",
         lambda *args, **kwargs: captured.append(args) or [b"image"],
     )
     await plugin.send_deliveries()
-    assert len(captured) == 2
+    assert len(captured) == 1
     assert "整体作答未通过" in str(captured)
     assert not any(
         value in str(captured)
         for value in ("secret question", "private answer", "第 1", "第1")
     )
+    sends = [
+        (action, params)
+        for action, params in plugin.context.get_platform_inst("napcat").client.calls
+        if action in {"send_group_msg", "send_private_msg"}
+    ]
+    assert len(sends) == 1 and sends[0][0] == "send_private_msg"
+    assert sends[0][1]["user_id"] == 4444444
+    if closed:
+        assert "无法重新填写" in str(captured)
+        assert "/抽奖 参与" not in str(captured)
+    else:
+        assert f"/抽奖 参与 {item['id']}" in str(captured)
+        assert "QQ 群 2222222" in str(captured)
+        assert "从第一题重新作答" in str(captured)
+
+
+async def test_legacy_rejected_group_notice_is_suppressed_when_retrying(
+    plugin, rules, monkeypatch
+):
+    rules.update(require_correct=False, questions=[{"kind": "text", "prompt": "资料"}])
+    item = await plugin.store.save(rules, "admin")
+    identity = plugin.identity(event(plugin))
+    await plugin.store.enroll(item["id"], identity)
+    await plugin.store.answer(
+        item["id"], {**identity, "group_id": ""}, {"kind": "text", "value": "answer"}, 0
+    )
+    await plugin.store.review(
+        item["id"],
+        {"action": "decision", "user_id": "4444444", "correct": False},
+        "admin",
+    )
+    notice = json.loads((await plugin.store.deliveries())[0]["body"])
+    notice["target"].update(channel="group", recipient="2222222")
+    await plugin.store.db.execute(
+        "INSERT INTO outbox (id,lottery_id,body,attempts) VALUES (?,?,?,?)",
+        ("legacy-rejected-group", item["id"], json.dumps(notice), 4),
+    )
+    monkeypatch.setattr(plugin_module, "render_pages", lambda *a, **k: [b"image"])
+    await plugin.send_deliveries()
+    calls = plugin.context.get_platform_inst("napcat").client.calls
+    assert [action for action, _ in calls] == ["send_private_msg"]
+    assert not await plugin.store.deliveries()
+
+
+@pytest.mark.parametrize("pending", [False, True])
+async def test_group_policy_change_while_avatar_loading_revokes_fetched_notice(
+    plugin, rules, monkeypatch, pending
+):
+    if pending:
+        rules.update(
+            require_correct=False, questions=[{"kind": "text", "prompt": "资料"}]
+        )
+    item = await plugin.store.save(rules, "admin")
+    identity = plugin.identity(event(plugin))
+    await plugin.store.enroll(item["id"], identity)
+    if pending:
+        await plugin.store.answer(
+            item["id"],
+            {**identity, "group_id": ""},
+            {"kind": "text", "value": "answer"},
+            0,
+        )
+    reached, release = asyncio.Event(), asyncio.Event()
+
+    async def avatar(*args):
+        reached.set()
+        await release.wait()
+        return None
+
+    plugin.avatars.get = avatar
+    monkeypatch.setattr(plugin_module, "render_pages", lambda *a, **k: [b"image"])
+    sending = asyncio.create_task(plugin.send_deliveries())
+    await asyncio.wait_for(reached.wait(), 2)
+    await plugin.store.save(
+        {**rules, "group_success_notify": False, "group_pending_notify": False},
+        "admin",
+        item["id"],
+    )
+    release.set()
+    await sending
+    assert [
+        action for action, _ in plugin.context.get_platform_inst("napcat").client.calls
+    ] == ["send_private_msg"]
+
+
+@pytest.mark.parametrize(
+    ("wording", "reason", "hint"),
+    [
+        ("发送失败，请先添加对方为好友", "friend_required", "添加我为好友"),
+        ("failed to resolve UID for UIN 4444444", "uid_unresolved", "无法识别目标用户"),
+        ("rate limit: access_token=secret", "onebot_action_failed", "账号状态"),
+    ],
+)
+async def test_question_transport_failure_has_safe_diagnostics_and_recovers(
+    plugin, rules, monkeypatch, wording, reason, hint
+):
+    rules["questions"] = [{"kind": "text", "prompt": "secret question"}]
+    item = await plugin.store.save(rules, "admin")
+    identity = plugin.identity(event(plugin))
+    await plugin.store.enroll(item["id"], identity)
+    await plugin.store.queue_question(item["id"], "1234567", "4444444")
+    client = plugin.context.get_platform_inst("napcat").client
+    transport = client.call_action
+
+    async def fail(action, **kwargs):
+        raise ActionFailed({"retcode": 100, "wording": wording, "status": "failed"})
+
+    client.call_action = fail
+    monkeypatch.setattr(plugin_module, "render_pages", lambda *a, **k: [b"image"])
+    monkeypatch.setattr(plugin.logger, "warning", Mock())
+    await plugin.send_deliveries()
+    jobs = await plugin.store.deliveries()
+    # Retries are delayed, while the failed row remains visible to the administrator.
+    assert not jobs
+    details = await plugin.store.manage_entries(item["id"])
+    failed = details["deliveries"][0]
+    assert failed["attempts"] == 1 and hint in failed["error"]
+    assert "secret" not in failed["error"]
+    warning = plugin.logger.warning.call_args.args
+    assert warning[-2:] == (100, reason)
+    assert "secret" not in str(warning)
+    assert await plugin.store.private_session("1234567", "4444444") == item["id"]
+    assert (await plugin.store.entry(item["id"], "4444444"))["answers"] == []
+    client.call_action = transport
+    await plugin.store.queue_question(item["id"], "1234567", "4444444")
+    await plugin.send_deliveries()
+    assert [action for action, _ in client.calls] == ["send_private_msg"]
 
 
 @pytest.mark.parametrize("notify", [True, False])

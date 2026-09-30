@@ -170,7 +170,7 @@ async def test_answer_mode_expires_once_and_survives_reload(
     item = await store.save(rules, "admin")
     await store.enroll(item["id"], sender)
     deadline = (await store.entry(item["id"], sender["user_id"]))["mode_expires_at"]
-    assert deadline == start + 1200
+    assert deadline == start + 1800
     await store.answer(
         item["id"], {**sender, "group_id": ""}, {"kind": "text", "value": "保留答案"}, 0
     )
@@ -194,7 +194,7 @@ async def test_answer_mode_expires_once_and_survives_reload(
     assert await store.form_position(sender["bot_id"], sender["user_id"]) == 1
     assert (await store.entry(item["id"], sender["user_id"]))[
         "mode_expires_at"
-    ] == deadline + 1201
+    ] == deadline + 1801
     assert not await store.deliveries()
 
 
@@ -250,7 +250,7 @@ async def test_expired_or_replaced_mode_cannot_accept_inflight_answer(
     rules["questions"] = [{"kind": "text", "prompt": "资料"}]
     item = await store.save(rules, "admin")
     await store.enroll(item["id"], sender)
-    deadline = start + 1200
+    deadline = start + 1800
     monkeypatch.setattr(time, "time", lambda: start + 1)
     await store.enroll(item["id"], sender, restart_existing=True)
     with pytest.raises(ValueError, match="重新开启"):
@@ -582,6 +582,47 @@ async def test_pending_notice_switch_mutes_only_group_pending_and_survives_resta
         if m["item"]["id"] == item["id"]
         and m.get("entry", {}).get("review_status") == "pending"
     ] == ["private"]
+
+
+@pytest.mark.parametrize("success_notify", [False, True])
+@pytest.mark.parametrize("pending_notify", [False, True])
+async def test_rejected_review_is_private_for_every_group_notification_policy(
+    store, rules, sender, success_notify, pending_notify
+):
+    rules.update(
+        require_correct=False,
+        group_success_notify=success_notify,
+        group_pending_notify=pending_notify,
+        questions=[{"kind": "text", "prompt": "private question"}],
+    )
+    item = await store.save(rules, "admin")
+    await store.enroll(item["id"], sender)
+    await store.answer(
+        item["id"],
+        {**sender, "group_id": ""},
+        {"kind": "text", "value": "private answer"},
+        0,
+    )
+    await store.review(
+        item["id"],
+        {"action": "decision", "user_id": sender["user_id"], "correct": False},
+        "admin",
+    )
+    messages = [json.loads(row["body"]) for row in await store.deliveries()]
+    assert len(messages) == 1
+    assert messages[0]["kind"] == "review"
+    assert messages[0]["target"]["channel"] == "private"
+    assert messages[0]["target"]["recipient"] == sender["user_id"]
+    assert "private answer" not in json.dumps(messages)
+    legacy = deepcopy(messages[0])
+    legacy["target"].update(channel="group", recipient=sender["group_id"])
+    await store.db.execute(
+        "INSERT INTO outbox (id,lottery_id,body) VALUES (?,?,?)",
+        ("legacy-rejected-review", item["id"], json.dumps(legacy)),
+    )
+    await store.save(rules, "admin", item["id"])
+    messages = [json.loads(row["body"]) for row in await store.deliveries()]
+    assert len(messages) == 1 and messages[0]["target"]["channel"] == "private"
 
 
 @pytest.mark.parametrize(

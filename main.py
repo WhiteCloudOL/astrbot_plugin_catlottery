@@ -19,6 +19,7 @@ from pathlib import Path
 from urllib.parse import unquote, urlsplit
 
 import aiohttp
+from aiocqhttp.exceptions import ActionFailed
 from aiocqhttp.exceptions import Error as OneBotError
 from astrbot.api.event import AstrMessageEvent, MessageChain, filter
 from astrbot.api.message_components import Image, Plain
@@ -35,6 +36,7 @@ from PIL import ImageOps, UnidentifiedImageError
 from .avatars import AvatarCache
 from .cards import FONT_PATH, LOGO_PATH, CardSection, render_announcement, render_pages
 from .storage import (
+    FORM_MODE_SECONDS,
     Store,
     answer_images,
     date_text,
@@ -44,6 +46,7 @@ from .storage import (
 )
 
 PLUGIN_NAME = "astrbot_plugin_catlottery"
+FORM_HANDLER_PRIORITY = 100_000
 TOOL_NAMES = (
     "catlottery_list",
     "catlottery_info",
@@ -62,7 +65,7 @@ HELP = [
     ),
     (
         "私聊 · 补充报名资料",
-        "请先添加我为好友，再私聊回答\n作答模式持续 20 分钟，到期用 /抽奖 继续 恢复\n首条回答后收集 5 秒，可补充文字和多张图片\n等我确认保存并发送下一题后，再回答下一题\n/抽奖 上一题 · 查看并修改上一题答案\n/抽奖 下一题 · 前往已回答题的下一题\n/抽奖 取消回答 · 暂停并保留已保存资料\n/抽奖 继续 · 恢复回答\n/抽奖 待办 · 查看并切换多场待办\n/抽奖 回答 内容 · 可附图片，保留空格与换行",
+        "请先添加我为好友，再私聊回答\n作答模式持续 30 分钟，到期用 /抽奖 继续 恢复\n首条回答后收集 5 秒，可补充文字和多张图片\n等我确认保存并发送下一题后，再回答下一题\n/抽奖 上一题 · 查看并修改上一题答案\n/抽奖 下一题 · 前往已回答题的下一题\n/抽奖 取消回答 · 暂停并保留已保存资料\n/抽奖 继续 · 恢复回答\n/抽奖 待办 · 查看并切换多场待办\n/抽奖 回答 内容 · 可附图片，保留空格与换行",
     ),
     (
         "管理员 · 管理抽奖",
@@ -137,7 +140,7 @@ def question_sections(
         sections.insert(
             2,
             (
-                "抽奖作答模式 · 20 分钟",
+                "抽奖作答模式 · 30 分钟",
                 f"本轮至 {date_text(entry['mode_expires_at'])}（北京时间）\n到期保留答案并退出，私聊发送 /抽奖 继续 可恢复",
             ),
         )
@@ -1048,7 +1051,9 @@ class CatLottery(Star):
 
     # AstrBot takes registration priority from the innermost decorator.
     @filter.command("抽奖")
-    @filter.platform_adapter_type(filter.PlatformAdapterType.AIOCQHTTP, priority=90)
+    @filter.platform_adapter_type(
+        filter.PlatformAdapterType.AIOCQHTTP, priority=FORM_HANDLER_PRIORITY + 10
+    )
     async def lottery_command(self, event: AstrMessageEvent):
         """Dispatch /抽奖 subcommands and render every outcome, including syntax errors.
 
@@ -1395,7 +1400,9 @@ class CatLottery(Star):
             # A reply failure must not trigger another send through the same broken transport.
 
     @filter.event_message_type(filter.EventMessageType.ALL)
-    @filter.platform_adapter_type(filter.PlatformAdapterType.AIOCQHTTP, priority=81)
+    @filter.platform_adapter_type(
+        filter.PlatformAdapterType.AIOCQHTTP, priority=FORM_HANDLER_PRIORITY + 1
+    )
     async def restore_friend_forms(self, event: AstrMessageEvent):
         """Restore existing group reservations after a verified OneBot friend-add notice.
 
@@ -1468,8 +1475,11 @@ class CatLottery(Star):
             if self.private_windows.get(scope) is window:
                 del self.private_windows[scope]
 
-    @filter.event_message_type(filter.EventMessageType.PRIVATE_MESSAGE)
-    @filter.platform_adapter_type(filter.PlatformAdapterType.AIOCQHTTP, priority=80)
+    # Own raw answer events before ordinary chat and generic debounce handlers.
+    @filter.event_message_type(filter.EventMessageType.ALL)
+    @filter.platform_adapter_type(
+        filter.PlatformAdapterType.AIOCQHTTP, priority=FORM_HANDLER_PRIORITY
+    )
     async def collect_private(
         self,
         event: AstrMessageEvent,
@@ -1484,6 +1494,8 @@ class CatLottery(Star):
             content: Explicit answer command content, including text starting with a slash.
             submission: Captured collection window, supplied only by the owned timer.
         """
+        if not event.is_private_chat():
+            return
         text = (
             content
             if content is not None
@@ -1528,7 +1540,7 @@ class CatLottery(Star):
                 first = next(iter(self.private_receipts))
                 if (
                     len(self.private_receipts) <= 10000
-                    and now - self.private_receipts[first] < 1200
+                    and now - self.private_receipts[first] < FORM_MODE_SECONDS
                 ):
                     break
                 self.private_receipts.popitem(last=False)
@@ -1547,6 +1559,13 @@ class CatLottery(Star):
             if lottery_id is None:
                 if submission is not None:
                     self.wake.set()
+                else:
+                    self.logger.debug(
+                        "Private message has no active lottery mode; platform=%s bot=%s user=%s.",
+                        identity["platform_id"],
+                        identity["bot_id"],
+                        identity["user_id"],
+                    )
                 return
             entry = await self.store.entry(lottery_id, identity["user_id"])
             if entry and entry["platform_id"] != identity["platform_id"]:
@@ -1658,6 +1677,15 @@ class CatLottery(Star):
                         window["images"].append(image)
                         window["image_sources"].add(source)
                 if first:
+                    self.logger.info(
+                        "Lottery %s private answer window started; platform=%s bot=%s user=%s "
+                        "question=%d duration=5s; downstream message handlers stopped.",
+                        lottery_id,
+                        identity["platform_id"],
+                        identity["bot_id"],
+                        identity["user_id"],
+                        index + 1,
+                    )
                     try:
                         await event.send(
                             MessageChain(
@@ -1941,7 +1969,7 @@ class CatLottery(Star):
                     self.private_receipts = OrderedDict(
                         (key, value)
                         for key, value in self.private_receipts.items()
-                        if now - value < 1200
+                        if now - value < FORM_MODE_SECONDS
                     )
                     removed = await self.store.cleanup_artwork()
                     if removed:
@@ -2015,7 +2043,9 @@ class CatLottery(Star):
                         )
                         continue
                     if target["channel"] == "group" and (
-                        not live["item"]["group_success_notify"]
+                        kind == "review"
+                        and message["entry"].get("review_status") == "rejected"
+                        or not live["item"]["group_success_notify"]
                         and (
                             kind == "success"
                             or kind == "review"
@@ -2083,7 +2113,7 @@ class CatLottery(Star):
                         sections = [
                             (
                                 "恢复作答",
-                                "本轮 20 分钟已结束，你已填写的答案会保留\n报名截止前，私聊发送 /抽奖 继续 可恢复作答\n有多场待办时发送 /抽奖 待办 选择活动\n也可回原报名群发送 /抽奖 参与 "
+                                "本轮 30 分钟已结束，你已填写的答案会保留\n报名截止前，私聊发送 /抽奖 继续 可恢复作答\n有多场待办时发送 /抽奖 待办 选择活动\n也可回原报名群发送 /抽奖 参与 "
                                 + item["id"]
                                 + "，从第一题重新作答",
                             )
@@ -2119,9 +2149,26 @@ class CatLottery(Star):
                         explanation = {
                             "approved": "已成功参与，每个 QQ 号仅计一次，已获得开奖资格。",
                             "pending": "资料已提交，请等待管理员审核。整份资料审核通过后才有开奖资格。",
-                            "rejected": "整体作答未通过审核，暂无开奖资格，请联系活动管理员",
+                            "rejected": "整体作答未通过审核，暂无开奖资格",
                             "incomplete": "资料尚未填写完整，暂无开奖资格",
                         }[status]
+                        if status == "rejected":
+                            if (
+                                item["status"] == "open"
+                                and time.time() < item["close_at"]
+                            ):
+                                title = "审核未通过 · 请重新填写"
+                                explanation = (
+                                    "整体作答未通过审核，请在报名截止前重新填写\n"
+                                    f"回原报名群（QQ 群 {entry['group_id']}）发送 /抽奖 参与 {item['id']}\n"
+                                    "我会私聊发送题目，从第一题重新作答，完成后等待管理员审核"
+                                )
+                            else:
+                                title = "审核未通过 · 已停止报名"
+                                explanation = (
+                                    "整体作答未通过审核，本场已停止报名，无法重新填写\n"
+                                    "请联系活动管理员处理"
+                                )
                         if kind == "answer_changed":
                             title = (
                                 "整体作答未通过"
@@ -2301,13 +2348,45 @@ class CatLottery(Star):
                         target["channel"],
                     )
                 except NETWORK_ERRORS as exc:
-                    await self.store.delivery_done(row["id"], type(exc).__name__)
+                    error = type(exc).__name__
+                    reason, retcode = "transport_failure", None
+                    if isinstance(exc, ActionFailed):
+                        result = exc.result if isinstance(exc.result, dict) else {}
+                        wording = str(result.get("wording", "")).casefold()
+                        retcode = result.get("retcode")
+                        if type(retcode) is not int:
+                            retcode = None
+                        if "好友" in wording or "friend" in wording:
+                            reason = "friend_required"
+                            error += ": QQ 要求该用户先添加我为好友"
+                        elif "resolve uid" in wording:
+                            reason = "uid_unresolved"
+                            error += ": QQ 无法识别目标用户，请重新添加我为好友"
+                        else:
+                            reason = "onebot_action_failed"
+                            error += ": QQ 拒绝发送，请检查账号状态后重试"
+                        if target["channel"] == "private" and reason in {
+                            "friend_required",
+                            "uid_unresolved",
+                        }:
+                            error += (
+                                "，再私聊发送 /抽奖 继续"
+                                if kind == "question"
+                                else "，再在管理页重试通知"
+                            )
+                    await self.store.delivery_done(row["id"], error)
                     self.logger.warning(
-                        "Lottery %s %s notice failed for %s; retry queued (%s).",
+                        "Lottery %s %s notice failed; channel=%s platform=%s bot=%s recipient=%s "
+                        "error=%s retcode=%s reason=%s; retry queued.",
                         item["id"],
                         message["kind"],
                         target["channel"],
+                        target["platform_id"],
+                        target["bot_id"],
+                        target["recipient"],
                         type(exc).__name__,
+                        retcode,
+                        reason,
                     )
                 except (ValueError, KeyError, TypeError) as exc:
                     await self.store.delivery_done(row["id"], type(exc).__name__)
