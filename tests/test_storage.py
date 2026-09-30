@@ -1233,7 +1233,7 @@ async def test_paged_management_search_filters_and_bulk_review_are_atomic(
     approved = await store.manage_entries(item["id"], page=1, status="approved")
     assert [entry["user_id"] for entry in approved["entries"]] == selected
     assert (await store.entry(item["id"], "4444446"))["review_status"] == "pending"
-    for invalid in ["9999999", str(4444444 + 64)]:
+    for invalid in ["9999999"]:
         with pytest.raises(ValueError):
             await store.review(
                 item["id"],
@@ -1247,6 +1247,13 @@ async def test_paged_management_search_filters_and_bulk_review_are_atomic(
         assert (await store.entry(item["id"], selected[0]))[
             "review_status"
         ] == "approved"
+    await store.review(
+        item["id"],
+        {"action": "bulk", "user_ids": [str(4444444 + 64)], "correct": True},
+        "operator",
+    )
+    unfinished = await store.entry(item["id"], str(4444444 + 64))
+    assert unfinished["review_status"] == "approved" and unfinished["answers"] == []
     assert (await store.manage_entries(item["id"], page=10000))["page"] == 4
 
 
@@ -2384,3 +2391,205 @@ async def test_admin_deletion_pauses_old_prompt_before_the_user_can_reply(
     assert (await store.entry(item["id"], sender["user_id"]))["answers"][0][
         "kind"
     ] == "deleted"
+
+
+@pytest.mark.parametrize("require_correct", [False, True])
+@pytest.mark.parametrize("answer_count", [0, 1])
+@pytest.mark.parametrize("correct", [False, True])
+async def test_manual_decision_concludes_incomplete_form_without_fabricating_answers(
+    store, rules, sender, require_correct, answer_count, correct
+):
+    rules.update(
+        require_correct=require_correct,
+        group_success_notify=False,
+        group_pending_notify=False,
+        questions=[
+            {"kind": "text", "prompt": "第一题"},
+            {"kind": "mixed", "prompt": "尚未提交的图文"},
+        ],
+    )
+    item = await store.save(rules, "admin")
+    await store.enroll(item["id"], sender)
+    if answer_count:
+        await store.answer(
+            item["id"],
+            {**sender, "group_id": ""},
+            {"kind": "text", "value": "  原样答案  "},
+            0,
+        )
+    before = await store.entry(item["id"], sender["user_id"])
+    result = await store.review(
+        item["id"],
+        {
+            "action": "decision",
+            "user_id": sender["user_id"],
+            "correct": correct,
+            "revision": before["answer_revision"],
+        },
+        "web:reviewer",
+    )
+    saved = await store.entry(item["id"], sender["user_id"])
+    assert saved["answers"] == before["answers"]
+    assert saved["status"] == "complete"
+    assert saved["review_status"] == ("approved" if correct else "rejected")
+    assert (
+        saved["review_decision"] is correct and saved["reviewed_by"] == "web:reviewer"
+    )
+    assert saved["answer_revision"] == before["answer_revision"] + 1
+    assert result["changed_entries"] == 1 and result["approved_entries"] == int(correct)
+    assert await store.private_session(sender["bot_id"], sender["user_id"]) is None
+    assert (await store.restart_forms(item["id"]))["restarted_users"] == 0
+    notices = [json.loads(row["body"]) for row in await store.deliveries()]
+    assert len(notices) == 1 and notices[0]["kind"] == "review"
+    assert notices[0]["target"]["channel"] == "private"
+    assert "原样答案" not in str(notices) and "answers" not in notices[0]["entry"]
+    summary = (await store.manage_entries(item["id"]))["summary"]
+    assert summary["incomplete"] == 0 and summary["approved"] == int(correct)
+    assert summary["rejected"] == int(not correct)
+    await store.close()
+    await store.open()
+    assert (await store.entry(item["id"], sender["user_id"]))["review_status"] == saved[
+        "review_status"
+    ]
+    if not correct:
+        restarted, _ = await store.enroll(item["id"], sender, restart_existing=True)
+        assert restarted["answers"] == [] and restarted["review_status"] == "incomplete"
+        assert "review_decision" not in restarted
+    draw = await store.action(item["id"], "draw")
+    assert draw["eligible_count"] == int(correct)
+    assert [winner["user_id"] for winner in draw["winners"]] == (
+        [sender["user_id"]] if correct else []
+    )
+
+
+@pytest.mark.parametrize("require_correct", [False, True])
+@pytest.mark.parametrize("index", [0, 2])
+async def test_admin_can_fill_any_missing_question_preserving_gaps_and_revision(
+    store, rules, sender, require_correct, index
+):
+    rules.update(
+        require_correct=require_correct,
+        questions=[
+            {"kind": "text", "prompt": f"第 {number} 题"} for number in range(3)
+        ],
+    )
+    item = await store.save(rules, "admin")
+    await store.enroll(item["id"], sender)
+    text = "  人工补填\n保留空格  "
+    payload = {
+        "action": "edit_answer",
+        "user_id": sender["user_id"],
+        "question_index": index,
+        "revision": 0,
+        "answer": {"kind": "text", "value": text},
+        "notify": False,
+    }
+    await store.manage_answers(item["id"], payload, "web:editor")
+    saved = await store.entry(item["id"], sender["user_id"])
+    assert saved["answers"][index]["value"] == text
+    assert saved["answers"][index]["edited_by"] == "web:editor"
+    assert all(answer["kind"] == "deleted" for answer in saved["answers"][:index])
+    assert saved["status"] == "pending" and saved["review_status"] == "incomplete"
+    assert await store.private_session(sender["bot_id"], sender["user_id"]) is None
+    with pytest.raises(ValueError, match="更新"):
+        await store.review(
+            item["id"],
+            {
+                "action": "decision",
+                "user_id": sender["user_id"],
+                "correct": True,
+                "revision": 0,
+            },
+            "web:stale",
+        )
+    assert (await store.entry(item["id"], sender["user_id"])) == saved
+    await store.private_session(sender["bot_id"], sender["user_id"], item["id"])
+    assert await store.form_position(sender["bot_id"], sender["user_id"]) == (
+        1 if index == 0 else 0
+    )
+    await store.review(
+        item["id"],
+        {
+            "action": "decision",
+            "user_id": sender["user_id"],
+            "correct": True,
+            "revision": 1,
+        },
+        "web:reviewer",
+    )
+    assert (await store.entry(item["id"], sender["user_id"]))[
+        "review_status"
+    ] == "approved"
+    payload.update(revision=2, answer={"kind": "text", "value": "再次修改"})
+    await store.manage_answers(item["id"], payload, "web:editor")
+    edited = await store.entry(item["id"], sender["user_id"])
+    assert edited["review_status"] == "incomplete" and "review_decision" not in edited
+    assert (await store.action(item["id"], "draw"))["eligible_count"] == 0
+
+
+async def test_mixed_complete_and_incomplete_bulk_review_rolls_back_stale_or_missing_selection(
+    store, rules, sender
+):
+    rules.update(require_correct=False, questions=[{"kind": "text", "prompt": "资料"}])
+    item = await store.save(rules, "admin")
+    other = {**sender, "user_id": "8888888"}
+    await store.enroll(item["id"], sender)
+    await store.enroll(item["id"], other)
+    await store.answer(
+        item["id"], {**other, "group_id": ""}, {"kind": "text", "value": "已提交"}, 0
+    )
+    ids = [sender["user_id"], other["user_id"]]
+    payload = {
+        "action": "bulk",
+        "user_ids": ids,
+        "correct": True,
+        "revisions": {ids[0]: 0, ids[1]: 0},
+    }
+    before = [await store.entry(item["id"], user) for user in ids]
+    notices = await store.deliveries()
+    with pytest.raises(ValueError, match="更新"):
+        await store.review(item["id"], payload, "web:reviewer")
+    assert [await store.entry(item["id"], user) for user in ids] == before
+    assert await store.deliveries() == notices
+    payload["revisions"][ids[1]] = 1
+    with pytest.raises(ValueError, match="已删除"):
+        await store.review(
+            item["id"], {**payload, "user_ids": [*ids, "9999999"]}, "web:reviewer"
+        )
+    assert [await store.entry(item["id"], user) for user in ids] == before
+    assert (await store.review(item["id"], payload, "web:reviewer"))[
+        "approved_entries"
+    ] == 2
+    details = await store.manage_entries(item["id"], page=1, status="approved")
+    assert {entry["user_id"] for entry in details["entries"]} == set(ids)
+    assert sorted(entry["answer_count"] for entry in details["entries"]) == [0, 1]
+
+
+async def test_unfilled_image_slot_validation_rolls_back_without_placeholder_answers(
+    store, rules, sender
+):
+    rules.update(
+        require_correct=False,
+        questions=[
+            {"kind": "text", "prompt": "文字"},
+            {"kind": "image", "prompt": "照片"},
+        ],
+    )
+    item = await store.save(rules, "admin")
+    await store.enroll(item["id"], sender)
+    before = await store.entry(item["id"], sender["user_id"])
+    with pytest.raises(ValueError):
+        await store.manage_answers(
+            item["id"],
+            {
+                "action": "edit_answer",
+                "user_id": sender["user_id"],
+                "question_index": 1,
+                "revision": 0,
+                "notify": False,
+                "answer": {"kind": "image", "value": "a" * 32 + ".jpg"},
+            },
+            "web:editor",
+        )
+    assert await store.entry(item["id"], sender["user_id"]) == before
+    assert (await store.manage_entries(item["id"]))["summary"]["incomplete"] == 1

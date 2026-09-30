@@ -52,9 +52,16 @@ async function setup(t, { lotteries = [], entries = [], hash = "" } = {}) {
         if (rejectReview) throw Error("审核保存失败");
         const selected = forms.filter(value => payload.user_ids ? payload.user_ids.includes(value.user_id) : value.user_id === payload.user_id);
         for (const entry of selected) {
-          if (["decision","bulk"].includes(payload.action)) { entry.review_decision = payload.correct; entry.review_status = payload.correct ? "approved" : "rejected"; }
-          if (payload.action === "edit_answer") { entry.answers[payload.question_index] = {...payload.answer,correct:null}; entry.review_status = "pending"; }
-          if (payload.action === "delete_answer") { entry.answers[payload.question_index] = {kind:"deleted",value:""}; entry.review_status = "incomplete"; entry.status = "pending"; }
+          if (["decision","bulk"].includes(payload.action)) { entry.status = "complete"; entry.review_decision = payload.correct; entry.review_status = payload.correct ? "approved" : "rejected"; }
+          if (payload.action === "edit_answer") {
+            while (entry.answers.length <= payload.question_index) entry.answers.push({kind:"deleted",value:""});
+            entry.answers[payload.question_index] = {...payload.answer,correct:null};
+            const questionCount = data.lotteries.find(item => item.id === endpoint.split("/")[1]).questions.length;
+            entry.status = entry.answers.filter(answer => answer.kind !== "deleted").length === questionCount ? "complete" : "pending";
+            entry.review_status = entry.status === "complete" ? "pending" : "incomplete";
+            delete entry.review_decision;
+          }
+          if (payload.action === "delete_answer") { entry.answers[payload.question_index] = {kind:"deleted",value:"",deleted_at:Date.now()/1000}; entry.review_status = "incomplete"; entry.status = "pending"; }
           if (payload.action === "delete_entries") { entry.answers = entry.answers.map(() => ({kind:"deleted",value:""})); entry.review_status = "incomplete"; entry.status = "pending"; }
           entry.answer_revision = (entry.answer_revision || 0)+1;
         }
@@ -324,17 +331,18 @@ test("failed review retains question and saved marks; an expired form stays lock
   assert.equal(calls.length,2);
 });
 
-test("incomplete and winning participants cannot be selected or reviewed", async t => {
+test("incomplete participants can be selected and reviewed while winners stay locked", async t => {
   const item = reviewActivity(), entries = participants(3);
   item.winners = [{user_id:entries[0].user_id,nickname:entries[0].nickname,tier_index:0}];
   const {document,calls} = await setup(t, {lotteries:[item],entries,hash:"#detail/a1234567"});
   document.querySelector('[data-tab="participants"]').click(); await flush();
   assert.ok(document.querySelector('[data-select="4444444"]').disabled);
-  assert.ok(document.querySelector('[data-select="4444446"]').disabled);
+  assert.equal(document.querySelector('[data-select="4444446"]').disabled,false);
   document.querySelector('[data-action="select-page"]').click();
   document.querySelector('[data-action="bulk-approve"]').click();
   document.querySelector('[data-action="confirm-operation"]').click(); await flush();
-  assert.deepEqual(calls[0].payload.user_ids,["4444445"]);
+  assert.deepEqual(calls[0].payload.user_ids,["4444445","4444446"]);
+  assert.match(document.querySelector('[data-user="4444446"]').textContent,/参与成功/);
   document.querySelector('[data-action="review-person"][data-user-id="4444444"]').click(); await flush();
   assert.ok([...document.querySelectorAll("[data-review-decision]")].every(button => button.disabled));
   assert.match(document.querySelector(".review-mark-panel").textContent,/已中奖/);
@@ -460,7 +468,7 @@ test("single answer deletion asks whether to notify, cancels safely and keeps ot
   assert.equal(forms[0].answers[0].kind,"deleted");
   assert.equal(forms[0].answers[1].value,"图片与文字");
   assert.match(document.querySelector('.review-answer-text').textContent,/已删除/);
-  assert.ok(document.querySelector('[data-review-decision="approved"]').disabled);
+  assert.equal(document.querySelector('[data-review-decision="approved"]').disabled,false);
   assert.match(document.querySelector('[data-action="answer-edit"]').textContent,/重新填写/);
 });
 
@@ -470,7 +478,7 @@ test("bulk deletion includes selected incomplete participants and notifies only 
   document.querySelector('[data-tab="participants"]').click(); await flush();
   document.querySelector('[data-select="4444444"]').click();
   document.querySelector('[data-select="4444446"]').click();
-  assert.ok(document.querySelector('[data-action="bulk-approve"]').disabled);
+  assert.equal(document.querySelector('[data-action="bulk-approve"]').disabled,false);
   document.querySelector('[data-action="bulk-delete-entries"]').click();
   assert.equal(calls.length,0);
   assert.match(document.querySelector('.delete-notify-choice').textContent,/是否私聊通知/);
@@ -552,4 +560,69 @@ test("additional image slots stop at nine and an upload in any slot blocks savin
   assert.equal(calls.length,0);
   assert.equal(document.querySelectorAll('.modal-backdrop').length,1);
   assert.match(document.querySelector('.toast').textContent,/等待图片上传/);
+});
+
+for (const requireCorrect of [false,true]) {
+  test(`unfilled questions can be supplied by an administrator and approved with visible gaps (${requireCorrect ? 'instant' : 'deferred'})`, async t => {
+    const item = reviewActivity(); item.require_correct = requireCorrect;
+    const entries = participants(1);
+    const {document,window,calls,forms} = await setup(t,{lotteries:[item],entries,hash:'#detail/a1234567'});
+    document.querySelector('[data-tab="participants"]').click(); await flush();
+    document.querySelector('[data-action="review-person"]').click(); await flush();
+    assert.match(document.querySelector('.review-mark-panel').textContent,/资料未齐也可人工判断/);
+    assert.equal(document.querySelector('[data-review-decision="approved"]').disabled,false);
+    document.querySelector('[data-action="review-next"]').click();
+    const edit = document.querySelector('[data-action="answer-edit"]');
+    assert.match(edit.textContent,/补填本题答案/); edit.click();
+    document.querySelector('[name="answer_text"]').value = '  管理员补填\n保留空格  ';
+    await document.querySelector('meow-upload').upload(new window.File(['image'],'answer.png',{type:'image/png'}));
+    document.querySelector('meow-switch[name="answer_notify"] button').click();
+    document.querySelector('[data-action="answer-save"]').click(); await flush();
+    assert.equal(calls[0].payload.question_index,1);
+    assert.equal(calls[0].payload.answer.value,'  管理员补填\n保留空格  ');
+    assert.equal(calls[0].payload.notify,false);
+    assert.equal(forms[0].answers[0].kind,'deleted');
+    assert.match(document.querySelector('.review-person').textContent,/待填写/);
+    document.querySelector('[data-review-decision="approved"]').click(); await flush();
+    assert.deepEqual(calls[1].payload,{action:'decision',user_id:'4444444',correct:true,revision:1});
+    assert.equal(forms[0].review_status,'approved');
+    assert.match(document.querySelector('[data-user="4444444"] .participant-progress').textContent,/1 \/ 2 题/);
+    assert.match(document.querySelector('[data-user="4444444"] .participant-progress').textContent,/已人工审核/);
+    assert.equal(forms[0].answers.length,2);
+    document.querySelector('[data-action="review-previous"]').click();
+    assert.match(document.querySelector('.review-answer-text').textContent,/尚未回答/);
+    assert.equal(document.querySelectorAll('select,input[type="checkbox"],input[type="radio"]').length,0);
+  });
+}
+
+for (const correct of [false,true]) {
+  test(`a wholly empty enrollment supports a whole-form ${correct ? 'approval' : 'rejection'} and selective bulk actions`, async t => {
+    const {document,calls,forms} = await setup(t,{lotteries:[reviewActivity()],entries:participants(1),hash:'#detail/a1234567'});
+    document.querySelector('[data-tab="participants"]').click(); await flush();
+    document.querySelector('[data-action="select-page"]').click();
+    assert.equal(document.querySelector('[data-action="bulk-approve"]').disabled,false);
+    assert.equal(document.querySelector('[data-action="bulk-reject"]').disabled,false);
+    assert.ok(document.querySelector('[data-action="bulk-delete-entries"]').disabled);
+    document.querySelector('[data-action="review-person"]').click(); await flush();
+    assert.equal(document.querySelector('[data-action="answer-delete"]'),null);
+    assert.match(document.querySelector('[data-action="answer-edit"]').textContent,/补填/);
+    document.querySelector(`[data-review-decision="${correct ? 'approved' : 'rejected'}"]`).click(); await flush();
+    assert.deepEqual(calls[0].payload,{action:'decision',user_id:'4444444',correct,revision:0});
+    assert.equal(forms[0].answers.length,0);
+    assert.match(document.querySelector('.review-person').textContent,correct ? /参与成功/ : /未通过/);
+  });
+}
+
+test('incomplete-filter review advances to the next unfinished participant after a decision', async t => {
+  const entries = participants(2).map(entry => ({...entry,status:'pending',review_status:'incomplete',answers:[]}));
+  const {document,calls} = await setup(t,{lotteries:[reviewActivity()],entries,hash:'#detail/a1234567'});
+  document.querySelector('[data-tab="participants"]').click(); await flush();
+  document.querySelector('[data-entry-filter="incomplete"]').click(); await flush();
+  document.querySelector('[data-action="review-person"]').click(); await flush();
+  document.querySelector('[data-review-decision="rejected"]').click(); await flush();
+  assert.match(document.querySelector('[data-action="review-next-person"]').textContent,/未填完整/);
+  document.querySelector('[data-action="review-next-person"]').click(); await flush();
+  assert.match(document.querySelector('.review-person').textContent,/4444445/);
+  assert.equal(calls.length,1);
+  assert.equal(document.querySelector('[data-review-decision="approved"]').disabled,false);
 });

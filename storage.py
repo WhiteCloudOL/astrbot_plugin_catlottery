@@ -415,7 +415,7 @@ def validate_answer(question: dict, answer: dict, require_correct: bool) -> dict
 
 
 def review_status(item: dict, entry: dict) -> str:
-    """Derive eligibility from submission completion and the frozen answer mode.
+    """Derive eligibility from a whole-form decision or the frozen answer mode.
 
     Args:
         item: Lottery rules, with legacy activities defaulting to instant checking.
@@ -426,10 +426,10 @@ def review_status(item: dict, entry: dict) -> str:
     """
     if entry["status"] != "complete":
         return "incomplete"
-    if item.get("require_correct", True) or not item["questions"]:
-        return "approved"
     if isinstance(entry.get("review_decision"), bool):
         return "approved" if entry["review_decision"] else "rejected"
+    if item.get("require_correct", True) or not item["questions"]:
+        return "approved"
     marks = [answer.get("correct") for answer in entry["answers"]]
     if any(mark is False for mark in marks):
         return "rejected"
@@ -1369,11 +1369,11 @@ class Store:
         return item, entry
 
     async def review(self, lottery_id: str, payload: dict, reviewer_id: str) -> dict:
-        """Mark submitted answers or match text references before the draw freezes eligibility.
+        """Review complete or incomplete forms before the draw freezes eligibility.
 
         Args:
             lottery_id: Activity identifier.
-            payload: mark with user_id, question_index, and correct; or match.
+            payload: Whole-form decision or bulk decision, legacy mark, or text match.
             reviewer_id: Authenticated Dashboard operator for the private audit trail.
 
         Returns:
@@ -1404,7 +1404,7 @@ class Store:
                 )
                 or not isinstance(correct, bool)
             ):
-                raise ValueError("请明确选择 1–100 份已提交报名及通过或不通过标记")
+                raise ValueError("请明确选择 1–100 份报名及通过或不通过标记")
             selected_ids = list(dict.fromkeys(selected_ids))
             if "revisions" in payload and not isinstance(payload["revisions"], dict):
                 raise ValueError("资料版本无效，请刷新列表后操作")
@@ -1440,8 +1440,10 @@ class Store:
                     raise ValueError(
                         "该报名已获得提前开奖的奖项，资格与答案标记已锁定。"
                     )
-                if item.get("require_correct", True):
+                if item.get("require_correct", True) and action in {"mark", "match"}:
                     raise ValueError("本场采用当场答对模式，无需后续审核。")
+                if not item["questions"]:
+                    raise ValueError("本场无需填写资料，不需要审核")
                 if action in {"mark", "decision"}:
                     selected_ids = [user_id]
                 selection = (
@@ -1456,25 +1458,24 @@ class Store:
                     entries = [json.loads(row[0]) for row in await cursor.fetchall()]
                 if action in {"bulk", "decision"} and (
                     len(entries) != len(selected_ids)
-                    or any(
-                        entry["status"] != "complete" or entry["user_id"] in winner_ids
-                        for entry in entries
-                    )
+                    or any(entry["user_id"] in winner_ids for entry in entries)
                 ):
-                    raise ValueError(
-                        "所选报名中有未提交、已删除或已中奖者，请刷新列表后重试"
-                    )
+                    raise ValueError("所选报名中有已删除或已中奖者，请刷新列表后重试")
                 if action in {"mark", "decision"}:
                     entries = [
                         entry for entry in entries if entry["user_id"] == user_id
                     ]
-                    if not entries or entries[0]["status"] != "complete":
+                    if not entries:
+                        raise ValueError("报名已移除，请刷新列表后重试")
+                    if action == "mark" and entries[0]["status"] != "complete":
                         raise ValueError("只能审核已经提交全部资料的报名。")
-                    if not 0 <= index < len(item["questions"]):
+                    if action == "mark" and not 0 <= index < len(item["questions"]):
                         raise ValueError("题目序号无效。")
                 changed = marked = approved = 0
                 for entry in entries:
-                    if entry["status"] != "complete" or entry["user_id"] in winner_ids:
+                    if (
+                        action in {"mark", "match"} and entry["status"] != "complete"
+                    ) or entry["user_id"] in winner_ids:
                         continue
                     revision = (
                         payload.get("revision")
@@ -1494,10 +1495,17 @@ class Store:
                     ):
                         continue
                     if action in {"decision", "bulk"}:
+                        # An explicit whole-form decision concludes the reservation without inventing answers.
                         entry.update(
+                            status="complete",
+                            completed_at=entry.get("completed_at") or time.time(),
                             review_decision=correct,
                             reviewed_by=reviewer_id,
                             reviewed_at=time.time(),
+                        )
+                        await self.db.execute(
+                            "DELETE FROM sessions WHERE lottery_id=? AND user_id=?",
+                            (lottery_id, entry["user_id"]),
                         )
                     entry["answer_revision"] = entry.get("answer_revision", 0) + 1
                     for question_index, answer in enumerate(entry["answers"]):
@@ -1561,6 +1569,14 @@ class Store:
                         ),
                     )
                 await self.db.commit()
+                logger.info(
+                    "Lottery %s review action=%s; changed=%d approved=%d; operator=%s.",
+                    lottery_id,
+                    action,
+                    changed,
+                    approved,
+                    reviewer_id,
+                )
                 return {
                     "marked_answers": marked,
                     "changed_entries": changed,
@@ -1657,10 +1673,12 @@ class Store:
                         raise ValueError(
                             "资料已被用户或其他管理员更新，请重新打开后操作"
                         )
-                    if action != "delete_entries" and not 0 <= index < min(
-                        len(entry["answers"]), len(item["questions"])
+                    if action != "delete_entries" and not 0 <= index < len(
+                        item["questions"]
                     ):
-                        raise ValueError("本题尚未填写，无法编辑或删除")
+                        raise ValueError("题目序号无效")
+                    if action == "delete_answer" and index >= len(entry["answers"]):
+                        raise ValueError("本题尚未填写，无法删除")
                     if (
                         action == "delete_answer"
                         and entry["answers"][index]["kind"] == "deleted"
@@ -1675,6 +1693,10 @@ class Store:
                         )
                     entries.append(entry)
                 for entry in entries:
+                    if action == "edit_answer":
+                        # Preserve missing earlier slots when an operator fills a later question.
+                        while len(entry["answers"]) <= index:
+                            entry["answers"].append({"kind": "deleted", "value": ""})
                     slots = (
                         [index]
                         if action != "delete_entries"

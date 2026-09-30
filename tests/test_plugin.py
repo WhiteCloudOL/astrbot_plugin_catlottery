@@ -695,7 +695,9 @@ async def test_window_keeps_multiple_images_and_echoes_each_separately(
     chat.assert_not_awaited()
 
 
-@pytest.mark.parametrize("change", ["pause", "restart", "navigate", "expiry", "delete"])
+@pytest.mark.parametrize(
+    "change", ["pause", "restart", "navigate", "expiry", "delete", "approve", "reject"]
+)
 async def test_window_does_not_commit_after_mode_changes(
     plugin, rules, monkeypatch, change
 ):
@@ -723,6 +725,17 @@ async def test_window_does_not_commit_after_mode_changes(
             "mode_expires_at"
         ]
         monkeypatch.setattr(time, "time", lambda: expires)
+    elif change in {"approve", "reject"}:
+        await plugin.store.review(
+            item["id"],
+            {
+                "action": "decision",
+                "user_id": identity["user_id"],
+                "correct": change == "approve",
+                "revision": 1,
+            },
+            "web:admin",
+        )
     else:
         await plugin.store.withdraw(item["id"], identity)
     await flush_window(plugin)
@@ -2583,3 +2596,62 @@ async def test_receipt_fetched_before_admin_change_does_not_send_old_approval(
     )
     await plugin.send_deliveries()
     assert captured == []
+
+
+@pytest.mark.parametrize("require_correct", [False, True])
+async def test_web_can_fill_missing_answers_approve_and_preserve_group_rejoin_qualification(
+    plugin, rules, dispatch, monkeypatch, require_correct
+):
+    rules.update(
+        require_correct=require_correct,
+        group_success_notify=False,
+        group_pending_notify=False,
+        questions=[
+            {"kind": "text", "prompt": "第一题"},
+            {"kind": "text", "prompt": "第二题"},
+        ],
+    )
+    item = await plugin.store.save(rules, "admin")
+    await plugin.store.enroll(item["id"], plugin.identity(event(plugin)))
+    edit = {
+        "action": "edit_answer",
+        "user_id": "4444444",
+        "question_index": 1,
+        "revision": 0,
+        "notify": False,
+        "answer": {"kind": "text", "value": "  补填答案  "},
+    }
+    with web_request(edit, username=None):
+        assert (await plugin.web_review(item["id"])).status_code == 403
+    with web_request(edit):
+        assert (await plugin.web_review(item["id"])).status_code == 200
+    with web_request(
+        {"action": "decision", "user_id": "4444444", "revision": 1, "correct": True}
+    ):
+        assert (await plugin.web_review(item["id"])).status_code == 200
+    captured = []
+    monkeypatch.setattr(plugin, "card", AsyncMock())
+    status = json.loads(await plugin.tool_status(event(plugin, group=""), item["id"]))
+    assert (
+        status["eligible"] is True
+        and status["answered"] == 1
+        and status["questions"] == 2
+    )
+    monkeypatch.setattr(
+        plugin_module,
+        "render_pages",
+        lambda title, subtitle, sections, *a, **k: (
+            captured.append(sections) or [b"image"]
+        ),
+    )
+    await plugin.send_deliveries()
+    client = plugin.context.get_platform_inst("napcat").client
+    assert all(action != "send_group_msg" for action, _ in client.calls)
+    assert "补填答案" not in str(captured)
+    before = await plugin.store.entry(item["id"], "4444444")
+    await plugin.join(event(plugin), item["id"])
+    assert await plugin.store.entry(item["id"], "4444444") == before
+    assert await plugin.store.private_session("1234567", "4444444") is None
+    run, chat = dispatch
+    await run(event(plugin, group="", text="正常聊天"))
+    chat.assert_awaited_once()
