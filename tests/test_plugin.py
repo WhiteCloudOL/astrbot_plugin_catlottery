@@ -2,6 +2,7 @@
 
 import asyncio
 import base64
+import copy
 import json
 import sqlite3
 import time
@@ -12,11 +13,25 @@ from unittest.mock import AsyncMock, Mock
 import pytest
 from astrbot.api.message_components import Image, Plain
 from astrbot.api.web import PluginRequest, bind_request_context
+from astrbot.core.pipeline.context import PipelineContext
+from astrbot.core.pipeline.process_stage.stage import ProcessStage, StarRequestSubStage
+from astrbot.core.pipeline.waking_check.stage import WakingCheckStage
 from astrbot.core.platform.astrbot_message import AstrBotMessage, MessageMember
 from astrbot.core.platform.message_type import MessageType
 from astrbot.core.platform.platform_metadata import PlatformMetadata
 from astrbot.core.platform.sources.aiocqhttp.aiocqhttp_message_event import (
     AiocqhttpMessageEvent,
+)
+from astrbot.core.star.filter.event_message_type import (
+    EventMessageType,
+    EventMessageTypeFilter,
+)
+from astrbot.core.star.star import StarMetadata, star_map
+from astrbot.core.star.star_handler import (
+    EventType,
+    StarHandlerMetadata,
+    StarHandlerRegistry,
+    star_handlers_registry,
 )
 from astrbot.dashboard.services.plugin_page_service import PluginPageService
 from astrbot_plugin_catlottery.main import TOOL_NAMES, CatLottery
@@ -238,6 +253,222 @@ async def plugin(tmp_path, monkeypatch):
     await instance.terminate()
 
 
+@pytest.fixture
+async def dispatch(plugin, monkeypatch):
+    """Run real waking and processing stages with a competing private chat handler.
+
+    Args:
+        plugin: Plugin instance with isolated persistent data.
+        monkeypatch: Restore framework registration state after the test.
+
+    Returns:
+        Dispatch coroutine and spy for both plugin chat and default LLM fallback.
+    """
+    registry = StarHandlerRegistry()
+    module = CatLottery.__module__
+    for original in star_handlers_registry.get_handlers_by_module_name(module):
+        if original.event_type == EventType.AdapterMessageEvent:
+            handler = copy.copy(original)
+            handler.extras_configs = dict(original.extras_configs)
+            handler.handler = getattr(plugin, original.handler_name)
+            registry.append(handler)
+    chat = AsyncMock()
+
+    async def competing_chat(current):
+        await chat(current)
+        current.stop_event()
+
+    registry.append(
+        StarHandlerMetadata(
+            event_type=EventType.AdapterMessageEvent,
+            handler_full_name="test_private_chat",
+            handler_name="competing_chat",
+            handler_module_path="test_private_chat",
+            handler=competing_chat,
+            event_filters=[EventMessageTypeFilter(EventMessageType.PRIVATE_MESSAGE)],
+            extras_configs={"priority": 20},
+        )
+    )
+    monkeypatch.setitem(
+        star_map, module, StarMetadata(name="astrbot_plugin_catlottery")
+    )
+    monkeypatch.setitem(star_map, "test_private_chat", StarMetadata(name="test_chat"))
+    monkeypatch.setattr(
+        "astrbot.core.pipeline.waking_check.stage.star_handlers_registry", registry
+    )
+    monkeypatch.setattr(
+        "astrbot.core.star.session_plugin_manager.sp",
+        SimpleNamespace(get_async=AsyncMock(return_value={})),
+    )
+    config = {
+        "admins_id": [],
+        "wake_prefix": ["/"],
+        "platform_settings": {"friend_message_needs_wake_prefix": True},
+        "provider_settings": {"enable": True, "prompt_prefix": "", "identifier": False},
+    }
+    context = PipelineContext(config, None, "test")
+    waking = WakingCheckStage()
+    await waking.initialize(context)
+    processing = ProcessStage()
+    processing.ctx = context
+    processing.star_request_sub_stage = StarRequestSubStage()
+    await processing.star_request_sub_stage.initialize(context)
+
+    async def default_chat(current):
+        await chat(current)
+        yield None
+
+    processing.agent_sub_stage = SimpleNamespace(process=default_chat)
+
+    async def run(current):
+        await waking.process(current)
+        async for _ in processing.process(current):
+            pass
+
+    return run, chat
+
+
+@pytest.mark.parametrize("command", ["", "/抽奖 ", "/抽奖 回答 "])
+@pytest.mark.parametrize("with_image", [False, True])
+async def test_pending_private_answer_precedes_chat_in_real_dispatch(
+    plugin, rules, dispatch, command, with_image
+):
+    rules["require_correct"] = False
+    rules["questions"] = [
+        {"kind": "mixed" if with_image else "text", "prompt": "群主昵称"},
+        {"kind": "text", "prompt": "第二题"},
+    ]
+    item = await plugin.store.save(rules, "admin")
+    await plugin.store.enroll(item["id"], plugin.identity(event(plugin)))
+    run, chat = dispatch
+    answer = "  清蒸云鸭  两个空格\n第二行  "
+    raw = command + answer
+    components = [Plain(raw.strip())]
+    if with_image:
+        data = BytesIO()
+        with PillowImage.new("RGB", (20, 30), "pink") as image:
+            image.save(data, "PNG")
+        components.append(Image.fromBytes(data.getvalue()))
+    current = event(plugin, group="", text=raw.strip(), components=components)
+    current.message_obj.raw_message["message"] = [
+        {"type": "text", "data": {"text": raw}}
+    ]
+    await run(current)
+    entry = await plugin.store.entry(item["id"], "4444444")
+    assert entry["answers"][0]["value"] == answer
+    assert bool(entry["answers"][0].get("image")) is with_image
+    assert await plugin.store.form_position("1234567", "4444444") == 1
+    assert current.is_stopped()
+    chat.assert_not_awaited()
+
+
+async def test_private_form_completion_never_falls_back_to_llm(plugin, rules, dispatch):
+    rules["require_correct"] = False
+    rules["questions"] = [{"kind": "text", "prompt": "群主昵称"}]
+    item = await plugin.store.save(rules, "admin")
+    await plugin.store.enroll(item["id"], plugin.identity(event(plugin)))
+    run, chat = dispatch
+    current = event(plugin, group="", text="清蒸云鸭")
+    await run(current)
+    assert (await plugin.store.entry(item["id"], "4444444"))["status"] == "complete"
+    assert await plugin.store.private_session("1234567", "4444444") is None
+    assert not current._has_send_oper
+    chat.assert_not_awaited()
+
+
+async def test_invalid_private_answer_stays_in_form_without_chat(
+    plugin, rules, dispatch
+):
+    rules["questions"] = [{"kind": "mixed", "prompt": "图文资料"}]
+    item = await plugin.store.save(rules, "admin")
+    await plugin.store.enroll(item["id"], plugin.identity(event(plugin)))
+    run, chat = dispatch
+    current = event(plugin, group="", text="只有文字")
+    await run(current)
+    assert not (await plugin.store.entry(item["id"], "4444444"))["answers"]
+    assert await plugin.store.form_position("1234567", "4444444") == 0
+    assert current.is_stopped()
+    chat.assert_not_awaited()
+
+
+@pytest.mark.parametrize(
+    "text", ["/抽奖", "/抽奖 帮助", "/抽奖 待办", "/抽奖 参与 12345678"]
+)
+async def test_explicit_private_commands_are_never_answers(
+    plugin, rules, dispatch, text
+):
+    rules["questions"] = [{"kind": "text", "prompt": "群主昵称"}]
+    item = await plugin.store.save(rules, "admin")
+    await plugin.store.enroll(item["id"], plugin.identity(event(plugin)))
+    run, chat = dispatch
+    await run(event(plugin, group="", text=text))
+    assert not (await plugin.store.entry(item["id"], "4444444"))["answers"]
+    chat.assert_not_awaited()
+
+
+@pytest.mark.parametrize("state", ["idle", "paused", "group", "other-command"])
+async def test_shorthand_does_not_enroll_or_resume_other_contexts(
+    plugin, rules, dispatch, state
+):
+    rules["questions"] = [{"kind": "text", "prompt": "群主昵称"}]
+    item = await plugin.store.save(rules, "admin")
+    if state != "idle":
+        await plugin.store.enroll(item["id"], plugin.identity(event(plugin)))
+    if state == "paused":
+        await plugin.store.private_session("1234567", "4444444", "")
+    run, chat = dispatch
+    current = event(
+        plugin,
+        group="2222222" if state == "group" else "",
+        text="/help" if state == "other-command" else "/抽奖 清蒸云鸭",
+    )
+    await run(current)
+    entry = await plugin.store.entry(item["id"], "4444444")
+    assert entry is None or not entry["answers"]
+    if state in {"idle", "paused"}:
+        assert await plugin.store.private_session("1234567", "4444444") is None
+    if state == "other-command":
+        chat.assert_awaited_once()
+    else:
+        chat.assert_not_awaited()
+
+
+async def test_friend_add_restoration_precedes_chat_in_real_dispatch(
+    plugin, rules, dispatch
+):
+    rules["questions"] = [{"kind": "text", "prompt": "群主昵称"}]
+    item = await plugin.store.save(rules, "admin")
+    await plugin.store.enroll(item["id"], plugin.identity(event(plugin)))
+    await plugin.store.private_session("1234567", "4444444", "")
+    run, _ = dispatch
+    notice = event(plugin, group="", text="", components=[])
+    notice.message_obj.raw_message.update(post_type="notice", notice_type="friend_add")
+    await run(notice)
+    assert await plugin.store.private_session("1234567", "4444444") == item["id"]
+    answer = event(plugin, group="", text="清蒸云鸭")
+    await run(answer)
+    assert (await plugin.store.entry(item["id"], "4444444"))["answers"][0][
+        "value"
+    ] == "清蒸云鸭"
+
+
+@pytest.mark.parametrize("paused", [False, True])
+async def test_ordinary_private_chat_is_available_without_active_form(
+    plugin, rules, dispatch, paused
+):
+    rules["questions"] = [{"kind": "text", "prompt": "群主昵称"}]
+    item = await plugin.store.save(rules, "admin")
+    if paused:
+        await plugin.store.enroll(item["id"], plugin.identity(event(plugin)))
+        await plugin.store.private_session("1234567", "4444444", "")
+    run, chat = dispatch
+    await run(event(plugin, group="", text="正常私聊"))
+    chat.assert_awaited_once()
+    assert await plugin.store.private_session("1234567", "4444444") is None
+    entry = await plugin.store.entry(item["id"], "4444444")
+    assert entry is None or not entry["answers"]
+
+
 async def test_tool_switch_blocks_all_tools_and_leaves_qq_commands_available(
     plugin, rules
 ):
@@ -406,17 +637,18 @@ async def test_deferred_review_keeps_wrong_mixed_answer_and_truthful_status(
         response = await plugin.web_review(item["id"])
     assert response.status_code == 200
     assert json.loads(response.body)["marked_answers"] == 0
-    for index in (0, 1):
-        with web_request(
-            {
-                "action": "mark",
-                "user_id": "4444444",
-                "question_index": index,
-                "correct": True,
-            },
-            username="reviewer",
-        ):
-            assert (await plugin.web_review(item["id"])).status_code == 200
+    with web_request(
+        {
+            "action": "decision",
+            "user_id": "4444444",
+            "correct": True,
+            "revision": (await plugin.store.entry(item["id"], "4444444"))[
+                "answer_revision"
+            ],
+        },
+        username="reviewer",
+    ):
+        assert (await plugin.web_review(item["id"])).status_code == 200
     status = json.loads(await plugin.tool_status(event(plugin, group=""), item["id"]))
     assert status["eligible"] is True and status["review_status"] == "approved"
     captured = []
@@ -1254,7 +1486,7 @@ async def test_lifecycle_registers_only_owned_routes_and_stops_tasks(plugin, tmp
     instance = CatLottery(context)
     instance.store = Store(tmp_path / "lifecycle")
     await instance.initialize()
-    assert len(context.registered_web_apis) == 15
+    assert len(context.registered_web_apis) == 16
     tasks = (instance.worker, instance.sender)
     await instance.terminate()
     assert all(task.done() for task in tasks)
@@ -1412,3 +1644,245 @@ def test_real_page_service_rewrites_authenticated_assets_and_modules():
     assert "bridge-sdk.js?asset_token=synthetic-asset-token" in html
     assert "NotoSansSC.ttf?asset_token=synthetic-asset-token" in css
     assert "components.js?asset_token=synthetic-asset-token" in js
+
+
+async def test_friend_readdition_restores_original_form_and_failed_delivery_immediately(
+    plugin, rules, monkeypatch
+):
+    rules["questions"] = [
+        {"kind": "text", "prompt": "第一题"},
+        {"kind": "text", "prompt": "第二题"},
+    ]
+    item = await plugin.store.save(rules, "admin")
+    await plugin.join(event(plugin), item["id"])
+    await plugin.store.answer(
+        item["id"],
+        plugin.identity(event(plugin, group="")),
+        {"kind": "text", "value": "first"},
+        0,
+    )
+    await plugin.store.queue_question(item["id"], "1234567", "4444444")
+    message = (await plugin.store.deliveries())[0]
+    await plugin.store.delivery_done(message["id"], "not a friend")
+    await plugin.store.private_session("1234567", "4444444", "")
+    notice = event(plugin, group="", text="")
+    notice.message_obj.raw_message.update(post_type="notice", notice_type="friend_add")
+    await plugin.restore_friend_forms(notice)
+    assert await plugin.store.form_position("1234567", "4444444") == 1
+    jobs = await plugin.store.deliveries()
+    assert len(jobs) == 1 and jobs[0]["attempts"] == 0
+    monkeypatch.setattr(
+        "astrbot_plugin_catlottery.main.render_pages",
+        lambda *args, **kwargs: [b"image"],
+    )
+    await plugin.send_deliveries()
+    client = plugin.context.get_platform_inst("napcat").client
+    assert (
+        client.calls[-1][0] == "send_private_msg"
+        and client.calls[-1][1]["user_id"] == 4444444
+    )
+    await plugin.collect_private(event(plugin, group="", text="second"))
+    entry = await plugin.store.entry(item["id"], "4444444")
+    assert entry["status"] == "complete" and entry["answers"][0]["value"] == "first"
+
+
+async def test_friend_notice_never_spoofs_identity_or_enrolls_a_private_sender(
+    plugin, rules
+):
+    rules["questions"] = [{"kind": "text", "prompt": "资料"}]
+    item = await plugin.store.save(rules, "admin")
+    await plugin.join(event(plugin), item["id"])
+    await plugin.store.private_session("1234567", "4444444", "")
+    notice = event(plugin, group="", text="")
+    notice.message_obj.raw_message.update(
+        post_type="notice", notice_type="friend_add", user_id=9999999
+    )
+    await plugin.restore_friend_forms(notice)
+    assert await plugin.store.private_session("1234567", "4444444") is None
+    other = event(plugin, group="", user="9999999", text="")
+    other.message_obj.raw_message.update(post_type="notice", notice_type="friend_add")
+    await plugin.restore_friend_forms(other)
+    assert await plugin.store.entry(item["id"], "9999999") is None
+    assert not await plugin.store.deliveries()
+
+
+async def test_web_restart_requires_auth_and_confirmation_and_excludes_completed_users(
+    plugin, rules
+):
+    rules["questions"] = [{"kind": "text", "prompt": "资料"}]
+    item = await plugin.store.save(rules, "admin")
+    await plugin.join(event(plugin), item["id"])
+    await plugin.join(event(plugin, user="5555555"), item["id"])
+    await plugin.collect_private(event(plugin, group="", user="5555555", text="done"))
+    with web_request({"action": "restart_forms", "confirmed": True}, username=None):
+        assert (await plugin.web_review(item["id"])).status_code == 403
+    with web_request({"action": "restart_forms"}):
+        assert (await plugin.web_review(item["id"])).status_code == 400
+    with web_request({"action": "restart_forms", "confirmed": True}):
+        response = await plugin.web_review(item["id"])
+    assert (
+        response.status_code == 200
+        and json.loads(response.body)["restarted_users"] == 1
+    )
+    messages = [json.loads(row["body"]) for row in await plugin.store.deliveries()]
+    questions = [message for message in messages if message["kind"] == "question"]
+    assert len(questions) == 1 and questions[0]["target"]["recipient"] == "4444444"
+    assert questions[0]["target"]["channel"] == "private"
+
+
+async def test_private_answer_image_upload_is_authenticated_and_not_public_artwork(
+    plugin,
+):
+    output = BytesIO()
+    PillowImage.new("RGBA", (40, 60), (255, 30, 80, 100)).save(output, "PNG")
+    with web_request(uploaded=output.getvalue(), username=None):
+        assert (await plugin.web_upload_answer_image()).status_code == 403
+    with web_request(uploaded=output.getvalue()):
+        response = await plugin.web_upload_answer_image()
+    assert response.status_code == 200
+    filename = json.loads(response.body)["image"]
+    with PillowImage.open(plugin.store.directory / "uploads" / filename) as image:
+        assert image.mode == "RGB" and image.format == "JPEG"
+    assert not (plugin.store.directory / "artwork" / filename).exists()
+    with web_request():
+        assert (await plugin.web_artwork(filename)).status_code == 404
+    with web_request(query="preview=1"):
+        preview = await plugin.web_image(filename)
+    assert preview.status_code == 200 and preview.headers["cache-control"] == "no-store"
+
+
+async def test_web_review_only_accepts_whole_form_and_failure_notices_are_generic(
+    plugin, rules, monkeypatch
+):
+    rules.update(
+        require_correct=False, questions=[{"kind": "text", "prompt": "secret question"}]
+    )
+    item = await plugin.store.save(rules, "admin")
+    await plugin.join(event(plugin), item["id"])
+    await plugin.collect_private(event(plugin, group="", text="private answer"))
+    entry = await plugin.store.entry(item["id"], "4444444")
+    with web_request(
+        {"action": "mark", "user_id": "4444444", "question_index": 0, "correct": False}
+    ):
+        assert (await plugin.web_review(item["id"])).status_code == 400
+    with web_request({"action": "decision", "user_id": "4444444", "correct": False}):
+        assert (await plugin.web_review(item["id"])).status_code == 400
+    with web_request(
+        {
+            "action": "decision",
+            "user_id": "4444444",
+            "correct": False,
+            "revision": entry["answer_revision"],
+        }
+    ):
+        assert (await plugin.web_review(item["id"])).status_code == 200
+    captured = []
+    monkeypatch.setattr(
+        "astrbot_plugin_catlottery.main.render_pages",
+        lambda *args, **kwargs: captured.append(args) or [b"image"],
+    )
+    await plugin.send_deliveries()
+    assert len(captured) == 2
+    assert "整体作答未通过" in str(captured)
+    assert not any(
+        value in str(captured)
+        for value in ("secret question", "private answer", "第 1", "第1")
+    )
+
+
+@pytest.mark.parametrize("notify", [True, False])
+async def test_web_data_deletion_notifies_only_when_chosen_and_never_names_a_question(
+    plugin, rules, monkeypatch, notify
+):
+    rules.update(
+        require_correct=False, questions=[{"kind": "text", "prompt": "secret prompt"}]
+    )
+    item = await plugin.store.save(rules, "admin")
+    await plugin.join(event(plugin), item["id"])
+    await plugin.collect_private(event(plugin, group="", text="secret answer"))
+    entry = await plugin.store.entry(item["id"], "4444444")
+    payload = {
+        "action": "delete_answer",
+        "user_id": "4444444",
+        "revision": entry["answer_revision"],
+        "question_index": 0,
+        "confirmed": True,
+        "notify": notify,
+    }
+    with web_request(payload):
+        assert (await plugin.web_review(item["id"])).status_code == 200
+    captured = []
+    monkeypatch.setattr(
+        "astrbot_plugin_catlottery.main.render_pages",
+        lambda *args, **kwargs: captured.append(args) or [b"image"],
+    )
+    await plugin.send_deliveries()
+    assert len(captured) == int(notify)
+    assert not any(
+        value in str(captured)
+        for value in ("secret prompt", "secret answer", "第 1", "第1")
+    )
+    if notify:
+        assert (
+            plugin.context.get_platform_inst("napcat").client.calls[-1][0]
+            == "send_private_msg"
+        )
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"action": "bulk", "user_ids": [{}], "revisions": {}, "correct": True},
+        {"action": "bulk", "user_ids": ["4444444"], "revisions": None, "correct": True},
+        {"action": "decision", "user_id": "4444444", "revision": True, "correct": True},
+        {
+            "action": "delete_entries",
+            "user_ids": [{}],
+            "revisions": {},
+            "notify": False,
+            "confirmed": True,
+        },
+    ],
+)
+async def test_web_answer_management_malformed_payload_returns_validation_error(
+    plugin, rules, payload
+):
+    item = await plugin.store.save(rules, "admin")
+    with web_request(payload):
+        assert (await plugin.web_review(item["id"])).status_code == 400
+
+
+async def test_receipt_fetched_before_admin_change_does_not_send_old_approval(
+    plugin, rules, monkeypatch
+):
+    rules.update(require_correct=False, questions=[{"kind": "text", "prompt": "资料"}])
+    item = await plugin.store.save(rules, "admin")
+    await plugin.join(event(plugin), item["id"])
+    await plugin.collect_private(event(plugin, group="", text="answer"))
+    await plugin.store.review(
+        item["id"],
+        {"action": "decision", "user_id": "4444444", "correct": True},
+        "web:admin",
+    )
+    stale = await plugin.store.deliveries()
+    entry = await plugin.store.entry(item["id"], "4444444")
+    await plugin.store.manage_answers(
+        item["id"],
+        {
+            "action": "delete_answer",
+            "user_id": "4444444",
+            "revision": entry["answer_revision"],
+            "question_index": 0,
+            "confirmed": True,
+            "notify": False,
+        },
+        "web:admin",
+    )
+    monkeypatch.setattr(plugin.store, "deliveries", AsyncMock(return_value=stale))
+    captured = []
+    monkeypatch.setattr(
+        "astrbot_plugin_catlottery.main.render_pages",
+        lambda *args, **kwargs: captured.append(args) or [b"image"],
+    )
+    await plugin.send_deliveries()
+    assert captured == []

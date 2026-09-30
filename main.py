@@ -32,7 +32,7 @@ from PIL import ImageOps, UnidentifiedImageError
 
 from .avatars import AvatarCache
 from .cards import FONT_PATH, LOGO_PATH, CardSection, render_announcement, render_pages
-from .storage import Store, date_text, prize_tiers, validate_lottery
+from .storage import Store, date_text, form_progress, prize_tiers, validate_lottery
 
 PLUGIN_NAME = "astrbot_plugin_catlottery"
 TOOL_NAMES = (
@@ -102,10 +102,15 @@ def question_sections(item: dict, entry: dict, index: int) -> list[CardSection]:
     navigation = []
     if index > 0:
         navigation.append("/抽奖 上一题")
-    if index < len(entry.get("answers", [])) and index + 1 < len(item["questions"]):
+    if index < form_progress(entry, len(item["questions"]))[1] and index + 1 < len(
+        item["questions"]
+    ):
         navigation.append("/抽奖 下一题")
     navigation.append("/抽奖 取消回答")
-    if index < len(entry.get("answers", [])):
+    if (
+        index < len(entry.get("answers", []))
+        and entry["answers"][index]["kind"] != "deleted"
+    ):
         instruction += "\n这题已有回答，重新发送会替换原答案"
     return [
         ("当前问题", prompt),
@@ -171,7 +176,7 @@ def entry_text(entry: dict | None, question_count: int) -> str:
     if entry is None:
         return "尚未参与"
     if entry["status"] != "complete":
-        return f"待填写 · 已完成 {len(entry['answers'])}/{question_count} 项"
+        return f"待填写 · 已完成 {form_progress(entry, question_count)[0]}/{question_count} 项"
     return {
         "approved": "参与成功",
         "pending": "资料已提交 · 等待审核",
@@ -319,6 +324,12 @@ class CatLottery(Star):
                 self.web_image,
                 ["GET"],
                 "Download a private form image",
+            ),
+            (
+                "answer-images",
+                self.web_upload_answer_image,
+                ["POST"],
+                "Upload private answer image",
             ),
             (
                 "artwork",
@@ -792,7 +803,7 @@ class CatLottery(Star):
             if entry
             else None,
             "eligible": eligible,
-            "answered": len(entry["answers"]) if entry else 0,
+            "answered": form_progress(entry, len(item["questions"]))[0] if entry else 0,
             "questions": len(item["questions"]),
             "user_id": identity["user_id"],
             "approved_count": live["approved"],
@@ -963,8 +974,9 @@ class CatLottery(Star):
         )
         return "已预留报名，用户需按图片引导私聊填写；尚未完成报名。"
 
-    @filter.command("抽奖", priority=90)
-    @filter.platform_adapter_type(filter.PlatformAdapterType.AIOCQHTTP)
+    # AstrBot takes registration priority from the innermost decorator.
+    @filter.command("抽奖")
+    @filter.platform_adapter_type(filter.PlatformAdapterType.AIOCQHTTP, priority=90)
     async def lottery_command(self, event: AstrMessageEvent):
         """Dispatch /抽奖 subcommands and render every outcome, including syntax errors.
 
@@ -972,6 +984,7 @@ class CatLottery(Star):
             event: Actual QQ command message event.
         """
         event.stop_event()
+        event.should_call_llm(True)
         try:
             identity = self.identity(event)
             # A single root handler avoids framework-generated text errors for
@@ -998,8 +1011,8 @@ class CatLottery(Star):
                     text = text[len(prefix) :].lstrip()
                     break
             # The framework already matched the root command, including configured renames.
-            text = re.sub(r"^\S+\s*", "", text, count=1)
-            parts = re.match(r"(\S+)(?:\s([\s\S]*))?", text)
+            text = re.sub(r"^\S+(?:\s|$)", "", text, count=1)
+            parts = re.match(r"(\S+)(?:\s([\s\S]*))?", text.lstrip())
             command = parts.group(1) if parts else "帮助"
             argument = (parts.group(2) or "") if parts else ""
             if command != "回答":
@@ -1065,7 +1078,7 @@ class CatLottery(Star):
                         pending.append(
                             (
                                 item["title"],
-                                f"/抽奖 切换 {item['id']}\n已完成 {len(entry['answers'])}/{len(item['questions'])} 项",
+                                f"/抽奖 切换 {item['id']}\n已完成 {form_progress(entry, len(item['questions']))[0]}/{len(item['questions'])} 项",
                             )
                         )
                 await self.card(
@@ -1273,6 +1286,11 @@ class CatLottery(Star):
                         ],
                         f"{item['title']} · {lottery_id}",
                     )
+            elif not identity["group_id"] and await self.store.private_session(
+                identity["bot_id"], identity["user_id"]
+            ):
+                # Only an existing active private form can accept the shorthand answer.
+                await self.collect_private(event, content=text)
             else:
                 raise ValueError("未知子命令。发送 /抽奖 查看图片帮助。")
         except ValueError as exc:
@@ -1300,8 +1318,52 @@ class CatLottery(Star):
             )
             # A reply failure must not trigger another send through the same broken transport.
 
-    @filter.event_message_type(filter.EventMessageType.PRIVATE_MESSAGE, priority=80)
-    @filter.platform_adapter_type(filter.PlatformAdapterType.AIOCQHTTP)
+    @filter.event_message_type(filter.EventMessageType.ALL)
+    @filter.platform_adapter_type(filter.PlatformAdapterType.AIOCQHTTP, priority=81)
+    async def restore_friend_forms(self, event: AstrMessageEvent):
+        """Restore existing group reservations after a verified OneBot friend-add notice.
+
+        Args:
+            event: Adapter event whose raw notice identifies the actual friend and bot.
+        """
+        raw = event.message_obj.raw_message
+        if (
+            not isinstance(raw, dict)
+            or raw.get("post_type") != "notice"
+            or raw.get("notice_type") != "friend_add"
+        ):
+            return
+        bot_id, user_id = str(event.get_self_id()), str(event.get_sender_id())
+        if (
+            event.get_platform_name() != "aiocqhttp"
+            or event.get_group_id()
+            or str(raw.get("self_id")) != bot_id
+            or str(raw.get("user_id")) != user_id
+            or not all(
+                re.fullmatch(r"[1-9][0-9]{4,19}", value) for value in (bot_id, user_id)
+            )
+        ):
+            self.logger.warning(
+                "Untrusted friend-add notice rejected for lottery restoration."
+            )
+            return
+        try:
+            result = await self.store.restart_forms(
+                bot_id=bot_id, user_id=user_id, platform_id=event.get_platform_id()
+            )
+            if result["restarted_users"]:
+                self.wake.set()
+                self.logger.info(
+                    "Friend-add notice restored a pending lottery form for QQ %s.",
+                    user_id,
+                )
+        except (sqlite3.Error, RuntimeError, json.JSONDecodeError):
+            self.logger.exception(
+                "Friend-add lottery restoration failed; manual continuation remains available."
+            )
+
+    @filter.event_message_type(filter.EventMessageType.PRIVATE_MESSAGE)
+    @filter.platform_adapter_type(filter.PlatformAdapterType.AIOCQHTTP, priority=80)
     async def collect_private(
         self, event: AstrMessageEvent, content: str | None = None
     ):
@@ -1355,6 +1417,7 @@ class CatLottery(Star):
                     return
                 raise ValueError("请通过报名时使用的平台私聊我。")
             event.stop_event()
+            event.should_call_llm(True)
             item = await self.store.get(lottery_id)
             self.check_target(item, identity)
             entry = await self.store.entry(lottery_id, identity["user_id"])
@@ -1427,7 +1490,7 @@ class CatLottery(Star):
                 self.logger.debug(
                     "Lottery %s form advanced to question %d.",
                     lottery_id,
-                    len(entry["answers"]) + 1,
+                    form_progress(entry, len(item["questions"]))[1] + 1,
                 )
                 try:
                     await self.show_question(event, item, entry)
@@ -1718,8 +1781,18 @@ class CatLottery(Star):
                         sections = question_sections(item, entry, index)
                     elif kind == "participation_guide":
                         title, sections = "", []
-                    elif kind in {"success", "submitted", "review"}:
+                    elif kind in {"success", "submitted", "review", "answer_changed"}:
                         entry = message["entry"]
+                        current = await self.store.entry(item["id"], entry["user_id"])
+                        if not current or current.get(
+                            "answer_revision", 0
+                        ) != entry.get("answer_revision", 0):
+                            await self.store.delivery_done(row["id"], skipped=True)
+                            self.logger.debug(
+                                "Skipped an obsolete lottery eligibility receipt for %s.",
+                                item["id"],
+                            )
+                            continue
                         try:
                             portrait = await asyncio.wait_for(
                                 self.avatars.get(
@@ -1736,9 +1809,29 @@ class CatLottery(Star):
                         title = entry_text(entry, len(item["questions"]))
                         explanation = {
                             "approved": "已成功参与，每个 QQ 号仅计一次，已获得开奖资格。",
-                            "pending": "资料已提交，请等待管理员审核。审核全部通过后才有开奖资格。",
-                            "rejected": "审核未通过，暂不进入开奖名单。请联系活动管理员核对。",
+                            "pending": "资料已提交，请等待管理员审核。整份资料审核通过后才有开奖资格。",
+                            "rejected": "整体作答未通过审核，暂无开奖资格，请联系活动管理员",
+                            "incomplete": "资料尚未填写完整，暂无开奖资格",
                         }[status]
+                        if kind == "answer_changed":
+                            title = (
+                                "整体作答未通过"
+                                if entry["status"] != "complete"
+                                else "填写资料已更新"
+                            )
+                            explanation = (
+                                "管理员已调整你的填写资料，请查询 /抽奖 状态 "
+                                + item["id"]
+                            )
+                            if entry["status"] != "complete":
+                                explanation += (
+                                    "\n报名截止前请私聊发送 /抽奖 继续，补齐资料后重新审核"
+                                    if item["status"] == "open"
+                                    and time.time() < item["close_at"]
+                                    else "\n报名已截止，请联系活动管理员处理"
+                                )
+                            elif not item.get("require_correct", True):
+                                explanation += "\n请等待管理员重新审核整份资料"
                         sections = [
                             (
                                 "报名确认",
@@ -2147,9 +2240,45 @@ class CatLottery(Star):
         """
         try:
             payload = await request.json()
-            result = await self.store.review(
-                lottery_id, payload, f"web:{request.username}"
-            )
+            if not isinstance(payload, dict) or not isinstance(
+                payload.get("action"), str
+            ):
+                raise ValueError("请选择有效的管理操作")
+            if payload.get("action") == "restart_forms":
+                if payload.get("confirmed") is not True:
+                    raise ValueError("请确认重新通知全部未填写完的用户")
+                result = await self.store.restart_forms(lottery_id)
+                self.wake.set()
+                return json_response(result)
+            if payload.get("action") in {
+                "edit_answer",
+                "delete_answer",
+                "delete_entries",
+            }:
+                result = await self.store.manage_answers(
+                    lottery_id, payload, f"web:{request.username}"
+                )
+            else:
+                if payload.get("action") == "mark":
+                    raise ValueError("请审核整份填写资料，不支持单题标记")
+                if (
+                    payload.get("action") == "decision"
+                    and type(payload.get("revision")) is not int
+                ):
+                    raise ValueError("请刷新报名资料后审核")
+                if payload.get("action") == "bulk" and (
+                    not isinstance(payload.get("revisions"), dict)
+                    or not isinstance(payload.get("user_ids"), list)
+                    or any(
+                        not isinstance(user, str)
+                        or type(payload["revisions"].get(user)) is not int
+                        for user in payload["user_ids"]
+                    )
+                ):
+                    raise ValueError("请刷新并明确选择报名资料后批量审核")
+                result = await self.store.review(
+                    lottery_id, payload, f"web:{request.username}"
+                )
             self.logger.info(
                 "Lottery %s review action=%s; marked=%d; changed=%d.",
                 lottery_id,
@@ -2163,8 +2292,11 @@ class CatLottery(Star):
             return error_response(str(exc))
 
     @web_boundary
-    async def web_upload_artwork(self):
+    async def web_upload_artwork(self, *, private: bool = False):
         """Validate and sanitize one uploaded award image or lottery cover.
+
+        Args:
+            private: Store a private answer image instead of public artwork.
 
         Returns:
             Generated image reference, or a readable file validation error.
@@ -2173,7 +2305,7 @@ class CatLottery(Star):
             files = await request.files()
             uploaded = files.get("file")
             if uploaded is None or len(files.getlist("file")) != 1:
-                raise ValueError("请上传一张奖品图片或活动封面")
+                raise ValueError("请上传一张图片")
             data = await uploaded.read(8 * 1024 * 1024 + 1)
             if not data or len(data) > 8 * 1024 * 1024:
                 raise ValueError("图片不能为空，且不能超过 8 MB")
@@ -2196,7 +2328,11 @@ class CatLottery(Star):
                                 PillowImage.Resampling.LANCZOS,
                             )
                             filename = f"{secrets.token_hex(16)}.jpg"
-                            path = self.store.directory / "artwork" / filename
+                            path = (
+                                self.store.directory
+                                / ("uploads" if private else "artwork")
+                                / filename
+                            )
                             try:
                                 await asyncio.to_thread(
                                     picture.save, path, "JPEG", quality=90
@@ -2221,6 +2357,15 @@ class CatLottery(Star):
         except ValueError as exc:
             self.logger.debug("Lottery artwork validation rejected.")
             return error_response(str(exc))
+
+    @web_boundary
+    async def web_upload_answer_image(self):
+        """Sanitize private answer uploads with the same bounded image pipeline.
+
+        Returns:
+            A private attachment reference or a validation error.
+        """
+        return await self.web_upload_artwork(private=True)
 
     @web_boundary
     async def web_artwork(self, filename: str):

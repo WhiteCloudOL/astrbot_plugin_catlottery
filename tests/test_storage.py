@@ -1597,3 +1597,488 @@ async def test_legacy_completed_entries_keep_eligibility_and_instant_rules(
         await store.review(item["id"], {"action": "match"}, "web:admin")
     drawn = await store.action(item["id"], "draw")
     assert drawn["eligible_count"] == 1
+
+
+@pytest.fixture
+async def managed_form(store, rules, sender):
+    """Create a submitted three-question form with one private image."""
+    rules.update(
+        require_correct=False,
+        questions=[
+            {"kind": "text", "prompt": "第一题"},
+            {"kind": "mixed", "prompt": "图文资料"},
+            {"kind": "text", "prompt": "最后一题"},
+        ],
+    )
+    item = await store.save(rules, "admin")
+    await store.enroll(item["id"], sender)
+    filename = "1" * 32 + ".jpg"
+    (store.directory / "uploads" / filename).write_bytes(b"original private image")
+    for index, answer in enumerate(
+        [
+            {"kind": "text", "value": "  first  answer\n"},
+            {"kind": "mixed", "value": "middle", "image": filename},
+            {"kind": "text", "value": "last answer"},
+        ]
+    ):
+        await store.answer(item["id"], {**sender, "group_id": ""}, answer, index)
+    return item, await store.entry(item["id"], sender["user_id"])
+
+
+async def test_admin_edit_resets_whole_review_and_preserves_exact_text(
+    store, sender, managed_form
+):
+    item, entry = managed_form
+    await store.review(
+        item["id"],
+        {"action": "decision", "user_id": sender["user_id"], "correct": True},
+        "web:admin",
+    )
+    entry = await store.entry(item["id"], sender["user_id"])
+    text = "  new  words\nsecond  line  "
+    result = await store.manage_answers(
+        item["id"],
+        {
+            "action": "edit_answer",
+            "user_id": sender["user_id"],
+            "revision": entry["answer_revision"],
+            "question_index": 0,
+            "answer": {"kind": "text", "value": text, "correct": True},
+            "notify": True,
+        },
+        "web:editor",
+    )
+    saved = await store.entry(item["id"], sender["user_id"])
+    assert saved["answers"][0]["value"] == text
+    assert saved["answers"][0]["edited_by"] == "web:editor"
+    assert saved["review_status"] == "pending" and "review_decision" not in saved
+    assert all(answer["correct"] is None for answer in saved["answers"])
+    assert result["private_notices"] == 1
+    messages = [json.loads(row["body"]) for row in await store.deliveries()]
+    assert len(messages) == 1 and messages[0]["kind"] == "answer_changed"
+    assert messages[0]["target"]["channel"] == "private"
+    assert (
+        "question_index" not in messages[0]["entry"]
+        and "answers" not in messages[0]["entry"]
+    )
+    assert text not in str(messages)
+    with pytest.raises(ValueError, match="更新"):
+        await store.manage_answers(
+            item["id"],
+            {
+                "action": "edit_answer",
+                "user_id": sender["user_id"],
+                "revision": entry["answer_revision"],
+                "question_index": 0,
+                "answer": {"kind": "text", "value": "stale"},
+                "notify": False,
+            },
+            "other",
+        )
+
+
+async def test_deleted_middle_answer_can_be_refilled_without_losing_later_answers(
+    store, sender, managed_form
+):
+    from astrbot_plugin_catlottery.storage import form_progress
+
+    item, entry = managed_form
+    await store.manage_answers(
+        item["id"],
+        {
+            "action": "delete_answer",
+            "user_id": sender["user_id"],
+            "revision": entry["answer_revision"],
+            "question_index": 1,
+            "confirmed": True,
+            "notify": False,
+        },
+        "web:admin",
+    )
+    deleted = await store.entry(item["id"], sender["user_id"])
+    assert deleted["answers"][1]["kind"] == "deleted"
+    assert deleted["answers"][2]["value"] == "last answer"
+    assert form_progress(deleted, 3) == (2, 1)
+    assert deleted["review_status"] == "incomplete"
+    assert not list((store.directory / "uploads").glob("*.jpg"))
+    assert not await store.deliveries()
+    await store.private_session(sender["bot_id"], sender["user_id"], item["id"])
+    assert await store.form_position(sender["bot_id"], sender["user_id"]) == 1
+    with pytest.raises(ValueError):
+        await store.form_position(sender["bot_id"], sender["user_id"], 1)
+    filename = "2" * 32 + ".jpg"
+    (store.directory / "uploads" / filename).write_bytes(b"replacement")
+    _, saved = await store.answer(
+        item["id"],
+        {**sender, "group_id": ""},
+        {"kind": "mixed", "value": "replacement", "image": filename},
+        1,
+    )
+    assert saved["status"] == "complete" and len(saved["answers"]) == 3
+    assert saved["answers"][2]["value"] == "last answer"
+    assert await store.private_session(sender["bot_id"], sender["user_id"]) is None
+
+
+@pytest.mark.parametrize("notify", [True, False])
+async def test_bulk_data_deletion_requires_confirmation_and_is_atomic(
+    store, sender, managed_form, notify
+):
+    item, entry = managed_form
+    other = {**sender, "user_id": "8888888"}
+    await store.enroll(item["id"], other)
+    await store.answer(
+        item["id"],
+        {**other, "group_id": ""},
+        {"kind": "text", "value": "second participant"},
+        0,
+    )
+    ids = [sender["user_id"], other["user_id"]]
+    payload = {
+        "action": "delete_entries",
+        "user_ids": ids,
+        "revisions": {ids[0]: entry["answer_revision"], ids[1]: 0},
+        "notify": notify,
+        "confirmed": True,
+    }
+    with pytest.raises(ValueError, match="更新"):
+        await store.manage_answers(item["id"], payload, "web:admin")
+    assert (await store.entry(item["id"], ids[0])) == entry
+    payload["revisions"][ids[1]] = 1
+    payload["confirmed"] = False
+    with pytest.raises(ValueError, match="确认"):
+        await store.manage_answers(item["id"], payload, "web:admin")
+    payload["confirmed"] = True
+    assert (await store.manage_answers(item["id"], payload, "web:admin"))[
+        "changed_entries"
+    ] == 2
+    for user in ids:
+        saved = await store.entry(item["id"], user)
+        assert saved["status"] == "pending" and saved["review_status"] == "incomplete"
+        assert all(answer["kind"] == "deleted" for answer in saved["answers"])
+    assert len(await store.deliveries()) == (2 if notify else 0)
+    await store.restart_forms(item["id"])
+    assert await store.form_position(sender["bot_id"], sender["user_id"]) == 0
+
+
+async def test_private_image_edit_rejects_reuse_and_cleans_replaced_attachment(
+    store, sender, managed_form
+):
+    item, entry = managed_form
+    filename = "2" * 32 + ".jpg"
+    (store.directory / "uploads" / filename).write_bytes(b"new private image")
+    payload = {
+        "action": "edit_answer",
+        "user_id": sender["user_id"],
+        "revision": entry["answer_revision"],
+        "question_index": 0,
+        "answer": {
+            "kind": "text",
+            "value": "optional image",
+            "image": "1" * 32 + ".jpg",
+        },
+        "notify": False,
+    }
+    with pytest.raises(ValueError, match="其他答案"):
+        await store.manage_answers(item["id"], payload, "admin")
+    payload.update(
+        question_index=1, answer={"kind": "mixed", "value": "new", "image": filename}
+    )
+    await store.manage_answers(item["id"], payload, "admin")
+    assert not (store.directory / "uploads" / ("1" * 32 + ".jpg")).exists()
+    payload["revision"] += 1
+    payload["answer"] = {"kind": "mixed", "value": "image required"}
+    with pytest.raises(ValueError, match="图片"):
+        await store.manage_answers(item["id"], payload, "admin")
+    assert (store.directory / "uploads" / filename).exists()
+
+
+async def test_admin_can_restore_deleted_answer_before_draw_but_not_after(
+    store, sender, managed_form, monkeypatch
+):
+    item, entry = managed_form
+    payload = {
+        "action": "delete_answer",
+        "user_id": sender["user_id"],
+        "revision": entry["answer_revision"],
+        "question_index": 0,
+        "notify": True,
+        "confirmed": True,
+    }
+    await store.manage_answers(item["id"], payload, "admin")
+    monkeypatch.setattr(time, "time", lambda: item["close_at"] + 1)
+    payload.update(
+        action="edit_answer",
+        revision=entry["answer_revision"] + 1,
+        answer={"kind": "text", "value": "restored"},
+    )
+    await store.manage_answers(item["id"], payload, "admin")
+    saved = await store.entry(item["id"], sender["user_id"])
+    assert saved["status"] == "complete" and saved["review_status"] == "pending"
+    monkeypatch.setattr(time, "time", lambda: item["draw_at"])
+    with pytest.raises(ValueError, match="锁定"):
+        await store.manage_answers(
+            item["id"], {**payload, "revision": saved["answer_revision"]}, "admin"
+        )
+    assert (await store.entry(item["id"], sender["user_id"])) == saved
+
+
+async def test_admin_edit_still_enforces_instant_quiz_and_winner_freeze(
+    store, rules, sender
+):
+    rules["questions"] = [{"kind": "quiz", "prompt": "题目", "answers": ["yes"]}]
+    item = await store.save(rules, "admin")
+    await store.enroll(item["id"], sender)
+    await store.answer(
+        item["id"], {**sender, "group_id": ""}, {"kind": "text", "value": "yes"}, 0
+    )
+    payload = {
+        "action": "edit_answer",
+        "user_id": sender["user_id"],
+        "revision": 1,
+        "question_index": 0,
+        "answer": {"kind": "text", "value": "no"},
+        "notify": False,
+    }
+    with pytest.raises(ValueError, match="不正确"):
+        await store.manage_answers(item["id"], payload, "admin")
+    await store.action(item["id"], "draw_tier", tier_index=0)
+    with pytest.raises(ValueError, match="中奖|锁定"):
+        await store.manage_answers(
+            item["id"], {**payload, "answer": {"kind": "text", "value": "yes"}}, "admin"
+        )
+
+
+async def test_restart_forms_resets_delivery_backoff_and_never_creates_private_enrollment(
+    store, rules, sender, monkeypatch
+):
+    rules["questions"] = [
+        {"kind": "text", "prompt": "第一题"},
+        {"kind": "text", "prompt": "第二题"},
+    ]
+    item = await store.save(rules, "admin")
+    await store.enroll(item["id"], sender)
+    await store.answer(
+        item["id"], {**sender, "group_id": ""}, {"kind": "text", "value": "saved"}, 0
+    )
+    await store.queue_question(item["id"], sender["bot_id"], sender["user_id"])
+    old = (await store.deliveries())[0]
+    await store.delivery_done(old["id"], "offline")
+    assert not await store.deliveries()
+    await store.private_session(sender["bot_id"], sender["user_id"], "")
+    assert (
+        await store.restart_forms(
+            bot_id=sender["bot_id"],
+            user_id="9999999",
+            platform_id=sender["platform_id"],
+        )
+    )["restarted_users"] == 0
+    assert (
+        await store.restart_forms(
+            bot_id=sender["bot_id"], user_id=sender["user_id"], platform_id="other"
+        )
+    )["restarted_users"] == 0
+    assert (
+        await store.restart_forms(
+            bot_id=sender["bot_id"],
+            user_id=sender["user_id"],
+            platform_id=sender["platform_id"],
+        )
+    )["restarted_users"] == 1
+    assert await store.form_position(sender["bot_id"], sender["user_id"]) == 1
+    assert (await store.entry(item["id"], sender["user_id"]))["answers"][0][
+        "value"
+    ] == "saved"
+    await store.restart_forms(item["id"])
+    assert len(await store.deliveries()) == 1
+    monkeypatch.setattr(time, "time", lambda: item["close_at"])
+    with pytest.raises(ValueError, match="截止"):
+        await store.restart_forms(item["id"])
+    assert (
+        await store.restart_forms(
+            bot_id=sender["bot_id"],
+            user_id=sender["user_id"],
+            platform_id=sender["platform_id"],
+        )
+    )["restarted_users"] == 0
+
+
+async def test_overall_review_has_no_per_question_manual_marks_and_rejects_stale_revision(
+    store, sender, managed_form
+):
+    item, entry = managed_form
+    await store.review(
+        item["id"],
+        {
+            "action": "decision",
+            "user_id": sender["user_id"],
+            "correct": False,
+            "revision": entry["answer_revision"],
+        },
+        "web:admin",
+    )
+    saved = await store.entry(item["id"], sender["user_id"])
+    assert saved["review_status"] == "rejected" and saved["review_decision"] is False
+    assert all(answer.get("correct") is None for answer in saved["answers"])
+    with pytest.raises(ValueError, match="更新"):
+        await store.review(
+            item["id"],
+            {
+                "action": "decision",
+                "user_id": sender["user_id"],
+                "correct": True,
+                "revision": entry["answer_revision"],
+            },
+            "web:other",
+        )
+    assert (await store.entry(item["id"], sender["user_id"])) == saved
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        {"revision": True},
+        {"revision": -1},
+        {"notify": "false"},
+        {"confirmed": "true"},
+        {"question_index": True},
+        {"question_index": 999},
+        {"user_id": "quoted sender"},
+    ],
+)
+async def test_invalid_admin_delete_payload_never_mutates_data(
+    store, sender, managed_form, change
+):
+    item, entry = managed_form
+    payload = {
+        "action": "delete_answer",
+        "user_id": sender["user_id"],
+        "question_index": 0,
+        "revision": entry["answer_revision"],
+        "notify": False,
+        "confirmed": True,
+        **change,
+    }
+    with pytest.raises(ValueError):
+        await store.manage_answers(item["id"], payload, "web:admin")
+    assert await store.entry(item["id"], sender["user_id"]) == entry
+    assert (store.directory / "uploads" / ("1" * 32 + ".jpg")).exists()
+
+
+async def test_edit_and_draw_serialize_without_awarding_an_invalidated_entry(
+    store, sender, managed_form
+):
+    item, entry = managed_form
+    await store.review(
+        item["id"],
+        {"action": "decision", "user_id": sender["user_id"], "correct": True},
+        "web:admin",
+    )
+    entry = await store.entry(item["id"], sender["user_id"])
+    payload = {
+        "action": "edit_answer",
+        "user_id": sender["user_id"],
+        "question_index": 0,
+        "revision": entry["answer_revision"],
+        "notify": False,
+        "answer": {"kind": "text", "value": "requires review again"},
+    }
+    edit, draw = await asyncio.gather(
+        store.manage_answers(item["id"], payload, "web:admin"),
+        store.action(item["id"], "draw"),
+        return_exceptions=True,
+    )
+    saved = await store.entry(item["id"], sender["user_id"])
+    if isinstance(edit, ValueError):
+        assert draw["winners"][0]["user_id"] == sender["user_id"] and saved == entry
+    else:
+        assert draw["winners"] == [] and saved["review_status"] == "pending"
+
+
+async def test_restarting_a_form_preserves_active_activity_when_multiple_are_pending(
+    store, rules, sender
+):
+    rules["questions"] = [{"kind": "text", "prompt": "资料"}]
+    first = await store.save(rules, "admin")
+    await store.enroll(first["id"], sender)
+    second = await store.save({**rules, "title": "second"}, "admin")
+    await store.enroll(second["id"], sender)
+    await store.restart_forms(
+        bot_id=sender["bot_id"],
+        user_id=sender["user_id"],
+        platform_id=sender["platform_id"],
+    )
+    assert (
+        await store.private_session(sender["bot_id"], sender["user_id"]) == second["id"]
+    )
+    assert len(await store.deliveries()) == 1
+    await store.restart_forms(first["id"])
+    assert (
+        await store.private_session(sender["bot_id"], sender["user_id"]) == first["id"]
+    )
+    jobs = await store.deliveries()
+    assert len(jobs) == 1 and jobs[0]["lottery_id"] == first["id"]
+
+
+async def test_removing_optional_admin_image_only_deletes_the_unreferenced_file(
+    store, sender, managed_form
+):
+    item, entry = managed_form
+    filename = "3" * 32 + ".jpg"
+    (store.directory / "uploads" / filename).write_bytes(b"optional attachment")
+    payload = {
+        "action": "edit_answer",
+        "user_id": sender["user_id"],
+        "question_index": 0,
+        "revision": entry["answer_revision"],
+        "notify": False,
+        "answer": {"kind": "text", "value": "text", "image": filename},
+    }
+    await store.manage_answers(item["id"], payload, "admin")
+    payload["revision"] += 1
+    payload["answer"].pop("image")
+    await store.manage_answers(item["id"], payload, "admin")
+    assert not (store.directory / "uploads" / filename).exists()
+    assert (store.directory / "uploads" / ("1" * 32 + ".jpg")).exists()
+
+
+async def test_admin_deletion_pauses_old_prompt_before_the_user_can_reply(
+    store, rules, sender
+):
+    rules.update(
+        require_correct=False,
+        questions=[
+            {"kind": "text", "prompt": "first"},
+            {"kind": "text", "prompt": "second"},
+        ],
+    )
+    item = await store.save(rules, "admin")
+    await store.enroll(item["id"], sender)
+    await store.answer(
+        item["id"],
+        {**sender, "group_id": ""},
+        {"kind": "text", "value": "first answer"},
+        0,
+    )
+    await store.manage_answers(
+        item["id"],
+        {
+            "action": "delete_answer",
+            "user_id": sender["user_id"],
+            "question_index": 0,
+            "revision": 1,
+            "confirmed": True,
+            "notify": False,
+        },
+        "admin",
+    )
+    assert await store.private_session(sender["bot_id"], sender["user_id"]) is None
+    with pytest.raises(ValueError, match="暂停"):
+        await store.answer(
+            item["id"],
+            {**sender, "group_id": ""},
+            {"kind": "text", "value": "reply to old prompt"},
+            0,
+        )
+    assert (await store.entry(item["id"], sender["user_id"]))["answers"][0][
+        "kind"
+    ] == "deleted"

@@ -193,14 +193,15 @@ class Artwork extends HTMLElement {
   }
   async loadPreview() {
     const filename = this.value;
+    const key = this.hasAttribute("private") ? `answer:${filename}` : filename;
     try {
-      if (!artworkCache.has(filename)) {
+      if (!artworkCache.has(key)) {
         if (artworkCache.size >= 64) artworkCache.delete(artworkCache.keys().next().value);
-        artworkCache.set(filename, window.AstrBotPluginPage.apiGet(`artwork/${filename}`));
+        artworkCache.set(key, this.hasAttribute("private") ? window.AstrBotPluginPage.apiGet(`images/${filename}`, {preview:"1"}) : window.AstrBotPluginPage.apiGet(`artwork/${filename}`));
       }
-      const data = await artworkCache.get(filename);
+      const data = await artworkCache.get(key);
       if (this.value === filename) { this.preview = data.preview; this.render(); }
-    } catch { artworkCache.delete(filename); if (this.value === filename) { this.preview = ""; this.failed = true; this.render(); } }
+    } catch { artworkCache.delete(key); if (this.value === filename) { this.preview = ""; this.failed = true; this.render(); } }
   }
   async upload(file) {
     if (this.busy || this.hasAttribute("disabled")) return;
@@ -209,7 +210,7 @@ class Artwork extends HTMLElement {
     this.busy = true; this.failed = false; this.render();
     this.dispatchEvent(new Event("upload-state", { bubbles: true }));
     try {
-      const result = await window.AstrBotPluginPage.upload("artwork", file);
+      const result = await window.AstrBotPluginPage.upload(this.hasAttribute("private") ? "answer-images" : "artwork", file);
       this.value = result.image;
       this.dispatchEvent(new Event("change", { bubbles: true }));
       await this.loadPreview();
@@ -223,7 +224,7 @@ class Artwork extends HTMLElement {
   }
 }
 customElements.define("meow-upload", Artwork);
-export const artwork = (name, value = "", label = "图片", { disabled = false, cover = false } = {}) => `<meow-upload name="${escapeHTML(name)}" value="${escapeHTML(value)}" label="${escapeHTML(label)}" variant="${cover ? "cover" : "prize"}" ${disabled ? "disabled" : ""}></meow-upload>`;
+export const artwork = (name, value = "", label = "图片", { disabled = false, cover = false, privateImage = false } = {}) => `<meow-upload name="${escapeHTML(name)}" value="${escapeHTML(value)}" label="${escapeHTML(label)}" variant="${cover ? "cover" : "prize"}" ${privateImage ? "private" : ""} ${disabled ? "disabled" : ""}></meow-upload>`;
 
 export async function loadArtwork(container) {
   await Promise.all([...container.querySelectorAll("img[data-artwork]")].map(async image => {

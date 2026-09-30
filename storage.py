@@ -292,6 +292,94 @@ def validate_lottery(payload: dict, *, now: float | None = None) -> dict:
     return result
 
 
+def form_progress(entry: dict, question_count: int) -> tuple[int, int]:
+    """Count present answers and locate the first missing question.
+
+    Args:
+        entry: A participant with index-aligned answer slots.
+        question_count: Number of required questions.
+
+    Returns:
+        Submitted answer count and the first missing index, or question_count.
+    """
+    present = {
+        index
+        for index, answer in enumerate(entry.get("answers", []))
+        if index < question_count and answer.get("kind") != "deleted"
+    }
+    return len(present), next(
+        (index for index in range(question_count) if index not in present),
+        question_count,
+    )
+
+
+def validate_answer(question: dict, answer: dict, require_correct: bool) -> dict:
+    """Normalize one submission without changing its whitespace or trusting review fields.
+
+    Args:
+        question: Frozen question rules.
+        answer: Text and optional plugin-owned image reference.
+        require_correct: Enforce instant quiz correctness when enabled.
+
+    Returns:
+        Validated answer with a fresh review mark.
+
+    Raises:
+        ValueError: The answer does not satisfy the question rules.
+    """
+    expected_kind = (
+        question["kind"] if question["kind"] in {"image", "mixed"} else "text"
+    )
+    if not isinstance(answer, dict) or answer.get("kind") != expected_kind:
+        raise ValueError("请按当前题目要求发送文本、图片或图文消息。")
+    original_text = (
+        answer.get("text", "") if expected_kind == "image" else answer.get("value", "")
+    )
+    filename = (
+        answer.get("value", "") if expected_kind == "image" else answer.get("image", "")
+    )
+    if not isinstance(original_text, str) or len(original_text) > 1000:
+        raise ValueError("文本请控制在 1000 字以内，空格和换行也计入长度。")
+    if expected_kind != "image" and not original_text.strip():
+        raise ValueError("本题需要非空文本，图片可以与文本在同一条消息中发送。")
+    if not isinstance(filename, str) or (
+        filename and not re.fullmatch(r"[a-f0-9]{32}\.jpg", filename)
+    ):
+        raise ValueError("图片记录无效。")
+    if expected_kind in {"image", "mixed"} and not filename:
+        raise ValueError("本题需要一张图片，请按题目要求重新发送。")
+    answer = {
+        "kind": expected_kind,
+        "value": filename if expected_kind == "image" else original_text,
+    }
+    if expected_kind == "image" and original_text:
+        answer["text"] = original_text
+    elif expected_kind != "image" and filename:
+        answer["image"] = filename
+    if question["kind"] == "quiz" and require_correct:
+        text = original_text.strip()
+        options = question["options"]
+        if options:
+            choice = unicodedata.normalize("NFKC", text).upper()
+            if choice in [chr(65 + n) for n in range(len(options))]:
+                text = options[ord(choice) - 65]
+            elif choice.isdecimal() and 1 <= int(choice) <= len(options):
+                text = options[int(choice) - 1]
+            elif unicodedata.normalize("NFKC", text).casefold() not in {
+                unicodedata.normalize("NFKC", option).casefold() for option in options
+            }:
+                raise ValueError("请发送选项字母、数字序号或完整选项文本。")
+        normalized = unicodedata.normalize("NFKC", text).strip().casefold()
+        if normalized not in {
+            unicodedata.normalize("NFKC", x).strip().casefold()
+            for x in question["answers"]
+        }:
+            raise ValueError("答案还不正确，再想一想喵！请重新回答当前题。")
+    if not require_correct:
+        answer["correct"] = None
+    return answer
+
+
 def review_status(item: dict, entry: dict) -> str:
     """Derive eligibility from submission completion and the frozen answer mode.
 
@@ -306,6 +394,8 @@ def review_status(item: dict, entry: dict) -> str:
         return "incomplete"
     if item.get("require_correct", True) or not item["questions"]:
         return "approved"
+    if isinstance(entry.get("review_decision"), bool):
+        return "approved" if entry["review_decision"] else "rejected"
     marks = [answer.get("correct") for answer in entry["answers"]]
     if any(mark is False for mark in marks):
         return "rejected"
@@ -780,6 +870,7 @@ class Store:
                 entry = {
                     **identity,
                     "answers": [],
+                    "answer_revision": 0,
                     "status": "pending" if item["questions"] else "complete",
                     "joined_at": time.time(),
                     "completed_at": None if item["questions"] else time.time(),
@@ -857,7 +948,12 @@ class Store:
                     raise ValueError("报名已截止，不能继续填写。")
                 await self.db.execute(
                     "INSERT OR REPLACE INTO sessions (bot_id, user_id, lottery_id, question_index) VALUES (?, ?, ?, ?)",
-                    (bot_id, user_id, lottery_id, len(entry["answers"])),
+                    (
+                        bot_id,
+                        user_id,
+                        lottery_id,
+                        form_progress(entry, len(item["questions"]))[1],
+                    ),
                 )
             async with self.db.execute(
                 "SELECT s.lottery_id, l.body FROM sessions s "
@@ -913,9 +1009,14 @@ class Store:
             ):
                 raise ValueError("资料已提交或报名已截止，不能继续回答")
             index = (
-                row[0] if row[0] is not None else len(entry["answers"])
+                row[0]
+                if row[0] is not None
+                else form_progress(entry, len(item["questions"]))[1]
             ) + direction
-            if not 0 <= index < len(item["questions"]) or index > len(entry["answers"]):
+            if (
+                not 0 <= index < len(item["questions"])
+                or index > form_progress(entry, len(item["questions"]))[1]
+            ):
                 raise ValueError("没有可切换的题目，请先回答当前题")
             if direction:
                 await self.db.execute(
@@ -943,7 +1044,9 @@ class Store:
             if row:
                 entry, item = json.loads(row[1]), json.loads(row[2])
                 entry["question_index"] = (
-                    row[0] if row[0] is not None else len(entry["answers"])
+                    row[0]
+                    if row[0] is not None
+                    else form_progress(entry, len(item["questions"]))[1]
                 )
                 await self.db.execute(
                     "DELETE FROM outbox WHERE lottery_id=? AND delivered_at IS NULL "
@@ -1004,7 +1107,9 @@ class Store:
                 if not session:
                     raise ValueError("当前回答已暂停，请私聊发送 /抽奖 继续 恢复")
                 expected = (
-                    session[0] if session[0] is not None else len(entry["answers"])
+                    session[0]
+                    if session[0] is not None
+                    else form_progress(entry, len(item["questions"]))[1]
                 )
                 if session[1] != lottery_id:
                     raise ValueError("已切换到另一场活动，请按最新题目卡片回答")
@@ -1012,69 +1117,18 @@ class Store:
                     entry["status"] != "pending"
                     or index != expected
                     or not 0 <= index < len(item["questions"])
-                    or index > len(entry["answers"])
+                    or index > form_progress(entry, len(item["questions"]))[1]
                 ):
                     raise ValueError("这题已处理，请按最新的问题卡片作答。")
                 question = item["questions"][index]
-                expected_kind = (
-                    question["kind"]
-                    if question["kind"] in {"image", "mixed"}
-                    else "text"
-                )
-                if not isinstance(answer, dict) or answer.get("kind") != expected_kind:
-                    raise ValueError("请按当前题目要求发送文本、图片或图文消息。")
-                original_text = (
-                    answer.get("text", "")
-                    if expected_kind == "image"
-                    else answer.get("value", "")
+                answer = validate_answer(
+                    question, answer, item.get("require_correct", True)
                 )
                 filename = (
-                    answer.get("value", "")
-                    if expected_kind == "image"
+                    answer["value"]
+                    if answer["kind"] == "image"
                     else answer.get("image", "")
                 )
-                if not isinstance(original_text, str) or len(original_text) > 1000:
-                    raise ValueError("文本请控制在 1000 字以内，空格和换行也计入长度。")
-                if expected_kind != "image" and not original_text.strip():
-                    raise ValueError(
-                        "本题需要非空文本，图片可以与文本在同一条消息中发送。"
-                    )
-                if not isinstance(filename, str) or (
-                    filename and not re.fullmatch(r"[a-f0-9]{32}\.jpg", filename)
-                ):
-                    raise ValueError("图片记录无效。")
-                if expected_kind in {"image", "mixed"} and not filename:
-                    raise ValueError("本题需要一张图片，请按题目要求重新发送。")
-                answer = {
-                    "kind": expected_kind,
-                    "value": filename if expected_kind == "image" else original_text,
-                }
-                if expected_kind == "image" and original_text:
-                    answer["text"] = original_text
-                elif expected_kind != "image" and filename:
-                    answer["image"] = filename
-                if question["kind"] == "quiz" and item.get("require_correct", True):
-                    text = original_text.strip()
-                    options = question["options"]
-                    if options:
-                        choice = unicodedata.normalize("NFKC", text).upper()
-                        if choice in [chr(65 + n) for n in range(len(options))]:
-                            text = options[ord(choice) - 65]
-                        elif choice.isdecimal() and 1 <= int(choice) <= len(options):
-                            text = options[int(choice) - 1]
-                        elif unicodedata.normalize("NFKC", text).casefold() not in {
-                            unicodedata.normalize("NFKC", option).casefold()
-                            for option in options
-                        }:
-                            raise ValueError("请发送选项字母、数字序号或完整选项文本。")
-                    normalized = unicodedata.normalize("NFKC", text).strip().casefold()
-                    if normalized not in {
-                        unicodedata.normalize("NFKC", x).strip().casefold()
-                        for x in question["answers"]
-                    }:
-                        raise ValueError("答案还不正确，再想一想喵！请重新回答当前题。")
-                if not item.get("require_correct", True):
-                    answer["correct"] = None
                 old_image = None
                 if index < len(entry["answers"]):
                     old = entry["answers"][index]
@@ -1086,14 +1140,22 @@ class Store:
                     entry["answers"].append(answer)
                 await self.db.execute(
                     "UPDATE sessions SET question_index=? WHERE bot_id=? AND user_id=? AND lottery_id=?",
-                    (index + 1, identity["bot_id"], identity["user_id"], lottery_id),
+                    (
+                        form_progress(entry, len(item["questions"]))[1],
+                        identity["bot_id"],
+                        identity["user_id"],
+                        lottery_id,
+                    ),
                 )
                 await self.db.execute(
                     "DELETE FROM outbox WHERE lottery_id=? AND delivered_at IS NULL "
                     "AND json_extract(body,'$.kind')='question' AND json_extract(body,'$.entry.user_id')=?",
                     (lottery_id, identity["user_id"]),
                 )
-                if len(entry["answers"]) == len(item["questions"]):
+                entry["answer_revision"] = entry.get("answer_revision", 0) + 1
+                if form_progress(entry, len(item["questions"]))[0] == len(
+                    item["questions"]
+                ):
                     entry["status"] = "complete"
                     entry["completed_at"] = time.time()
                     entry["review_status"] = review_status(item, entry)
@@ -1147,8 +1209,9 @@ class Store:
             "mark",
             "match",
             "bulk",
+            "decision",
         ):
-            raise ValueError("请选择逐题标记或文字答案匹配。")
+            raise ValueError("请选择整份资料审核或文字答案匹配")
         action = payload["action"]
         selected_ids = []
         if action == "bulk":
@@ -1166,9 +1229,11 @@ class Store:
             ):
                 raise ValueError("请明确选择 1–100 份已提交报名及通过或不通过标记")
             selected_ids = list(dict.fromkeys(selected_ids))
-        if action == "mark":
+            if "revisions" in payload and not isinstance(payload["revisions"], dict):
+                raise ValueError("资料版本无效，请刷新列表后操作")
+        if action in {"mark", "decision"}:
             user_id = payload.get("user_id")
-            index = payload.get("question_index")
+            index = payload.get("question_index", 0)
             correct = payload.get("correct")
             if (
                 not isinstance(user_id, str)
@@ -1177,6 +1242,8 @@ class Store:
                 or isinstance(index, bool)
                 or "correct" not in payload
                 or (correct is not None and not isinstance(correct, bool))
+                or action == "decision"
+                and not isinstance(correct, bool)
             ):
                 raise ValueError("请指定报名 QQ、题目序号及待审核／正确／错误标记。")
         async with self.lock:
@@ -1192,13 +1259,13 @@ class Store:
                 if item["status"] != "open" or time.time() >= item["draw_at"]:
                     raise ValueError("开奖时间已到或活动已结束，审核资格已锁定。")
                 winner_ids = {winner["user_id"] for winner in item["winners"]}
-                if action == "mark" and user_id in winner_ids:
+                if action in {"mark", "decision"} and user_id in winner_ids:
                     raise ValueError(
                         "该报名已获得提前开奖的奖项，资格与答案标记已锁定。"
                     )
                 if item.get("require_correct", True):
                     raise ValueError("本场采用当场答对模式，无需后续审核。")
-                if action == "mark":
+                if action in {"mark", "decision"}:
                     selected_ids = [user_id]
                 selection = (
                     " AND user_id IN (" + ",".join("?" for _ in selected_ids) + ")"
@@ -1210,7 +1277,7 @@ class Store:
                     (lottery_id, *selected_ids),
                 ) as cursor:
                     entries = [json.loads(row[0]) for row in await cursor.fetchall()]
-                if action == "bulk" and (
+                if action in {"bulk", "decision"} and (
                     len(entries) != len(selected_ids)
                     or any(
                         entry["status"] != "complete" or entry["user_id"] in winner_ids
@@ -1220,7 +1287,7 @@ class Store:
                     raise ValueError(
                         "所选报名中有未提交、已删除或已中奖者，请刷新列表后重试"
                     )
-                if action == "mark":
+                if action in {"mark", "decision"}:
                     entries = [
                         entry for entry in entries if entry["user_id"] == user_id
                     ]
@@ -1232,8 +1299,33 @@ class Store:
                 for entry in entries:
                     if entry["status"] != "complete" or entry["user_id"] in winner_ids:
                         continue
+                    revision = (
+                        payload.get("revision")
+                        if action == "decision"
+                        else payload.get("revisions", {}).get(entry["user_id"])
+                        if action == "bulk"
+                        else None
+                    )
+                    if revision is not None and (
+                        type(revision) is not int
+                        or revision != entry.get("answer_revision", 0)
+                    ):
+                        raise ValueError("资料已经更新，请刷新后重新审核整份资料")
                     previous = entry.get("review_status", "approved")
+                    if action == "match" and isinstance(
+                        entry.get("review_decision"), bool
+                    ):
+                        continue
+                    if action in {"decision", "bulk"}:
+                        entry.update(
+                            review_decision=correct,
+                            reviewed_by=reviewer_id,
+                            reviewed_at=time.time(),
+                        )
+                    entry["answer_revision"] = entry.get("answer_revision", 0) + 1
                     for question_index, answer in enumerate(entry["answers"]):
+                        if action in {"decision", "bulk"}:
+                            continue
                         if action in {"mark", "bulk"}:
                             if action == "mark" and question_index != index:
                                 continue
@@ -1300,6 +1392,321 @@ class Store:
             except BaseException:
                 await self.db.rollback()
                 raise
+
+    async def manage_answers(
+        self, lottery_id: str, payload: dict, reviewer_id: str
+    ) -> dict:
+        """Edit or delete private answers atomically and invalidate stale eligibility.
+
+        Args:
+            lottery_id: Activity being managed.
+            payload: Edit, single-answer deletion, or selected participants' data deletion.
+            reviewer_id: Authenticated operator retained in the audit metadata.
+
+        Returns:
+            Changed participant and queued private notification counts.
+
+        Raises:
+            ValueError: Selection, revision, attachment, or frozen eligibility is invalid.
+        """
+        action = payload.get("action") if isinstance(payload, dict) else None
+        if not isinstance(action, str) or action not in {
+            "edit_answer",
+            "delete_answer",
+            "delete_entries",
+        }:
+            raise ValueError("请选择编辑答案或删除填写资料")
+        ids = (
+            payload.get("user_ids")
+            if action == "delete_entries"
+            else [payload.get("user_id")]
+        )
+        revisions = (
+            payload.get("revisions", {})
+            if action == "delete_entries"
+            else {payload.get("user_id"): payload.get("revision")}
+        )
+        notify = payload.get("notify")
+        if (
+            not isinstance(ids, list)
+            or not 1 <= len(ids) <= 100
+            or any(
+                not isinstance(user, str) or not re.fullmatch(r"[1-9][0-9]{4,19}", user)
+                for user in ids
+            )
+            or len(set(ids)) != len(ids)
+            or not isinstance(revisions, dict)
+            or any(
+                type(revisions.get(user)) is not int or revisions[user] < 0
+                for user in ids
+            )
+            or not isinstance(notify, bool)
+        ):
+            raise ValueError(
+                "请选择 1–100 位参与者，刷新资料后重试，并明确是否通知用户"
+            )
+        if action != "edit_answer" and payload.get("confirmed") is not True:
+            raise ValueError("删除资料前请确认是否通知用户")
+        index = payload.get("question_index")
+        if action != "delete_entries" and (type(index) is not int or index < 0):
+            raise ValueError("题目序号无效")
+        discarded = set()
+        async with self.lock:
+            await self.db.execute("BEGIN IMMEDIATE")
+            try:
+                async with self.db.execute(
+                    "SELECT body FROM lotteries WHERE id=?", (lottery_id,)
+                ) as cursor:
+                    row = await cursor.fetchone()
+                if not row:
+                    raise ValueError("抽奖不存在")
+                item = json.loads(row[0])
+                if item["status"] != "open" or time.time() >= item["draw_at"]:
+                    raise ValueError("活动已结束或开奖时间已到，资料已锁定")
+                winners = {winner["user_id"] for winner in item["winners"]}
+                entries = []
+                for user in ids:
+                    async with self.db.execute(
+                        "SELECT body FROM entries WHERE lottery_id=? AND user_id=?",
+                        (lottery_id, user),
+                    ) as cursor:
+                        row = await cursor.fetchone()
+                    if not row or user in winners:
+                        raise ValueError(
+                            "所选参与者已移除或已中奖，无法修改资料，请刷新列表"
+                        )
+                    entry = json.loads(row[0])
+                    if revisions[user] != entry.get("answer_revision", 0):
+                        raise ValueError(
+                            "资料已被用户或其他管理员更新，请重新打开后操作"
+                        )
+                    if action != "delete_entries" and not 0 <= index < min(
+                        len(entry["answers"]), len(item["questions"])
+                    ):
+                        raise ValueError("本题尚未填写，无法编辑或删除")
+                    if (
+                        action == "delete_answer"
+                        and entry["answers"][index]["kind"] == "deleted"
+                    ):
+                        raise ValueError("本题答案已经删除，请刷新资料")
+                    if (
+                        action == "delete_entries"
+                        and not form_progress(entry, len(item["questions"]))[0]
+                    ):
+                        raise ValueError(
+                            "所选参与者中有人尚未填写资料，请刷新并重新选择"
+                        )
+                    entries.append(entry)
+                for entry in entries:
+                    slots = (
+                        [index]
+                        if action != "delete_entries"
+                        else range(len(entry["answers"]))
+                    )
+                    for position in slots:
+                        previous = entry["answers"][position]
+                        old_image = (
+                            previous["value"]
+                            if previous["kind"] == "image"
+                            else previous.get("image", "")
+                        )
+                        if action == "edit_answer":
+                            answer = validate_answer(
+                                item["questions"][position],
+                                payload.get("answer"),
+                                item.get("require_correct", True),
+                            )
+                            image = (
+                                answer["value"]
+                                if answer["kind"] == "image"
+                                else answer.get("image", "")
+                            )
+                            if (
+                                image
+                                and not (self.directory / "uploads" / image).is_file()
+                            ):
+                                raise ValueError("答案图片已失效，请重新上传")
+                            if image and image != old_image:
+                                async with self.db.execute(
+                                    "SELECT body FROM entries"
+                                ) as cursor:
+                                    for row in await cursor.fetchall():
+                                        if any(
+                                            image
+                                            == (
+                                                value["value"]
+                                                if value["kind"] == "image"
+                                                else value.get("image")
+                                            )
+                                            for value in json.loads(row[0])["answers"]
+                                        ):
+                                            raise ValueError(
+                                                "该图片已用于其他答案，请为当前用户单独上传"
+                                            )
+                            answer.update(edited_by=reviewer_id, edited_at=time.time())
+                        else:
+                            image = ""
+                            answer = {
+                                "kind": "deleted",
+                                "value": "",
+                                "deleted_by": reviewer_id,
+                                "deleted_at": time.time(),
+                            }
+                        if old_image and old_image != image:
+                            discarded.add(old_image)
+                        entry["answers"][position] = answer
+                    entry.pop("review_decision", None)
+                    entry.pop("reviewed_by", None)
+                    entry.pop("reviewed_at", None)
+                    # Every edit requires a fresh whole-form review in deferred mode.
+                    if not item.get("require_correct", True):
+                        for answer in entry["answers"]:
+                            if answer["kind"] != "deleted":
+                                answer["correct"] = None
+                                for key in (
+                                    "review_method",
+                                    "reviewed_by",
+                                    "reviewed_at",
+                                ):
+                                    answer.pop(key, None)
+                    count, _ = form_progress(entry, len(item["questions"]))
+                    entry["status"] = (
+                        "complete" if count == len(item["questions"]) else "pending"
+                    )
+                    entry["completed_at"] = (
+                        time.time() if entry["status"] == "complete" else None
+                    )
+                    entry["review_status"] = review_status(item, entry)
+                    entry["answer_revision"] = entry.get("answer_revision", 0) + 1
+                    await self.db.execute(
+                        "UPDATE entries SET body=? WHERE lottery_id=? AND user_id=?",
+                        (
+                            json.dumps(entry, ensure_ascii=False),
+                            lottery_id,
+                            entry["user_id"],
+                        ),
+                    )
+                    await self.db.execute(
+                        "DELETE FROM outbox WHERE lottery_id=? AND delivered_at IS NULL AND json_extract(body,'$.entry.user_id')=?",
+                        (lottery_id, entry["user_id"]),
+                    )
+                    if entry["status"] == "complete":
+                        await self.db.execute(
+                            "DELETE FROM sessions WHERE lottery_id=? AND user_id=?",
+                            (lottery_id, entry["user_id"]),
+                        )
+                    else:
+                        # Pause stale prompts so a reply to the old question cannot fill a deleted slot.
+                        await self.db.execute(
+                            "DELETE FROM sessions WHERE lottery_id=? AND user_id=?",
+                            (lottery_id, entry["user_id"]),
+                        )
+                    if notify:
+                        await self.queue(item, "answer_changed", entry=entry)
+                await self.db.commit()
+            except BaseException:
+                await self.db.rollback()
+                raise
+        await self.cleanup_artwork(discarded)
+        logger.info(
+            "Lottery %s answer action=%s; participants=%d; operator=%s; notify=%s.",
+            lottery_id,
+            action,
+            len(entries),
+            reviewer_id,
+            notify,
+        )
+        return {
+            "changed_entries": len(entries),
+            "private_notices": len(entries) if notify else 0,
+            "marked_answers": 0,
+        }
+
+    async def restart_forms(
+        self,
+        lottery_id: str | None = None,
+        *,
+        bot_id: str = "",
+        user_id: str = "",
+        platform_id: str = "",
+    ) -> dict:
+        """Restart incomplete group reservations after friendship or explicit management.
+
+        Args:
+            lottery_id: Explicit WebUI activity, or None for a trusted friend-add notice.
+            bot_id: Trusted friend's bot account when handling a notice.
+            user_id: Trusted QQ account when handling a notice.
+            platform_id: Trusted adapter identifier when handling a notice.
+
+        Returns:
+            Number of users whose next question was queued.
+
+        Raises:
+            ValueError: An explicitly selected activity no longer accepts answers.
+        """
+        async with self.lock:
+            await self.db.execute("BEGIN IMMEDIATE")
+            try:
+                if lottery_id is not None:
+                    async with self.db.execute(
+                        "SELECT body FROM lotteries WHERE id=?", (lottery_id,)
+                    ) as cursor:
+                        row = await cursor.fetchone()
+                    if (
+                        not row
+                        or json.loads(row[0])["status"] != "open"
+                        or time.time() >= json.loads(row[0])["close_at"]
+                    ):
+                        raise ValueError("报名已截止或活动已结束，不能重新发起填写")
+                async with self.db.execute(
+                    "SELECT e.lottery_id,e.body,l.body FROM entries e JOIN lotteries l ON l.id=e.lottery_id LEFT JOIN sessions s ON s.bot_id=json_extract(e.body,'$.bot_id') AND s.user_id=e.user_id WHERE json_extract(e.body,'$.status')='pending' ORDER BY CASE WHEN s.lottery_id=e.lottery_id THEN 0 ELSE 1 END,json_extract(e.body,'$.joined_at'),e.lottery_id"
+                ) as cursor:
+                    rows = await cursor.fetchall()
+                selected = {}
+                for identifier, body, rules in rows:
+                    entry, item = json.loads(body), json.loads(rules)
+                    if (
+                        lottery_id is not None
+                        and lottery_id != identifier
+                        or item["status"] != "open"
+                        or time.time() >= item["close_at"]
+                        or bot_id
+                        and entry["bot_id"] != bot_id
+                        or user_id
+                        and entry["user_id"] != user_id
+                        or platform_id
+                        and entry["platform_id"] != platform_id
+                    ):
+                        continue
+                    key = (entry["bot_id"], entry["user_id"])
+                    if key in selected:
+                        continue
+                    missing = form_progress(entry, len(item["questions"]))[1]
+                    if missing >= len(item["questions"]):
+                        continue
+                    selected[key] = identifier
+                    await self.db.execute(
+                        "INSERT OR REPLACE INTO sessions (bot_id,user_id,lottery_id,question_index) VALUES (?,?,?,?)",
+                        (*key, identifier, missing),
+                    )
+                    # Replace backoff jobs so a new friendship does not inherit failed delivery delays.
+                    await self.db.execute(
+                        "DELETE FROM outbox WHERE delivered_at IS NULL AND json_extract(body,'$.kind')='question' AND json_extract(body,'$.target.bot_id')=? AND json_extract(body,'$.entry.user_id')=?",
+                        key,
+                    )
+                    await self.queue(
+                        item, "question", entry={**entry, "question_index": missing}
+                    )
+                await self.db.commit()
+            except BaseException:
+                await self.db.rollback()
+                raise
+        logger.info(
+            "Lottery private forms restarted; activity=%s; users=%d.",
+            lottery_id or "friendship",
+            len(selected),
+        )
+        return {"restarted_users": len(selected)}
 
     async def withdraw(self, lottery_id: str, identity: dict) -> None:
         """Remove only the actual sender's enrollment before the cutoff.
@@ -1391,7 +1798,7 @@ class Store:
                 {**entry, "channel": "private", "recipient": entry["user_id"]},
             ]
             if (
-                kind == "question"
+                kind in {"question", "answer_changed"}
                 or (
                     not item.get("group_success_notify", True)
                     and (
@@ -1833,7 +2240,9 @@ class Store:
                 entries = [json.loads(row[0]) for row in await cursor.fetchall()]
             if page is not None:
                 for entry in entries:
-                    entry["answer_count"] = len(entry["answers"])
+                    entry["answer_count"] = sum(
+                        answer["kind"] != "deleted" for answer in entry["answers"]
+                    )
                     entry["marked_count"] = sum(
                         answer.get("correct") is not None for answer in entry["answers"]
                     )
@@ -1922,8 +2331,11 @@ class Store:
                     except OSError:
                         logger.warning("Deleted lottery attachment cleanup deferred.")
 
-    async def cleanup_artwork(self) -> int:
+    async def cleanup_artwork(self, discarded: set[str] | None = None) -> int:
         """Remove unbound artwork and private attachments after one day.
+
+        Args:
+            discarded: Private images just removed from answers, eligible for immediate cleanup.
 
         Returns:
             Number of stale, unreferenced files removed.
@@ -1955,9 +2367,10 @@ class Store:
             ):
                 for path in (self.directory / directory).glob("*.jpg"):
                     try:
-                        if (
-                            path.name not in retained
-                            and path.stat().st_mtime < time.time() - 86400
+                        if path.name not in retained and (
+                            path.stat().st_mtime < time.time() - 86400
+                            or directory == "uploads"
+                            and path.name in (discarded or set())
                         ):
                             path.unlink(missing_ok=True)
                             removed += 1
