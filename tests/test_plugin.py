@@ -229,6 +229,249 @@ class Platform:
         return self.client
 
 
+async def test_scheduler_queues_cutoff_for_all_original_groups(plugin, rules):
+    item = await plugin.store.save(rules, "admin")
+    item["close_at"] = time.time() - 1
+    await plugin.store.db.execute(
+        "UPDATE lotteries SET body=? WHERE id=?", (json.dumps(item), item["id"])
+    )
+    worker = asyncio.create_task(plugin.scheduler())
+    try:
+        for _ in range(50):
+            saved = await plugin.store.get(item["id"])
+            if saved.get("closed_notice_at") == item["close_at"]:
+                break
+            await asyncio.sleep(0.01)
+        assert saved["closed_notice_at"] == item["close_at"]
+        rows = await plugin.store.deliveries()
+        assert len(rows) == 2
+        assert {json.loads(row["body"])["target"]["platform_id"] for row in rows} == {
+            "napcat",
+            "snowluma",
+        }
+        assert saved["status"] == "open" and saved["draw_at"] == item["draw_at"]
+    finally:
+        worker.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await worker
+
+
+@pytest.mark.parametrize("kind", ["closed", "result", "tier_result"])
+async def test_snowluma_group_notice_recovers_only_unsent_pages(
+    plugin, rules, monkeypatch, kind
+):
+    item = await plugin.store.save(rules, "admin")
+    await plugin.store.enroll(item["id"], plugin.identity(event(plugin)))
+    await plugin.store.db.execute("DELETE FROM outbox")
+    if kind == "closed":
+        frozen = await plugin.store.action(item["id"], "close")
+    elif kind == "tier_result":
+        rules["prize_tiers"] = [
+            {"name": "一等奖", "prize": "玩偶", "count": 1},
+            {"name": "二等奖", "prize": "贴纸", "count": 1},
+        ]
+        # A separate activity keeps the immutable enrolled prize rules intact.
+        item = await plugin.store.save(rules, "admin")
+        frozen = await plugin.store.action(item["id"], "draw_tier", tier_index=0)
+    else:
+        frozen = await plugin.store.action(item["id"], "draw")
+    monkeypatch.setattr(
+        plugin_module, "render_pages", lambda *a, **k: [b"page1", b"page2", b"page3"]
+    )
+    client = plugin.context.get_platform_inst("snowluma").client
+    attempts = []
+    failed = False
+
+    async def snow_send(action, **params):
+        nonlocal failed
+        assert action == "send_group_msg"
+        assert params["self_id"] == 7654321 and params["group_id"] == 3333333
+        assert "user_id" not in params and len(params["message"]) == 1
+        segment = params["message"][0]
+        assert segment["type"] == "image"
+        page = base64.b64decode(segment["data"]["file"].removeprefix("base64://"))
+        attempts.append(page)
+        if page == b"page2" and not failed:
+            failed = True
+            raise ActionFailed(
+                {"retcode": 100, "wording": "image upload failed", "status": "failed"}
+            )
+        return {"message_id": 100 + len(attempts)}
+
+    client.call_action = snow_send
+    await plugin.send_deliveries()
+    assert attempts == [b"page1", b"page2"]
+    records = (await plugin.store.manage_entries(item["id"]))["deliveries"]
+    failed_record = next(
+        row for row in records if row["target"]["platform_id"] == "snowluma"
+    )
+    assert (failed_record["sent_pages"], failed_record["total_pages"]) == (1, 3)
+    assert failed_record["attempts"] == 1 and "图片上传失败" in failed_record["error"]
+    assert "100" in failed_record["error"]
+    napcat_calls = len(plugin.context.get_platform_inst("napcat").client.calls)
+    with web_request(
+        {"action": "retry", "delivery_id": failed_record["id"], "confirmed": True}
+    ):
+        response = await plugin.web_action(item["id"])
+    assert (
+        response.status_code == 200 and json.loads(response.body)["queued_count"] == 1
+    )
+    await plugin.send_deliveries()
+    assert attempts == [b"page1", b"page2", b"page2", b"page3"]
+    assert len(plugin.context.get_platform_inst("napcat").client.calls) == napcat_calls
+    assert (await plugin.store.get(item["id"])) == frozen
+    assert not await plugin.store.deliveries()
+    assert all(
+        row["delivered_at"]
+        for row in (await plugin.store.manage_entries(item["id"]))["deliveries"]
+    )
+    with web_request(
+        {"action": "retry", "delivery_id": failed_record["id"], "confirmed": True}
+    ):
+        assert (await plugin.web_action(item["id"])).status_code == 400
+
+
+async def test_new_result_interrupts_an_existing_private_retry_batch(
+    plugin, rules, monkeypatch
+):
+    rules["questions"] = [{"kind": "text", "prompt": "资料"}]
+    item = await plugin.store.save(rules, "admin")
+    for index in range(3):
+        await plugin.store.enroll(
+            item["id"],
+            {**plugin.identity(event(plugin)), "user_id": str(4444444 + index)},
+        )
+    await plugin.store.expire_forms(now=time.time() + 1801)
+    monkeypatch.setattr(plugin_module, "render_pages", lambda *a, **k: [b"image"])
+    reached, release = asyncio.Event(), asyncio.Event()
+    client = plugin.context.get_platform_inst("napcat").client
+    transport = client.call_action
+    private_attempts = 0
+
+    async def slow_private(action, **params):
+        nonlocal private_attempts
+        if action == "send_private_msg":
+            private_attempts += 1
+            reached.set()
+            await release.wait()
+            raise ActionFailed(
+                {"retcode": 100, "wording": "cannot resolve uid", "status": "failed"}
+            )
+        return await transport(action, **params)
+
+    client.call_action = slow_private
+    sending = asyncio.create_task(plugin.send_deliveries())
+    await asyncio.wait_for(reached.wait(), 2)
+    draw = await plugin.store.save({**rules, "questions": []}, "admin")
+    await plugin.store.action(draw["id"], "draw")
+    release.set()
+    await sending
+    assert private_attempts == 1 and plugin.wake.is_set()
+    await plugin.send_deliveries()
+    assert [action for action, _ in client.calls][:1] == ["send_group_msg"]
+    assert all(
+        row["delivered_at"]
+        for row in (await plugin.store.manage_entries(draw["id"]))["deliveries"]
+    )
+
+
+@pytest.mark.parametrize("ended", [False, True])
+async def test_obsolete_timeout_cards_are_removed_without_calling_onebot(
+    plugin, rules, ended
+):
+    rules["questions"] = [{"kind": "text", "prompt": "资料"}]
+    item = await plugin.store.save(rules, "admin")
+    await plugin.store.enroll(item["id"], plugin.identity(event(plugin)))
+    await plugin.store.expire_forms(now=time.time() + 1801)
+    assert len(await plugin.store.deliveries()) == 1
+    if ended:
+        await plugin.store.action(item["id"], "draw")
+        await plugin.store.db.execute(
+            "DELETE FROM outbox WHERE json_extract(body,'$.kind')='result'"
+        )
+    else:
+        item["close_at"] = time.time() - 1
+        await plugin.store.db.execute(
+            "UPDATE lotteries SET body=? WHERE id=?", (json.dumps(item), item["id"])
+        )
+    await plugin.send_deliveries()
+    assert not plugin.context.get_platform_inst("napcat").client.calls
+    assert not (await plugin.store.manage_entries(item["id"]))["deliveries"]
+
+
+async def test_manual_retry_only_requeues_confirmed_failed_jobs_of_this_activity(
+    plugin, rules
+):
+    item = await plugin.store.save(rules, "admin")
+    await plugin.store.action(item["id"], "draw")
+    jobs = await plugin.store.deliveries()
+    await plugin.store.delivery_done(jobs[0]["id"], "ConnectionError")
+    other = await plugin.store.save(rules, "admin")
+    await plugin.store.action(other["id"], "draw")
+    for payload in (
+        {"action": "retry"},
+        {"action": "retry", "delivery_id": "invalid", "confirmed": True},
+        {
+            "action": "retry",
+            "delivery_id": (await plugin.store.deliveries())[-1]["id"],
+            "confirmed": True,
+        },
+        {"action": "retry", "delivery_id": jobs[1]["id"], "confirmed": True},
+    ):
+        with web_request(payload):
+            assert (await plugin.web_action(item["id"])).status_code == 400
+    with web_request(
+        {"action": "retry", "delivery_id": jobs[0]["id"], "confirmed": True},
+        username=None,
+    ):
+        assert (await plugin.web_action(item["id"])).status_code == 403
+    with web_request({"action": "retry", "confirmed": True}):
+        response = await plugin.web_action(item["id"])
+    assert json.loads(response.body)["queued_count"] == 1
+    saved = await plugin.store.get(item["id"])
+    assert saved["status"] == "drawn" and saved["winners"] == []
+
+
+async def test_protocol_upload_timeout_has_sixty_second_budget_and_keeps_results(
+    plugin, rules, monkeypatch
+):
+    item = await plugin.store.save(rules, "admin")
+    frozen = await plugin.store.action(item["id"], "draw")
+    monkeypatch.setattr(plugin_module, "render_pages", lambda *a, **k: [b"image"])
+    budgets = []
+
+    async def time_out(awaitable, *, timeout):
+        budgets.append(timeout)
+        awaitable.close()
+        raise asyncio.TimeoutError()
+
+    monkeypatch.setattr(plugin_module.asyncio, "wait_for", time_out)
+    await plugin.send_deliveries()
+    assert budgets == [60, 60]
+    records = (await plugin.store.manage_entries(item["id"]))["deliveries"]
+    assert all(row["attempts"] == 1 and "60 秒" in row["error"] for row in records)
+    assert await plugin.store.get(item["id"]) == frozen
+
+
+async def test_obsolete_cutoff_after_deadline_extension_is_not_sent(plugin, rules):
+    item = await plugin.store.save(rules, "admin")
+    item["close_at"] = time.time() - 120
+    await plugin.store.db.execute(
+        "UPDATE lotteries SET body=? WHERE id=?", (json.dumps(item), item["id"])
+    )
+    closed = await plugin.store.action(item["id"], "close", due_only=True)
+    closed["close_at"] = time.time() - 60
+    await plugin.store.db.execute(
+        "UPDATE lotteries SET body=? WHERE id=?", (json.dumps(closed), item["id"])
+    )
+    await plugin.send_deliveries()
+    assert not (await plugin.store.manage_entries(item["id"]))["deliveries"]
+    assert all(
+        not platform.client.calls
+        for platform in plugin.context.platform_manager.platform_insts
+    )
+
+
 @pytest.fixture
 async def plugin(tmp_path, monkeypatch):
     monkeypatch.setattr(
@@ -1854,9 +2097,9 @@ async def test_notifications_use_live_counts_and_muted_success_still_reaches_pri
     assert captured == [(2, 0)] * 4
     calls = plugin.context.get_platform_inst("napcat").client.calls
     assert [action for action, _ in calls] == [
-        "send_private_msg",
-        "send_private_msg",
         "send_group_msg",
+        "send_private_msg",
+        "send_private_msg",
     ]
     await plugin.store.enroll(
         item["id"], plugin.identity(event(plugin, user="6666666"))

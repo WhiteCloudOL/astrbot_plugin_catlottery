@@ -47,6 +47,7 @@ from .storage import (
 
 PLUGIN_NAME = "astrbot_plugin_catlottery"
 FORM_HANDLER_PRIORITY = 100_000
+DELIVERY_TIMEOUT_SECONDS = 60
 TOOL_NAMES = (
     "catlottery_list",
     "catlottery_info",
@@ -2005,8 +2006,6 @@ class CatLottery(Star):
         next_cleanup = 0.0
         while True:
             try:
-                if await self.store.expire_forms():
-                    self.wake.set()
                 for item in await self.store.snapshot():
                     if item["status"] == "open" and time.time() >= item["draw_at"]:
                         try:
@@ -2018,6 +2017,23 @@ class CatLottery(Star):
                         except ValueError:
                             # Another command can finalize the same draw first.
                             continue
+                    elif (
+                        item["status"] == "open"
+                        and time.time() >= item["close_at"]
+                        and item.get("closed_notice_at") != item["close_at"]
+                    ):
+                        try:
+                            await self.store.action(item["id"], "close", due_only=True)
+                            self.logger.info(
+                                "Scheduled lottery %s registration cutoff queued.",
+                                item["id"],
+                            )
+                            self.wake.set()
+                        except ValueError:
+                            # A concurrent draw, close, or deadline edit takes precedence.
+                            continue
+                if await self.store.expire_forms():
+                    self.wake.set()
                 for lottery_id in await self.store.schedule_announcements():
                     self.logger.info(
                         "Lottery %s scheduled group announcement queued.", lottery_id
@@ -2080,11 +2096,22 @@ class CatLottery(Star):
                         ) as cursor:
                             if await cursor.fetchone() is None:
                                 continue
+                        if target["channel"] == "private":
+                            async with self.store.db.execute(
+                                "SELECT 1 FROM outbox WHERE delivered_at IS NULL AND next_at<=? "
+                                "AND json_extract(body,'$.kind') IN ('closed','result','tier_result','cancelled') LIMIT 1",
+                                (time.time(),),
+                            ) as cursor:
+                                if await cursor.fetchone() is not None:
+                                    # Refresh the batch when an important group notice arrives mid-send.
+                                    self.wake.set()
+                                    break
                     live = await self.store.participation_state(item["id"])
                     kind = message["kind"]
                     if kind == "closed" and (
                         live["item"]["status"] != "open"
                         or time.time() < live["item"]["close_at"]
+                        or item["close_at"] != live["item"]["close_at"]
                     ):
                         await self.store.delivery_done(row["id"], skipped=True)
                         continue
@@ -2163,8 +2190,15 @@ class CatLottery(Star):
                             item, entry, index, self.store.directory / "uploads"
                         )
                     elif kind == "form_timeout":
-                        if await self.store.private_session(
-                            target["bot_id"], target["recipient"]
+                        entry = await self.store.entry(item["id"], target["recipient"])
+                        if (
+                            item["status"] != "open"
+                            or time.time() >= item["close_at"]
+                            or not entry
+                            or entry["status"] != "pending"
+                            or await self.store.private_session(
+                                target["bot_id"], target["recipient"]
+                            )
                         ):
                             await self.store.delivery_done(row["id"], skipped=True)
                             continue
@@ -2390,28 +2424,64 @@ class CatLottery(Star):
                         ):
                             await self.store.delivery_done(row["id"], skipped=True)
                             continue
-                    await asyncio.wait_for(
-                        client.call_action(
-                            "send_group_msg"
-                            if target["channel"] == "group"
-                            else "send_private_msg",
-                            **parameters,
-                        ),
-                        timeout=15,
-                    )
-                    await self.store.delivery_done(row["id"])
-                    self.logger.debug(
-                        "Lottery %s %s notice delivered to %s.",
-                        item["id"],
-                        message["kind"],
-                        target["channel"],
-                    )
+                    segments = parameters["message"]
+                    if not segments:
+                        raise ValueError("The notification renderer returned no pages")
+                    start = message.get("sent_pages", 0)
+                    if (
+                        type(start) is not int
+                        or not 0 <= start <= len(segments)
+                        or start
+                        and message.get("total_pages") != len(segments)
+                    ):
+                        raise ValueError("The pending notification page count changed")
+                    for index in range(start, len(segments)):
+                        # One image per request bounds protocol uploads and preserves page-level recovery.
+                        parameters["message"] = [segments[index]]
+                        async with self.store.lock:
+                            async with self.store.db.execute(
+                                "SELECT 1 FROM outbox WHERE id=? AND delivered_at IS NULL",
+                                (row["id"],),
+                            ) as cursor:
+                                if await cursor.fetchone() is None:
+                                    break
+                        await asyncio.wait_for(
+                            client.call_action(
+                                "send_group_msg"
+                                if target["channel"] == "group"
+                                else "send_private_msg",
+                                **parameters,
+                            ),
+                            timeout=DELIVERY_TIMEOUT_SECONDS,
+                        )
+                        message.update(sent_pages=index + 1, total_pages=len(segments))
+                        async with self.store.lock:
+                            await self.store.db.execute(
+                                "UPDATE outbox SET body=? WHERE id=? AND delivered_at IS NULL",
+                                (json.dumps(message, ensure_ascii=False), row["id"]),
+                            )
+                    else:
+                        await self.store.delivery_done(row["id"])
+                        self.logger.debug(
+                            "Lottery %s %s notice delivered to %s; pages=%d.",
+                            item["id"],
+                            message["kind"],
+                            target["channel"],
+                            len(segments),
+                        )
                 except NETWORK_ERRORS as exc:
                     error = type(exc).__name__
                     reason, retcode = "transport_failure", None
+                    if isinstance(exc, asyncio.TimeoutError):
+                        reason = "request_timeout"
+                        error += f": 等待协议端超过 {DELIVERY_TIMEOUT_SECONDS} 秒，请检查连接后重发"
+                    elif isinstance(exc, ConnectionError):
+                        error += ": 平台、账号或网络连接不可用，请恢复连接后重发"
                     if isinstance(exc, ActionFailed):
                         result = exc.result if isinstance(exc.result, dict) else {}
-                        wording = str(result.get("wording", "")).casefold()
+                        wording = " ".join(
+                            str(result.get(key, "")) for key in ("wording", "message")
+                        ).casefold()
                         retcode = result.get("retcode")
                         if type(retcode) is not int:
                             retcode = None
@@ -2421,9 +2491,17 @@ class CatLottery(Star):
                         elif "resolve uid" in wording:
                             reason = "uid_unresolved"
                             error += ": QQ 无法识别目标用户，请重新添加我为好友"
+                        elif "upload" in wording or "上传" in wording:
+                            reason = "media_upload_failed"
+                            error += ": 图片上传失败，请检查协议端网络与账号状态后重发"
+                        elif "timeout" in wording or "超时" in wording:
+                            reason = "protocol_timeout"
+                            error += ": 协议端发送超时，请检查连接后重发"
                         else:
                             reason = "onebot_action_failed"
                             error += ": QQ 拒绝发送，请检查账号状态后重试"
+                        if retcode is not None:
+                            error += f"（返回码 {retcode}）"
                         if target["channel"] == "private" and reason in {
                             "friend_required",
                             "uid_unresolved",
@@ -2657,17 +2735,37 @@ class CatLottery(Star):
                 )
                 return json_response({"deleted": True})
             if action == "retry":
+                if payload.get("confirmed") is not True:
+                    raise ValueError("请确认重新发送失败通知")
+                delivery_id = payload.get("delivery_id")
+                if delivery_id is not None and (
+                    not isinstance(delivery_id, str)
+                    or re.fullmatch(r"[a-f0-9]{32}", delivery_id) is None
+                ):
+                    raise ValueError("通知编号无效，请刷新通知记录")
                 await self.store.get(lottery_id)
                 async with self.store.lock:
-                    await self.store.db.execute(
-                        "UPDATE outbox SET next_at=0 WHERE lottery_id=? AND delivered_at IS NULL",
-                        (lottery_id,),
+                    async with self.store.db.execute(
+                        "UPDATE outbox SET next_at=0 WHERE lottery_id=? "
+                        "AND delivered_at IS NULL AND error<>''"
+                        + (" AND id=?" if delivery_id is not None else ""),
+                        (lottery_id, delivery_id)
+                        if delivery_id is not None
+                        else (lottery_id,),
+                    ) as cursor:
+                        queued = cursor.rowcount
+                if delivery_id is not None and not queued:
+                    raise ValueError(
+                        "该通知已发送、已失效或正在等待首次发送，请刷新记录"
                     )
                 self.wake.set()
                 self.logger.info(
-                    "Lottery %s pending notices requeued via WebUI.", lottery_id
+                    "Lottery %s failed notices requeued via WebUI; count=%d; delivery=%s.",
+                    lottery_id,
+                    queued,
+                    delivery_id or "all",
                 )
-                return json_response({"queued": True})
+                return json_response({"queued": True, "queued_count": queued})
             item = await self.store.action(
                 lottery_id, action, tier_index=payload.get("tier_index")
             )

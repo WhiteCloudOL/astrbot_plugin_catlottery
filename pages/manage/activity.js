@@ -60,7 +60,7 @@ export class ActivityView {
     } else {
       const rows = this.data.deliveries;
       this.deliveryPage = Math.min(this.deliveryPage, Math.max(1, Math.ceil(rows.length / 20)));
-      outlet.innerHTML = `<section class="page-panel"><div class="panel-heading"><div><h3>通知发送记录</h3><p class="muted">图片和参与指令文本分别投递，发送失败只重试对应消息</p></div>${!this.readonly && this.data.server_time < item.close_at && this.summary.incomplete ? button("重新通知未填写用户", {action:"restart-forms",glyph:"send"}) : ""}${button("重试未发送通知", { action: "retry", glyph: "refresh" })}</div><div class="notification-table">${rows.slice((this.deliveryPage - 1) * 20, this.deliveryPage * 20).map(row => `<div class="notification-row"><div><strong>${esc(({success:"参与成功",submitted:"资料已提交",review:"整体审核结果",answer_changed:"填写资料更新",result:"开奖结果",tier_result:"奖项提前开奖",announcement:"公告图片",participation_guide:"参与指令文本",question:"私聊题目",cancelled:"活动取消",closed:"报名截止"})[row.kind] || "通知")}</strong><small>${row.target.channel === "group" ? "群" : "私聊 QQ"} ${esc(row.target.recipient)} · ${esc(row.target.platform_id)}</small></div><span class="${row.delivered_at ? "delivered" : "pending"}">${row.delivered_at ? "已发送" : row.attempts ? `待重试 ${row.attempts} 次` : "等待发送"}</span></div>`).join("") || '<div class="small-empty">还没有通知记录</div>'}</div>${pagination(this.deliveryPage, rows.length, 20, "delivery-page")}<p class="muted">最多显示最近 200 条记录</p><p class="page-action-error form-error" role="alert"></p></section>`;
+      outlet.innerHTML = `<section class="page-panel"><div class="panel-heading"><div><h3>通知发送记录</h3><p class="muted">截止与开奖结果优先发送，失败可单条重发或全部重发<br/>多页图片只补发未发送页，开奖结果沿用已保存名单</p></div>${!this.readonly && this.data.server_time < item.close_at && this.summary.incomplete ? button("重新通知未填写用户", {action:"restart-forms",glyph:"send"}) : ""}${button("重发全部失败通知", { action: "retry", glyph: "refresh" })}</div><div class="notification-table">${rows.slice((this.deliveryPage - 1) * 20, this.deliveryPage * 20).map(row => `<div class="notification-row"><div><strong>${esc(({success:"参与成功",submitted:"资料已提交",review:"整体审核结果",answer_changed:"填写资料更新",result:"开奖结果",tier_result:"奖项提前开奖",announcement:"公告图片",participation_guide:"参与指令文本",question:"私聊题目",form_timeout:"作答模式超时",cancelled:"活动取消",closed:"报名截止"})[row.kind] || "通知")}</strong><small>${row.target.channel === "group" ? "群" : "私聊 QQ"} ${esc(row.target.recipient)} · ${esc(row.target.platform_id)} · 我 QQ ${esc(row.target.bot_id)}</small>${row.total_pages ? `<small>已发送 ${Number(row.sent_pages) || 0} / ${Number(row.total_pages)} 页</small>` : ""}${!row.delivered_at && row.error ? `<p class="notification-error" role="status">${esc(clean(row.error))}</p><small>${row.next_at > this.data.server_time ? `下次自动重试 ${chinaDate(row.next_at)}` : "已重新排队，等待发送"}</small>` : ""}</div><div class="notification-status"><span class="${row.delivered_at ? "delivered" : "pending"}">${row.delivered_at ? "已发送" : row.error ? `发送失败 · ${row.attempts} 次` : "等待发送"}</span>${!row.delivered_at && row.error ? button("重新发送", {action:"retry-notice",glyph:"refresh",style:"tonal",attrs:`data-delivery-id="${esc(row.id)}" aria-label="重新发送${esc(({result:"开奖结果",tier_result:"奖项提前开奖",closed:"报名截止"})[row.kind] || "通知")}给 ${esc(row.target.recipient)}"`}) : ""}</div></div>`).join("") || '<div class="small-empty">还没有通知记录</div>'}</div>${pagination(this.deliveryPage, rows.length, 20, "delivery-page")}<p class="muted">最多显示最近 200 条记录，已失效的报名与题目提醒会自动清理</p><p class="page-action-error form-error" role="alert"></p></section>`;
     }
   }
 
@@ -119,6 +119,14 @@ export class ActivityView {
     if (action === "reset-entries") { this.filter = "all"; this.query = ""; this.page = 1; this.selected.clear(); this.paintTab(); return; }
     if (action === "entry-page" || action === "reload-entries") { if (target.dataset.page) this.page = Number(target.dataset.page); await this.loadEntries(); return; }
     if (action === "delivery-page") { this.deliveryPage = Number(target.dataset.page); this.paintTab(); return; }
+    if (action === "retry-notice") {
+      const row = this.data.deliveries.find(value => value.id === target.dataset.deliveryId);
+      if (!row || row.delivered_at || !row.error) return;
+      await this.confirm("重新发送这条失败通知？", `发送到${row.target.channel === "group" ? "群" : "私聊 QQ"} ${esc(row.target.recipient)} · ${esc(row.target.platform_id)}<br/>仅补发尚未发送的页，开奖结果沿用已保存名单<br/>已过期的题目、作答超时或招募提醒不会发送`, async () => {
+        await this.bridge.apiPost(`lotteries/${this.id}/action`, {action:"retry",delivery_id:row.id,confirmed:true});
+        await this.open(); this.updated(); toast("失败通知已重新排队，稍后刷新查看发送结果");
+      }); return;
+    }
     if (action === "review-person") { await this.review(target.dataset.userId); return; }
     if (["bulk-approve", "bulk-reject"].includes(action)) {
       const ids = [...this.selected], correct = action === "bulk-approve";
@@ -143,10 +151,10 @@ export class ActivityView {
     if (action === "match") { target.disabled = true; try { const result = await this.bridge.apiPost(`lotteries/${this.id}/review`, {action:"match"}); await this.reloadAfterReview(); toast(`已匹配 ${result.marked_answers} 个未标记文字答案`); } catch (error) { this.showError(error); } finally { if (target.isConnected) target.disabled = false; } return; }
     if (["publish", "close", "draw", "cancel", "delete", "retry", "draw-tier"].includes(action)) {
       const tier = action === "draw-tier" ? this.item.prize_tiers[Number(target.dataset.tierIndex)] : null;
-      const messages = {publish:["发布本场群公告？","将横版公告图片和独立的参与指令文本发送到所有配置群"],close:["现在截止报名？","停止群报名与私聊填写，剩余奖项仍按原时间开奖"],draw:["抽取全部剩余奖项？","仅抽取成功参与且未中奖者，审核与报名立即锁定，已保存的奖项不会重复抽取"],cancel:["取消本场活动？","停止报名与审核，并向所有配置群发送取消通知"],delete:["删除活动与私聊资料？","永久移除本场活动、报名资料及通知记录，此操作无法撤销"],retry:["重试未发送通知？","只重新排队未送达的消息，已发送图片不会因为文本失败而重发"],"draw-tier":[`提前揭晓${tier?.name}？`,`仅抽取当前成功参与且未中奖者，人数不足保留空缺<br/>本奖项结果立即锁定，剩余奖项继续按原时间开奖`]};
+      const messages = {publish:["发布本场群公告？","将横版公告图片和独立的参与指令文本发送到所有配置群"],close:["现在截止报名？","停止群报名与私聊填写，剩余奖项仍按原时间开奖"],draw:["抽取全部剩余奖项？","仅抽取成功参与且未中奖者，审核与报名立即锁定，已保存的奖项不会重复抽取"],cancel:["取消本场活动？","停止报名与审核，并向所有配置群发送取消通知"],delete:["删除活动与私聊资料？","永久移除本场活动、报名资料及通知记录，此操作无法撤销"],retry:["重发全部失败通知？","只重新排队本场发送失败的消息，已发送通知与等待首次发送的通知不受影响<br/>仅补发尚未发送的页，开奖结果沿用已保存名单"],"draw-tier":[`提前揭晓${tier?.name}？`,`仅抽取当前成功参与且未中奖者，人数不足保留空缺<br/>本奖项结果立即锁定，剩余奖项继续按原时间开奖`]};
       await this.confirm(...messages[action], async () => {
-        await this.bridge.apiPost(`lotteries/${this.id}/action`, {action:action === "draw-tier" ? "draw_tier" : action, confirmed:true, ...(tier ? {tier_index:Number(target.dataset.tierIndex)} : {})});
-        toast(action === "delete" ? "活动与资料已删除" : "操作已保存，通知已排队");
+        const result = await this.bridge.apiPost(`lotteries/${this.id}/action`, {action:action === "draw-tier" ? "draw_tier" : action, confirmed:true, ...(tier ? {tier_index:Number(target.dataset.tierIndex)} : {})});
+        toast(action === "delete" ? "活动与资料已删除" : action === "retry" ? `已重新排队 ${result.queued_count || 0} 条失败通知` : "操作已保存，通知已排队");
         if (action === "delete") this.navigate("home", "", {force:true}); else await this.open();
         this.updated();
       });

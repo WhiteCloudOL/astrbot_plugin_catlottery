@@ -1139,7 +1139,11 @@ class Store:
                         (row[0], row[1]),
                     )
                     entry, item = json.loads(row[3]), json.loads(row[4])
-                    if entry["status"] == "pending":
+                    if (
+                        entry["status"] == "pending"
+                        and item["status"] == "open"
+                        and now < item["close_at"]
+                    ):
                         await self.queue(item, "form_timeout", entry=entry)
                 await self.db.commit()
             except BaseException:
@@ -2126,7 +2130,7 @@ class Store:
         Args:
             lottery_id: Activity identifier.
             action: publish, close, draw, draw_tier, or cancel.
-            due_only: Require scheduled draw time to have arrived.
+            due_only: Require the scheduled draw or registration cutoff to have arrived.
             tier_index: Zero-based award index, required only for draw_tier.
 
         Returns:
@@ -2248,10 +2252,28 @@ class Store:
                     )
                     await self.queue(item, "cancelled")
                 elif action == "close":
-                    if time.time() >= item["close_at"]:
+                    if due_only:
+                        if (
+                            time.time() < item["close_at"]
+                            or time.time() >= item["draw_at"]
+                            or item.get("closed_notice_at") == item["close_at"]
+                        ):
+                            raise ValueError("尚未到报名截止时间，或截止通知已创建")
+                    elif time.time() >= item["close_at"]:
                         raise ValueError("报名已经截止，无需重复操作。")
-                    item["close_at"] = min(item["close_at"], time.time())
-                    await self.queue(item, "closed")
+                    if not due_only:
+                        item["close_at"] = min(item["close_at"], time.time())
+                    # Older releases persisted manual notices without a cutoff marker.
+                    async with self.db.execute(
+                        "SELECT 1 FROM outbox WHERE lottery_id=? "
+                        "AND json_extract(body,'$.kind')='closed' "
+                        "AND json_extract(body,'$.item.close_at')=? LIMIT 1",
+                        (lottery_id, item["close_at"]),
+                    ) as cursor:
+                        existing_notice = await cursor.fetchone()
+                    if not existing_notice:
+                        await self.queue(item, "closed")
+                    item["closed_notice_at"] = item["close_at"]
                 elif action == "publish":
                     if time.time() >= item["close_at"]:
                         raise ValueError(
@@ -2291,7 +2313,12 @@ class Store:
                 "SELECT o.* FROM outbox o WHERE o.delivered_at IS NULL AND o.next_at<=? "
                 "AND (json_extract(o.body,'$.depends_on') IS NULL OR EXISTS "
                 "(SELECT 1 FROM outbox parent WHERE parent.id=json_extract(o.body,'$.depends_on') "
-                "AND parent.delivered_at IS NOT NULL)) ORDER BY o.rowid LIMIT 40",
+                "AND parent.delivered_at IS NOT NULL)) "
+                "ORDER BY CASE json_extract(o.body,'$.kind') "
+                "WHEN 'result' THEN 0 WHEN 'tier_result' THEN 0 WHEN 'closed' THEN 0 "
+                "WHEN 'cancelled' THEN 0 WHEN 'announcement' THEN 1 "
+                "WHEN 'participation_guide' THEN 1 WHEN 'question' THEN 2 "
+                "WHEN 'form_timeout' THEN 4 ELSE 3 END, o.next_at, o.rowid LIMIT 40",
                 (time.time(),),
             ) as cursor:
                 return [dict(row) for row in await cursor.fetchall()]
@@ -2443,6 +2470,8 @@ class Store:
                             "next_at": row[3],
                             "delivered_at": row[4],
                             "error": row[5],
+                            "sent_pages": message.get("sent_pages", 0),
+                            "total_pages": message.get("total_pages", 0),
                         }
                     )
         return {

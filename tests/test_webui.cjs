@@ -10,7 +10,7 @@ const { JSDOM } = require("jsdom");
 const root = path.resolve(__dirname, "../pages/manage");
 const flush = async () => { for (let index = 0; index < 3; index++) await new Promise(resolve => setImmediate(resolve)); };
 
-async function setup(t, { lotteries = [], entries = [], hash = "" } = {}) {
+async function setup(t, { lotteries = [], entries = [], deliveries = [], hash = "" } = {}) {
   const html = await readFile(path.join(root, "index.html"), "utf8");
   const dom = new JSDOM(html, { url: "http://localhost/test" + hash, runScripts: "outside-only" });
   t.after(() => dom.window.close());
@@ -18,7 +18,7 @@ async function setup(t, { lotteries = [], entries = [], hash = "" } = {}) {
   const data = { lotteries, settings: { manager_ids: ["9999999"], llm_tools_enabled: true, avatar_cache_hours:24 }, server_time: Date.now() / 1000 };
   const calls = [];
   const polling = [];
-  let rejectUpload = false, rejectReview = false;
+  let rejectUpload = false, rejectReview = false, rejectAction = false;
   const forms = structuredClone(entries);
   const statusOf = entry => entry.status === "complete" ? entry.review_status || "approved" : "incomplete";
   const summary = () => Object.fromEntries(["total", "approved", "pending", "rejected", "incomplete"].map(key => [key, key === "total" ? forms.length : forms.filter(entry => statusOf(entry) === key).length]));
@@ -41,7 +41,7 @@ async function setup(t, { lotteries = [], entries = [], hash = "" } = {}) {
         if (!item) throw Error("活动不存在");
         if (parts[2] === "entries" && parts[3]) return {entry:structuredClone(forms.find(entry => entry.user_id === parts[3])),item:structuredClone(item),server_time:data.server_time};
         if (parts[2] === "entries") return page(params);
-        return {...page(),item:structuredClone(item),deliveries:[],server_time:data.server_time};
+        return {...page(),item:structuredClone(item),deliveries:structuredClone(deliveries),server_time:data.server_time};
       }
       throw Error(`Unexpected endpoint: ${endpoint}`);
     },
@@ -74,7 +74,9 @@ async function setup(t, { lotteries = [], entries = [], hash = "" } = {}) {
         data.lotteries = [item]; return item;
       }
       if (endpoint.endsWith("/action")) {
+        if (rejectAction) throw Error("通知已失效，请刷新记录");
         const item = data.lotteries[0];
+        if (payload.action === "retry") return {queued:true,queued_count:deliveries.filter(row => !row.delivered_at && row.error && (!payload.delivery_id || row.id === payload.delivery_id)).length};
         if (payload.action === "draw_tier") item.tier_draws.push({ tier_index: payload.tier_index, drawn_at: data.server_time, eligible_count: 0, winner_count: 0, pool_hash: "0".repeat(64) });
         return item;
       }
@@ -93,8 +95,55 @@ async function setup(t, { lotteries = [], entries = [], hash = "" } = {}) {
   await app.link(specifier => modules.get(path.basename(specifier)));
   await app.evaluate();
   await flush();
-  return { document: window.document, window, data, calls, polling, forms, rejectReviews: value => { rejectReview = value; }, rejectUploads: () => { rejectUpload = true; } };
+  return { document: window.document, window, data, calls, polling, forms, rejectActions: value => { rejectAction = value; }, rejectReviews: value => { rejectReview = value; }, rejectUploads: () => { rejectUpload = true; } };
 }
+
+test("failed notices expose errors and confirmed per-recipient retries after the activity ends", async t => {
+  const item = reviewActivity(); item.status = "drawn";
+  const base = {kind:"result",target:{channel:"group",recipient:"3333333",platform_id:"snowluma",bot_id:"7654321"},next_at:Date.now()/1000+60};
+  const deliveries = [
+    {...base,id:"1".repeat(32),attempts:2,error:"ActionFailed: 图片上传失败（返回码 100）",sent_pages:1,total_pages:3,delivered_at:null},
+    {...base,id:"2".repeat(32),attempts:1,error:"",sent_pages:3,total_pages:3,delivered_at:Date.now()/1000},
+    {...base,id:"3".repeat(32),attempts:0,error:"",delivered_at:null},
+  ];
+  const {document,calls} = await setup(t,{lotteries:[item],deliveries,hash:"#detail/a1234567"});
+  document.querySelector('[data-tab="deliveries"]').click(); await flush();
+  assert.equal(document.querySelectorAll('[data-action="retry-notice"]').length,1);
+  assert.match(document.querySelector('.notification-error').textContent,/图片上传失败.*100/);
+  assert.match(document.querySelector('.notification-row').textContent,/已发送 1 \/ 3 页/);
+  assert.match(document.querySelector('.notification-row').textContent,/我 QQ 7654321/);
+  document.querySelector('[data-action="retry-notice"]').click();
+  assert.equal(calls.length,0);
+  assert.match(document.querySelector('.confirm-copy').textContent,/3333333.*已保存名单/);
+  document.querySelector('.modal [data-action="dismiss"]').click();
+  assert.equal(calls.length,0);
+  document.querySelector('[data-action="retry-notice"]').click();
+  document.querySelector('[data-action="confirm-operation"]').click(); await flush();
+  assert.deepEqual(calls[0],{endpoint:"lotteries/a1234567/action",payload:{action:"retry",delivery_id:"1".repeat(32),confirmed:true}});
+  assert.equal(document.querySelector('.modal-backdrop'),null);
+  assert.ok(document.querySelector('[data-tab="deliveries"]').classList.contains('selected'));
+});
+
+test("retry failures stay actionable and bulk retries do not submit drawing operations", async t => {
+  const item = reviewActivity(); item.status = "drawn";
+  const deliveries = [{id:"a".repeat(32),kind:"closed",target:{channel:"group",recipient:"3333333",platform_id:"snowluma",bot_id:"7654321"},attempts:1,error:'<img src=x onerror="alert(1)">',next_at:Date.now()/1000+60,delivered_at:null}];
+  const {document,calls,rejectActions} = await setup(t,{lotteries:[item],deliveries,hash:"#detail/a1234567"});
+  document.querySelector('[data-tab="deliveries"]').click(); await flush();
+  assert.equal(document.querySelector('.notification-error img'),null);
+  assert.match(document.querySelector('.notification-error').textContent,/onerror/);
+  document.querySelector('[data-action="retry-notice"]').click();
+  rejectActions(true);
+  document.querySelector('[data-action="confirm-operation"]').click(); await flush();
+  assert.match(document.querySelector('.modal .form-error').textContent,/已失效/);
+  assert.equal(document.querySelector('[data-action="confirm-operation"]').disabled,false);
+  document.querySelector('.modal [data-action="dismiss"]').click();
+  rejectActions(false);
+  document.querySelector('[data-action="retry"]').click();
+  document.querySelector('[data-action="confirm-operation"]').click(); await flush();
+  assert.deepEqual(calls[1],{endpoint:"lotteries/a1234567/action",payload:{action:"retry",confirmed:true}});
+  assert.ok(calls.every(call => call.payload.action === "retry"));
+  assert.match(document.querySelector('.toast').textContent,/1 条失败通知/);
+});
 
 test("settings and guide are independent pages and unsaved settings survive polling", async t => {
   const { document, window, calls, polling } = await setup(t);

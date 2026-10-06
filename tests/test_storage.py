@@ -17,6 +17,79 @@ from astrbot_plugin_catlottery.storage import (
 )
 
 
+async def test_scheduled_cutoff_is_durable_and_only_queues_once(store, rules, sender):
+    rules["questions"] = [{"kind": "text", "prompt": "资料"}]
+    item = await store.save(rules, "admin")
+    await store.enroll(item["id"], sender)
+    item["close_at"] = time.time() - 1
+    await store.db.execute(
+        "UPDATE lotteries SET body=? WHERE id=?", (json.dumps(item), item["id"])
+    )
+    closed = await store.action(item["id"], "close", due_only=True)
+    assert closed["status"] == "open"
+    assert closed["draw_at"] == item["draw_at"]
+    assert closed["closed_notice_at"] == item["close_at"]
+    assert not await store.private_session(sender["bot_id"], sender["user_id"])
+    jobs = await store.deliveries()
+    assert len(jobs) == len(item["targets"])
+    assert all(json.loads(job["body"])["kind"] == "closed" for job in jobs)
+    await store.close()
+    await store.open()
+    with pytest.raises(ValueError, match="截止通知已创建"):
+        await store.action(item["id"], "close", due_only=True)
+    assert len(await store.deliveries()) == len(jobs)
+
+
+async def test_legacy_manual_cutoff_notice_is_not_duplicated(store, rules):
+    item = await store.save(rules, "admin")
+    closed = await store.action(item["id"], "close")
+    closed.pop("closed_notice_at")
+    await store.db.execute(
+        "UPDATE lotteries SET body=? WHERE id=?", (json.dumps(closed), item["id"])
+    )
+    await store.action(item["id"], "close", due_only=True)
+    assert len(await store.deliveries()) == len(item["targets"])
+
+
+@pytest.mark.parametrize("due_draw", [False, True])
+async def test_automatic_cutoff_rejects_early_or_already_due_draws(
+    store, rules, due_draw
+):
+    item = await store.save(rules, "admin")
+    if due_draw:
+        item["close_at"] = item["draw_at"] = time.time() - 1
+        await store.db.execute(
+            "UPDATE lotteries SET body=? WHERE id=?", (json.dumps(item), item["id"])
+        )
+    with pytest.raises(ValueError):
+        await store.action(item["id"], "close", due_only=True)
+    assert not await store.deliveries()
+
+
+@pytest.mark.parametrize("kind", ["closed", "result", "tier_result"])
+async def test_important_group_notices_precede_a_private_retry_backlog(
+    store, rules, sender, kind
+):
+    item = await store.save(rules, "admin")
+    async with store.lock:
+        for _ in range(60):
+            await store.queue(item, "form_timeout", entry=sender)
+        await store.queue(item, kind)
+    rows = await store.deliveries()
+    assert len(rows) == 40
+    assert all(json.loads(row["body"])["kind"] == kind for row in rows[:2])
+
+
+async def test_expired_forms_do_not_queue_timeout_cards_after_cutoff(
+    store, rules, sender
+):
+    rules["questions"] = [{"kind": "text", "prompt": "资料"}]
+    item = await store.save(rules, "admin")
+    await store.enroll(item["id"], sender)
+    assert await store.expire_forms(now=item["close_at"] + 1) == 1
+    assert not await store.deliveries()
+
+
 @pytest.mark.parametrize(
     "images",
     [None, "image.jpg", ["../../secret.jpg"], [True], ["f" * 32 + ".jpg"] * 10],
